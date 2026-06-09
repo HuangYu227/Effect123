@@ -25,7 +25,8 @@ def main() -> None:
     parser.add_argument("--config", default="configs/weather_core.yaml")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf"])
+    parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf", "longclip"])
+    parser.add_argument("--text-encoder-model", default=None, help="Override hf_model_name or longclip_model_name")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--checkpoint-dir", default=None)
     args = parser.parse_args()
@@ -37,6 +38,9 @@ def main() -> None:
         cfg["train"]["batch_size"] = args.batch_size
     if args.text_encoder_mode is not None:
         cfg["text_encoder"]["mode"] = args.text_encoder_mode
+    if args.text_encoder_model is not None:
+        key = "longclip_model_name" if str(cfg["text_encoder"].get("mode", "")).lower() == "longclip" else "hf_model_name"
+        cfg["text_encoder"][key] = args.text_encoder_model
     if args.checkpoint_dir is not None:
         cfg["train"]["checkpoint_dir"] = args.checkpoint_dir
     resolve_data_root(cfg, args.data_root)

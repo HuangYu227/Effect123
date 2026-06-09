@@ -26,7 +26,8 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=0, help="0 means all batches")
     parser.add_argument("--reference-max-batches", type=int, default=0, help="0 means all train batches")
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf"])
+    parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf", "longclip"])
+    parser.add_argument("--text-encoder-model", default=None, help="Override hf_model_name or longclip_model_name")
     parser.add_argument("--verbalts-root", default=None)
     parser.add_argument("--clip-folder", default=None, help="Folder containing model_configs.yaml and clip_model_best.pth")
     parser.add_argument("--clip-config", default=None)
@@ -39,6 +40,9 @@ def main() -> None:
         cfg["train"]["batch_size"] = args.batch_size
     if args.text_encoder_mode is not None:
         cfg["text_encoder"]["mode"] = args.text_encoder_mode
+    if args.text_encoder_model is not None:
+        key = "longclip_model_name" if str(cfg["text_encoder"].get("mode", "")).lower() == "longclip" else "hf_model_name"
+        cfg["text_encoder"][key] = args.text_encoder_model
     resolve_data_root(cfg, args.data_root)
     metrics = run(args, cfg)
     print(json.dumps(metrics, indent=2, ensure_ascii=False))

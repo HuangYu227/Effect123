@@ -104,6 +104,77 @@ class HFTextEncoder(nn.Module):
         return z, mask
 
 
+class CLIPTextProjectionEncoder(nn.Module):
+    """Frozen CLIP/LongCLIP text encoder using projected text embeddings."""
+
+    def __init__(self, model_name: str, d_model: int, *, local_files_only: bool = False) -> None:
+        super().__init__()
+        from transformers import AutoTokenizer, CLIPTextConfig, CLIPTextModelWithProjection
+
+        model_key = str(model_name)
+        if "longclip" in model_key.lower():
+            clip_config = CLIPTextConfig.from_pretrained(model_name, local_files_only=local_files_only)
+            clip_config.max_position_embeddings = max(int(getattr(clip_config, "max_position_embeddings", 77)), 248)
+            self.backbone = CLIPTextModelWithProjection.from_pretrained(
+                model_name,
+                config=clip_config,
+                local_files_only=local_files_only,
+            )
+        else:
+            self.backbone = CLIPTextModelWithProjection.from_pretrained(model_name, local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_files_only)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        self.backbone.eval()
+        hidden_size = int(getattr(self.backbone.config, "projection_dim", self.backbone.config.hidden_size))
+        self.max_length = int(getattr(self.backbone.config, "max_position_embeddings", 77))
+        self.proj = nn.Linear(hidden_size, d_model)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+    def forward(self, text_condition: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        slots = _expect_slots(text_condition)
+        device = self.proj.weight.device
+        self.backbone.eval()
+        flat, offsets, max_slots = _flatten_slots(slots)
+        if not flat:
+            batch_size = len(slots)
+            dtype = self.proj.weight.dtype
+            z = torch.zeros(batch_size, 1, self.proj.out_features, device=device, dtype=dtype)
+            mask = torch.zeros(batch_size, 1, device=device, dtype=dtype)
+            return z, mask
+
+        tokens = self.tokenizer(flat, padding=True, return_tensors="pt")
+        input_ids = tokens["input_ids"].to(device)
+        attention_mask = tokens.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        chunks = []
+        for start in range(0, input_ids.shape[1], self.max_length):
+            chunk_ids = input_ids[:, start : start + self.max_length]
+            if chunk_ids.shape[1] == 0:
+                continue
+            chunk_mask = attention_mask[:, start : start + self.max_length] if attention_mask is not None else None
+            kwargs = {"input_ids": chunk_ids}
+            if chunk_mask is not None:
+                kwargs["attention_mask"] = chunk_mask
+            with torch.no_grad():
+                chunks.append(self.backbone(**kwargs).text_embeds)
+        raw = torch.stack(chunks, dim=0).mean(dim=0)
+        emb = self.proj(raw)
+        z = torch.zeros(len(slots), max_slots, emb.shape[-1], device=device, dtype=emb.dtype)
+        mask = torch.zeros(len(slots), max_slots, device=device, dtype=emb.dtype)
+        for row, (start, end) in enumerate(offsets):
+            if end > start:
+                width = end - start
+                z[row, :width] = emb[start:end]
+                mask[row, :width] = 1.0
+        return z, mask
+
+
 def build_text_encoder(config: dict[str, Any], d_model: int) -> nn.Module:
     mode = str(config.get("mode", "hash")).lower()
     if mode == "hash":
@@ -134,6 +205,29 @@ def build_text_encoder(config: dict[str, Any], d_model: int) -> nn.Module:
                 f"Failed to load HuggingFace text encoder {model_name!r}. "
                 f"local_files_only={local_files_only!r}. Install/cache the model or set text_encoder.mode=hash "
                 f"for offline smoke tests. Original error: {exc}"
+            ) from exc
+    if mode in {"longclip", "clip_hf"}:
+        model_name = str(config.get("longclip_model_name", "save/Longclip"))
+        local_files_only = bool(config.get("longclip_local_files_only", config.get("local_files_only", False)))
+        try:
+            return CLIPTextProjectionEncoder(
+                model_name=model_name,
+                d_model=d_model,
+                local_files_only=local_files_only,
+            )
+        except Exception as exc:
+            fallback_mode = str(config.get("fallback_mode", "error")).lower()
+            if fallback_mode == "hash":
+                warnings.warn(
+                    f"Failed to load CLIP/LongCLIP text encoder {model_name!r}; falling back to HashTextEncoder. "
+                    f"Verify longclip_model_name and local_files_only={local_files_only!r}. Original error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return HashTextEncoder(raw_dim=int(config.get("fallback_hash_dim", config.get("hash_dim", 256))), d_model=d_model)
+            raise RuntimeError(
+                f"Failed to load CLIP/LongCLIP text encoder {model_name!r}. "
+                f"Verify longclip_model_name and local_files_only={local_files_only!r}. Original error: {exc}"
             ) from exc
     raise ValueError(f"Unknown text encoder mode {mode!r}")
 

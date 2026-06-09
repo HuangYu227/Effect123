@@ -42,6 +42,8 @@ text_encoder:
   hash_dim: 256
   precomputed_dim: 128
   hf_model_name: "BAAI/bge-small-en-v1.5"
+  longclip_model_name: "save/Longclip"
+  longclip_local_files_only: true
   local_files_only: false
   fallback_mode: error
   fallback_hash_dim: 256

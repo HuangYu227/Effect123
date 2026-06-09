@@ -26,12 +26,16 @@ def main() -> None:
     parser.add_argument("--allow-random-init", action="store_true")
     parser.add_argument("--split", default="valid", choices=["train", "valid", "test"])
     parser.add_argument("--max-batches", type=int, default=4)
-    parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf"])
+    parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf", "longclip"])
+    parser.add_argument("--text-encoder-model", default=None, help="Override hf_model_name or longclip_model_name")
     parser.add_argument("--data-root", default=None)
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.text_encoder_mode is not None:
         cfg["text_encoder"]["mode"] = args.text_encoder_mode
+    if args.text_encoder_model is not None:
+        key = "longclip_model_name" if str(cfg["text_encoder"].get("mode", "")).lower() == "longclip" else "hf_model_name"
+        cfg["text_encoder"][key] = args.text_encoder_model
     resolve_data_root(cfg, args.data_root)
     metrics = run_eval(
         cfg,

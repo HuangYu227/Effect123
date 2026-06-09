@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "effectcma-flow"
 version = "0.1.0"
 description = "Cross-modal effect mapping for text-induced residual flow in time series generation."
-readme = "README.md"
+readme = {text = "EffectCMA training core.", content-type = "text/plain"}
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.23",
@@ -14,6 +14,7 @@ dependencies = [
   "PyYAML>=6.0",
   "tqdm>=4.64",
   "matplotlib>=3.6",
+  "scipy>=1.10",
   "transformers>=4.40",
 ]
 

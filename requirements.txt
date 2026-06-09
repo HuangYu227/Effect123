@@ -3,6 +3,6 @@ torch>=2.0
 PyYAML>=6.0
 tqdm>=4.64
 matplotlib>=3.6
+scipy>=1.10
 pytest>=7.0
 transformers>=4.40
-

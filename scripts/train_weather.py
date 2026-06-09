@@ -95,6 +95,7 @@ def run_train(cfg: dict) -> None:
     eval_every = int(cfg["train"].get("eval_every", 200))
     step = 0
     progress = tqdm(total=max_steps, desc="train", dynamic_ncols=True)
+    last_metrics: dict[str, float] = {}
     while step < max_steps:
         for batch in train_loader:
             model.train()
@@ -110,13 +111,28 @@ def run_train(cfg: dict) -> None:
             step += 1
             progress.update(1)
             if step % log_every == 0 or step == 1:
-                progress.set_postfix(
-                    loss=f"{float(out['loss'].cpu()):.4f}",
-                    opH=f"{float(out['operator_gate_entropy'].cpu()):.2f}",
-                )
+                postfix = {
+                    "loss": f"{_scalar(out, 'loss'):.4f}",
+                    "inside": f"{_scalar(out, 'loss_inside'):.4f}",
+                    "outside": f"{_scalar(out, 'loss_outside'):.4f}",
+                    "opH": f"{_scalar(out, 'operator_gate_entropy'):.2f}",
+                    "tH": f"{_scalar(out, 'time_gate_entropy'):.2f}",
+                    "cH": f"{_scalar(out, 'channel_gate_entropy'):.2f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                }
+                if last_metrics:
+                    postfix.update(
+                        {
+                            "val_mse": f"{last_metrics.get('mse', float('nan')):.4f}",
+                            "val_iou": f"{last_metrics.get('mask_iou', float('nan')):.3f}",
+                            "fieldP": f"{last_metrics.get('field_scope_precision', float('nan')):.3f}",
+                        }
+                    )
+                progress.set_postfix(postfix)
             if step % eval_every == 0 or step == max_steps:
                 metrics = evaluate(model, valid_loader, cfg, device, max_batches=int(cfg["train"].get("eval_batches", 4)))
-                print(json.dumps({"step": step, "valid": metrics}, ensure_ascii=False))
+                last_metrics = metrics
+                progress.write(json.dumps({"step": step, "valid": metrics}, ensure_ascii=False))
                 save_checkpoint(checkpoint_dir / "latest.pt", model, optimizer, cfg, stats, step)
             if step >= max_steps:
                 break
@@ -151,6 +167,15 @@ def save_checkpoint(path: Path, model, optimizer, cfg: dict, stats: dict, step: 
         "step": step,
     }
     torch.save(payload, path)
+
+
+def _scalar(output: dict, key: str) -> float:
+    value = output.get(key)
+    if value is None:
+        return float("nan")
+    if torch.is_tensor(value):
+        return float(value.detach().cpu())
+    return float(value)
 
 if __name__ == "__main__":
     main()

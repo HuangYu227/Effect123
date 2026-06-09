@@ -71,6 +71,10 @@ class VerbalTSMetricComputer:
         generated_loader,
         text_encoder_mode: str,
         steps: int,
+        reference_series_key: str = "Y",
+        reference_text_key: str = "full_text",
+        generated_text_key: str = "full_text",
+        reference_denormalize: bool = True,
         reference_max_batches: int | None = None,
         generated_max_batches: int | None = None,
         cache_dir: str | Path | None = None,
@@ -78,7 +82,13 @@ class VerbalTSMetricComputer:
         reference_cache_dir = cache_dir if reference_max_batches is None else None
         ref_stats = self._load_reference_stats(reference_cache_dir)
         if ref_stats is None:
-            ref_ts, ref_joint = self._collect_reference_embeddings(reference_loader, reference_max_batches)
+            ref_ts, ref_joint = self._collect_reference_embeddings(
+                reference_loader,
+                reference_max_batches,
+                series_key=reference_series_key,
+                text_key=reference_text_key,
+                denormalize=reference_denormalize,
+            )
             ref_stats = {
                 "ts_mean": _mean_cov(ref_ts)[0],
                 "ts_cov": _mean_cov(ref_ts)[1],
@@ -93,6 +103,7 @@ class VerbalTSMetricComputer:
             loader=generated_loader,
             text_encoder_mode=text_encoder_mode,
             steps=steps,
+            text_key=generated_text_key,
             max_batches=generated_max_batches,
         )
         gen_ts_mean, gen_ts_cov = _mean_cov(gen_ts)
@@ -106,14 +117,24 @@ class VerbalTSMetricComputer:
         }
 
     @torch.no_grad()
-    def _collect_reference_embeddings(self, loader, max_batches: int | None) -> tuple[np.ndarray, np.ndarray]:
+    def _collect_reference_embeddings(
+        self,
+        loader,
+        max_batches: int | None,
+        *,
+        series_key: str,
+        text_key: str,
+        denormalize: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
         ts_embeddings = []
         joint_embeddings = []
         for batch_no, batch in enumerate(tqdm(loader, desc="verbalts-ref", dynamic_ncols=True)):
             if max_batches is not None and batch_no >= max_batches:
                 break
-            target = self._denormalize(batch["Y"].to(self.device).float())
-            text = [str(x) for x in batch["full_text"]]
+            target = batch[series_key].to(self.device).float()
+            if denormalize:
+                target = self._denormalize(target)
+            text = [str(x) for x in batch[text_key]]
             ts_emb, text_emb = self._embed(target, text)
             ts_embeddings.append(ts_emb.cpu())
             joint_embeddings.append(torch.cat([ts_emb, text_emb], dim=-1).cpu())
@@ -127,6 +148,7 @@ class VerbalTSMetricComputer:
         loader,
         text_encoder_mode: str,
         steps: int,
+        text_key: str,
         max_batches: int | None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         model.eval()
@@ -140,7 +162,7 @@ class VerbalTSMetricComputer:
             batch = batch_to_device(batch, self.device)
             pred, _ = euler_sample(model, batch["B"], text_condition_from_batch(batch, text_encoder_mode), steps=steps)
             pred = self._denormalize(pred.float())
-            text = [str(x) for x in batch["full_text"]]
+            text = [str(x) for x in batch[text_key]]
             ts_emb, text_emb = self._embed(pred, text)
             ts_embeddings.append(ts_emb.cpu())
             joint_embeddings.append(torch.cat([ts_emb, text_emb], dim=-1).cpu())

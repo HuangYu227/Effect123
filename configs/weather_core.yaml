@@ -1,0 +1,64 @@
+data:
+  root: null
+  window_length: null
+  normalize: true
+  include_precomputed_embeddings: false
+  seed: 20260609
+  effect_types:
+    - level_shift
+    - trend_up
+    - trend_down
+    - volatility_up
+    - volatility_down
+    - spike
+    - drop
+
+model:
+  d_model: 128
+  patch_len: 6
+  num_operators: 7
+  transformer_layers: 2
+  transformer_heads: 4
+  channel_patch_len: 6
+  channel_stride: 3
+  channel_temporal_layers: 1
+  channel_layers: 1
+  channel_heads: 4
+  channel_dropout: 0.0
+  mapper_field_rank: 4
+  mapper_slot_layers: 1
+  mapper_slot_heads: 4
+  mapper_dropout: 0.0
+  operator_hidden: 64
+  operator_t_dim: 32
+  operator_max_velocity: 5.0
+  operator_depth: 2
+  operator_kernel_size: 3
+  operator_dropout: 0.0
+  mapper_normalizer: softmax
+
+text_encoder:
+  mode: hash
+  hash_dim: 256
+  precomputed_dim: 128
+  hf_model_name: "BAAI/bge-small-en-v1.5"
+  local_files_only: false
+  fallback_mode: error
+  fallback_hash_dim: 256
+
+train:
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_steps: 1000
+  cfm_loss_mode: balanced
+  grad_clip: 1.0
+  num_workers: 0
+  device: auto
+  checkpoint_dir: checkpoints/weather_core
+  log_every: 20
+  eval_every: 200
+  eval_batches: 4
+
+sample:
+  steps: 16

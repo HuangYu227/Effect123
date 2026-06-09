@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Research artifacts
+checkpoints/
+logs/
+artifacts/
+cache/
+outputs/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Local indexes
+.codegraph/
+.cursor/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

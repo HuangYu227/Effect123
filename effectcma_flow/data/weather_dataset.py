@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from effectcma_flow.data.effects import EffectSpec, SUPPORTED_EFFECTS, apply_effect, normalize_channels
+from effectcma_flow.data.slot_embeddings import hash_slot_texts
+from effectcma_flow.data.text_templates import spec_to_text
+
+
+SPLITS = ("train", "valid", "test")
+
+
+def compute_train_stats(root: str | Path) -> dict[str, torch.Tensor]:
+    train = _load_ts(root, "train")
+    mean = torch.from_numpy(train.mean(axis=(0, 1), keepdims=True).astype(np.float32))
+    std = torch.from_numpy(train.std(axis=(0, 1), keepdims=True).astype(np.float32))
+    std = torch.clamp(std, min=1e-6)
+    return {"mean": mean, "std": std}
+
+
+def load_weather_caption_embeddings(root: str | Path, *, expected_dim: int = 128) -> dict[str, np.ndarray]:
+    """Load and split `[total_samples * 3, 128]` caption embeddings correctly."""
+    root = Path(root)
+    counts = np.load(root / "text_embedding_caption_counts.npy", allow_pickle=False)
+    flat = np.load(root / "text_embeddings_128_all_caps.npy", allow_pickle=False)
+    if counts.ndim != 1:
+        raise ValueError(f"caption counts must be 1-D, got {counts.shape}")
+    split_sizes = {split: int(_load_ts(root, split).shape[0]) for split in SPLITS}
+    total_samples = sum(split_sizes.values())
+    if counts.shape[0] != total_samples:
+        raise ValueError(f"caption counts rows {counts.shape[0]} do not match split total {total_samples}")
+    if not np.all(counts == 3):
+        raise ValueError("Only exactly three captions per sample are supported for Weather embeddings")
+    expected = int(counts.sum())
+    if flat.ndim != 2:
+        raise ValueError(f"caption embeddings must be 2-D [total*3, 128], got {flat.shape}")
+    if flat.shape != (expected, expected_dim):
+        raise ValueError(f"caption embeddings must have shape {(expected, expected_dim)}, got {flat.shape}")
+    sample_embeddings = flat.reshape(total_samples, 3, expected_dim).astype(np.float32)
+
+    offsets = _split_offsets(root)
+    return {
+        split: sample_embeddings[start:end]
+        for split, (start, end) in offsets.items()
+    }
+
+
+class WeatherSemiSyntheticDataset(Dataset):
+    def __init__(
+        self,
+        root: str | Path,
+        split: str,
+        *,
+        window_length: int | None = None,
+        normalize: bool = True,
+        stats: dict[str, torch.Tensor] | None = None,
+        effect_types: list[str] | tuple[str, ...] | None = None,
+        seed: int = 0,
+        include_precomputed_embeddings: bool = False,
+        precomputed_dim: int = 128,
+    ) -> None:
+        if split not in SPLITS:
+            raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+        self.root = Path(root)
+        self.split = split
+        self.seed = int(seed)
+        self.ts = _load_ts(self.root, split).astype(np.float32)
+        self.captions = np.load(self.root / f"{split}_text_caps.npy", allow_pickle=False)
+        self.attrs_idx = np.load(self.root / f"{split}_attrs_idx.npy", allow_pickle=False)
+        self.meta = _load_meta(self.root)
+        if self.ts.ndim != 3:
+            raise ValueError(f"{split}_ts.npy must have shape [N, L, C], got {self.ts.shape}")
+        if self.captions.shape[:2] != (self.ts.shape[0], 3):
+            raise ValueError(f"{split}_text_caps.npy must have shape [N, 3], got {self.captions.shape}")
+        if self.attrs_idx.shape[0] != self.ts.shape[0]:
+            raise ValueError(f"{split}_attrs_idx.npy row count does not match time series")
+
+        self.raw_length = int(self.ts.shape[1])
+        self.num_channels = int(self.ts.shape[2])
+        self.window_length = int(window_length) if window_length is not None else self.raw_length
+        if not 1 <= self.window_length <= self.raw_length:
+            raise ValueError(f"window_length must be in [1, {self.raw_length}], got {self.window_length}")
+
+        self.normalize = bool(normalize)
+        self.stats = stats if stats is not None else compute_train_stats(self.root)
+        if self.normalize:
+            self.mean = self.stats["mean"].float()
+            self.std = self.stats["std"].float()
+        else:
+            self.mean = torch.zeros(1, 1, self.num_channels)
+            self.std = torch.ones(1, 1, self.num_channels)
+
+        self.effect_types = tuple(effect_types or SUPPORTED_EFFECTS)
+        unknown = [name for name in self.effect_types if name not in SUPPORTED_EFFECTS]
+        if unknown:
+            raise ValueError(f"Unsupported effects in effect_types: {unknown}")
+
+        self.include_precomputed_embeddings = bool(include_precomputed_embeddings)
+        self.precomputed_dim = int(precomputed_dim)
+
+    def __len__(self) -> int:
+        return int(self.ts.shape[0])
+
+    @property
+    def sequence_length(self) -> int:
+        return self.window_length
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        rng = np.random.default_rng(self.seed + int(index))
+        raw = torch.from_numpy(self.ts[index]).float()
+        base = self._crop(raw, rng)
+        if self.normalize:
+            base = (base - self.mean.squeeze(0)) / self.std.squeeze(0)
+        spec = self._sample_spec(rng)
+        target, mask = apply_effect(base, spec)
+        full_text, slots = spec_to_text(spec, self.window_length)
+        item: dict[str, Any] = {
+            "B": base,
+            "Y": target,
+            "mask": mask,
+            "slots": slots,
+            "full_text": full_text,
+            "effect_type": spec.effect_type,
+            "spec": spec.to_dict(),
+            "caption": str(self.captions[index, 0]),
+        }
+        if self.include_precomputed_embeddings:
+            item["slot_embeddings"] = torch.from_numpy(hash_slot_texts(slots, self.precomputed_dim)).float()
+        return item
+
+    def _crop(self, series: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+        if self.window_length == self.raw_length:
+            return series
+        max_start = self.raw_length - self.window_length
+        start = int(rng.integers(0, max_start + 1))
+        return series[start : start + self.window_length]
+
+    def _sample_spec(self, rng: np.random.Generator) -> EffectSpec:
+        effect_type = str(rng.choice(self.effect_types))
+        min_duration = max(2, int(round(0.15 * self.window_length)))
+        max_duration = max(min_duration, int(round(0.55 * self.window_length)))
+        duration = int(rng.integers(min_duration, max_duration + 1))
+        start = int(rng.integers(0, self.window_length - duration + 1))
+        end = start + duration
+        num_channels = int(rng.integers(1, min(3, self.num_channels) + 1))
+        channels = normalize_channels(rng.choice(self.num_channels, size=num_channels, replace=False).tolist())
+        strength = _sample_strength(effect_type, rng)
+        return EffectSpec(effect_type=effect_type, start=start, end=end, channels=channels, strength=strength)
+
+
+def collate_effect_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    batch: dict[str, Any] = {
+        "B": torch.stack([s["B"] for s in samples]),
+        "Y": torch.stack([s["Y"] for s in samples]),
+        "mask": torch.stack([s["mask"] for s in samples]),
+        "slots": [s["slots"] for s in samples],
+        "full_text": [s["full_text"] for s in samples],
+        "effect_type": [s["effect_type"] for s in samples],
+        "spec": [s["spec"] for s in samples],
+        "caption": [s["caption"] for s in samples],
+    }
+    if "slot_embeddings" in samples[0]:
+        batch["slot_embeddings"] = torch.stack([s["slot_embeddings"] for s in samples])
+    return batch
+
+
+def _sample_strength(effect_type: str, rng: np.random.Generator) -> float:
+    if effect_type == "volatility_up":
+        return float(rng.uniform(1.2, 1.9))
+    if effect_type == "volatility_down":
+        return float(rng.uniform(0.35, 0.8))
+    if effect_type in {"trend_down", "drop"}:
+        return float(rng.uniform(0.25, 1.25))
+    return float(rng.uniform(0.25, 1.25))
+
+
+def _load_ts(root: str | Path, split: str) -> np.ndarray:
+    root = Path(root)
+    path = root / f"{split}_ts.npy"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return np.load(path, allow_pickle=False)
+
+
+def _load_meta(root: Path) -> dict[str, Any]:
+    with (root / "meta.json").open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _split_offsets(root: str | Path) -> dict[str, tuple[int, int]]:
+    root = Path(root)
+    sizes = {split: int(_load_ts(root, split).shape[0]) for split in SPLITS}
+    train_end = sizes["train"]
+    valid_end = train_end + sizes["valid"]
+    return {
+        "train": (0, train_end),
+        "valid": (train_end, valid_end),
+        "test": (valid_end, valid_end + sizes["test"]),
+    }

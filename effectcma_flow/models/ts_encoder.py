@@ -16,12 +16,10 @@ class TimePatchEncoder(nn.Module):
         heads: int = 4,
     ) -> None:
         super().__init__()
-        if sequence_length % patch_len != 0:
-            raise ValueError(f"sequence_length={sequence_length} must be divisible by patch_len={patch_len}")
         self.sequence_length = int(sequence_length)
         self.num_channels = int(num_channels)
         self.patch_len = int(patch_len)
-        self.num_patches = self.sequence_length // self.patch_len
+        self.num_patches = (self.sequence_length + self.patch_len - 1) // self.patch_len
         self.proj = nn.Linear(self.patch_len * self.num_channels, d_model)
         self.pos = nn.Parameter(torch.randn(self.num_patches, d_model) * 0.02)
         layer = nn.TransformerEncoderLayer(
@@ -41,6 +39,10 @@ class TimePatchEncoder(nn.Module):
         batch, length, channels = base.shape
         if length != self.sequence_length or channels != self.num_channels:
             raise ValueError(f"Expected [*, {self.sequence_length}, {self.num_channels}], got {tuple(base.shape)}")
+        padded_length = self.num_patches * self.patch_len
+        if padded_length > length:
+            pad = base.new_zeros(batch, padded_length - length, channels)
+            base = torch.cat([base, pad], dim=1)
         x = base.reshape(batch, self.num_patches, self.patch_len, channels)
         x = x.reshape(batch, self.num_patches, self.patch_len * channels)
         tokens = self.proj(x) + self.pos[None, :, :]

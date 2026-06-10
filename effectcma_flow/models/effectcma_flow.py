@@ -114,8 +114,9 @@ class EffectCMAFlow(nn.Module):
         slot_tokens, slot_mask = self.text_encoder(text_condition)
         g_patch, aux = self.mapper(slot_tokens, time_tokens, channel_tokens, slot_mask)
         g = g_patch.repeat_interleave(self.patch_len, dim=1)
-        if g.shape[1] != self.sequence_length:
-            raise RuntimeError(f"Expanded effect field length {g.shape[1]} does not match {self.sequence_length}")
+        if g.shape[1] < self.sequence_length:
+            raise RuntimeError(f"Expanded effect field length {g.shape[1]} is shorter than {self.sequence_length}")
+        g = g[:, : self.sequence_length]
         velocities = self.operator_bank(x_t, base, t)
         v_hat = (g * velocities).sum(dim=-1)
         aux = {**aux, "G_patch": g_patch, "G": g, "V": velocities}

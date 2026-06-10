@@ -94,6 +94,17 @@ def test_text2ts_model_forward_and_train_step_updates_params():
     assert not torch.allclose(before, model.mapper.op_proto.detach())
 
 
+def test_text2ts_model_supports_non_divisible_patch_length():
+    cfg = _text2ts_config()
+    cfg["model"]["patch_len"] = 6
+    model = build_model(cfg, sequence_length=13, num_channels=3)
+    x_t = torch.randn(2, 13, 3)
+    out, aux = model(x_t, torch.rand(2), [["caption"], ["caption"]])
+    assert out.shape == (2, 13, 3)
+    assert aux["G"].shape[:3] == (2, 13, 3)
+    assert torch.isfinite(out).all()
+
+
 class SpyZeroModel(nn.Module):
     def __init__(self):
         super().__init__()

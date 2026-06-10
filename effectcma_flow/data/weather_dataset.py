@@ -25,7 +25,7 @@ def compute_train_stats(root: str | Path) -> dict[str, torch.Tensor]:
 
 
 def load_weather_caption_embeddings(root: str | Path, *, expected_dim: int = 128) -> dict[str, np.ndarray]:
-    """Load and split `[total_samples * 3, 128]` caption embeddings correctly."""
+    """Load and split flat caption embeddings as `[samples, captions_per_sample, dim]`."""
     root = Path(root)
     counts = np.load(root / "text_embedding_caption_counts.npy", allow_pickle=False)
     flat = np.load(root / "text_embeddings_128_all_caps.npy", allow_pickle=False)
@@ -35,14 +35,17 @@ def load_weather_caption_embeddings(root: str | Path, *, expected_dim: int = 128
     total_samples = sum(split_sizes.values())
     if counts.shape[0] != total_samples:
         raise ValueError(f"caption counts rows {counts.shape[0]} do not match split total {total_samples}")
-    if not np.all(counts == 3):
-        raise ValueError("Only exactly three captions per sample are supported for Weather embeddings")
+    if not np.all(counts == counts[0]):
+        raise ValueError("Only a uniform number of captions per sample is supported for caption embeddings")
+    captions_per_sample = int(counts[0])
+    if captions_per_sample <= 0:
+        raise ValueError("caption counts must be positive")
     expected = int(counts.sum())
     if flat.ndim != 2:
-        raise ValueError(f"caption embeddings must be 2-D [total*3, 128], got {flat.shape}")
+        raise ValueError(f"caption embeddings must be 2-D [sum(counts), {expected_dim}], got {flat.shape}")
     if flat.shape != (expected, expected_dim):
         raise ValueError(f"caption embeddings must have shape {(expected, expected_dim)}, got {flat.shape}")
-    sample_embeddings = flat.reshape(total_samples, 3, expected_dim).astype(np.float32)
+    sample_embeddings = flat.reshape(total_samples, captions_per_sample, expected_dim).astype(np.float32)
 
     offsets = _split_offsets(root)
     return {
@@ -71,13 +74,12 @@ class WeatherSemiSyntheticDataset(Dataset):
         self.split = split
         self.seed = int(seed)
         self.ts = _load_ts(self.root, split).astype(np.float32)
-        self.captions = np.load(self.root / f"{split}_text_caps.npy", allow_pickle=False)
+        self.captions = np.load(self.root / f"{split}_text_caps.npy", allow_pickle=True)
         self.attrs_idx = np.load(self.root / f"{split}_attrs_idx.npy", allow_pickle=False)
         self.meta = _load_meta(self.root)
         if self.ts.ndim != 3:
             raise ValueError(f"{split}_ts.npy must have shape [N, L, C], got {self.ts.shape}")
-        if self.captions.shape[:2] != (self.ts.shape[0], 3):
-            raise ValueError(f"{split}_text_caps.npy must have shape [N, 3], got {self.captions.shape}")
+        _validate_caption_array(self.captions, self.ts.shape[0], split)
         if self.attrs_idx.shape[0] != self.ts.shape[0]:
             raise ValueError(f"{split}_attrs_idx.npy row count does not match time series")
 
@@ -184,12 +186,11 @@ class WeatherRawCaptionDataset(Dataset):
         self.seed = int(seed)
         self.caption_policy = caption_policy
         self.ts = _load_ts(self.root, split).astype(np.float32)
-        self.captions = np.load(self.root / f"{split}_text_caps.npy", allow_pickle=False)
+        self.captions = np.load(self.root / f"{split}_text_caps.npy", allow_pickle=True)
         self.attrs_idx = np.load(self.root / f"{split}_attrs_idx.npy", allow_pickle=False)
         if self.ts.ndim != 3:
             raise ValueError(f"{split}_ts.npy must have shape [N, L, C], got {self.ts.shape}")
-        if self.captions.shape[:2] != (self.ts.shape[0], 3):
-            raise ValueError(f"{split}_text_caps.npy must have shape [N, 3], got {self.captions.shape}")
+        _validate_caption_array(self.captions, self.ts.shape[0], split)
         if self.attrs_idx.shape[0] != self.ts.shape[0]:
             raise ValueError(f"{split}_attrs_idx.npy row count does not match time series")
 
@@ -305,6 +306,15 @@ def _load_ts(root: str | Path, split: str) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(path)
     return np.load(path, allow_pickle=False)
+
+
+def _validate_caption_array(captions: np.ndarray, num_samples: int, split: str) -> None:
+    if captions.ndim != 2:
+        raise ValueError(f"{split}_text_caps.npy must have shape [N, J], got {captions.shape}")
+    if captions.shape[0] != num_samples:
+        raise ValueError(f"{split}_text_caps.npy row count {captions.shape[0]} does not match time series {num_samples}")
+    if captions.shape[1] < 1:
+        raise ValueError(f"{split}_text_caps.npy must contain at least one caption per sample, got {captions.shape}")
 
 
 def _load_meta(root: Path) -> dict[str, Any]:

@@ -74,3 +74,16 @@ def test_raw_caption_dataset_returns_text_only_training_fields(fake_weather_root
     batch = collate_raw_caption_batch([item, ds[2]])
     assert batch["Y"].shape == (2, 12, 4)
     assert batch["caption_embeddings"].shape == (2, 128)
+
+
+def test_raw_caption_dataset_accepts_single_caption_per_sample(fake_weather_root):
+    for split in ("train", "valid", "test"):
+        caps = np.load(fake_weather_root / f"{split}_text_caps.npy", allow_pickle=True)
+        np.save(fake_weather_root / f"{split}_text_caps.npy", caps[:, :1])
+    stats = compute_train_stats(fake_weather_root)
+    ds = WeatherRawCaptionDataset(fake_weather_root, "train", stats=stats, seed=123, caption_policy="random")
+    item = ds[3]
+    assert item["caption"] == "train sample 3 caption 0"
+    assert item["caption_id"] == 0
+    batch = collate_raw_caption_batch([item])
+    assert batch["caption"] == ["train sample 3 caption 0"]

@@ -13,6 +13,7 @@ class DilatedResidualBlock(nn.Module):
         dilation: int,
         dropout: float,
         pointwise_groups: int = 1,
+        norm_type: str = "group",
     ) -> None:
         super().__init__()
         padding = dilation * (kernel_size - 1) // 2
@@ -23,7 +24,12 @@ class DilatedResidualBlock(nn.Module):
             nn.SiLU(),
             nn.Dropout(dropout),
         )
-        self.norm = nn.BatchNorm1d(width)
+        if norm_type == "group":
+            self.norm = nn.GroupNorm(1, width)
+        elif norm_type == "batch":
+            self.norm = nn.BatchNorm1d(width)
+        else:
+            raise ValueError(f"norm_type must be 'group' or 'batch', got {norm_type!r}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.block(x)
@@ -41,6 +47,7 @@ class TemporalOperatorExpert(nn.Module):
         depth: int,
         kernel_size: int,
         dropout: float,
+        norm_type: str,
     ) -> None:
         super().__init__()
         width = int(num_channels) * int(hidden)
@@ -52,6 +59,7 @@ class TemporalOperatorExpert(nn.Module):
                     dilation=2**layer,
                     dropout=dropout,
                     pointwise_groups=int(num_channels),
+                    norm_type=norm_type,
                 )
                 for layer in range(max(1, int(depth)))
             ]
@@ -76,6 +84,9 @@ class ResidualOperatorBank(nn.Module):
         depth: int = 2,
         kernel_size: int = 3,
         dropout: float = 0.0,
+        context_dim: int | None = None,
+        context_film: bool = True,
+        norm_type: str = "group",
     ) -> None:
         super().__init__()
         self.num_channels = int(num_channels)
@@ -90,6 +101,11 @@ class ResidualOperatorBank(nn.Module):
         self.in_proj = nn.Linear(4 + t_dim, hidden)
         width = self.hidden * self.num_channels
         self.channel_mixer = nn.Linear(self.num_channels, self.num_channels, bias=False)
+        self.context_proj = nn.Linear(int(context_dim), self.hidden) if context_dim is not None else None
+        self.context_film = nn.Linear(int(context_dim) + t_dim, 2 * self.hidden) if context_dim is not None and context_film else None
+        if self.context_film is not None:
+            nn.init.zeros_(self.context_film.weight)
+            nn.init.zeros_(self.context_film.bias)
         self.shared_temporal = nn.Sequential(
             nn.Conv1d(width, width, kernel_size=3, padding=1, groups=width),
             nn.SiLU(),
@@ -102,12 +118,15 @@ class ResidualOperatorBank(nn.Module):
                     depth=depth,
                     kernel_size=kernel_size,
                     dropout=dropout,
+                    norm_type=norm_type,
                 )
                 for _ in range(self.num_operators)
             ]
         )
 
-    def forward(self, x_t: torch.Tensor, base: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, base: torch.Tensor | None, t: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        if base is None:
+            base = torch.zeros_like(x_t)
         if x_t.shape != base.shape:
             raise ValueError(f"x_t and base shapes must match, got {tuple(x_t.shape)} and {tuple(base.shape)}")
         batch, length, channels = x_t.shape
@@ -119,13 +138,28 @@ class ResidualOperatorBank(nn.Module):
             raise ValueError(f"base and x_t must have same dtype, got {base.dtype} and {x_t.dtype}")
         if channels != self.num_channels:
             raise ValueError(f"Expected C={self.num_channels}, got {channels}")
-        t_emb = self.t_embed(t[:, None].to(x_t.dtype))
-        t_emb = t_emb[:, None, None, :].expand(batch, length, channels, -1)
+        t_code = self.t_embed(t[:, None].to(x_t.dtype))
+        t_emb = t_code[:, None, None, :].expand(batch, length, channels, -1)
         pos = torch.linspace(-1.0, 1.0, length, device=x_t.device, dtype=x_t.dtype)
         pos = pos[None, :, None].expand(batch, length, channels)
         feat = torch.stack([x_t, base, x_t - base, pos], dim=-1)
         feat = torch.cat([feat, t_emb], dim=-1)
         h = self.in_proj(feat)
+        if context is not None:
+            if self.context_proj is None:
+                raise ValueError("context was provided but this ResidualOperatorBank was created without context_dim")
+            if context.shape != (batch, self.context_proj.in_features):
+                raise ValueError(
+                    f"context must have shape [batch, {self.context_proj.in_features}], got {tuple(context.shape)}"
+                )
+            context = context.to(x_t.dtype)
+            h = h + self.context_proj(context)[:, None, None, :]
+            if self.context_film is not None:
+                film = self.context_film(torch.cat([context, t_code], dim=-1))
+                gamma, beta = film.chunk(2, dim=-1)
+                h = h * (1.0 + 0.1 * torch.tanh(gamma)[:, None, None, :]) + 0.1 * beta[:, None, None, :]
+        elif self.context_proj is not None:
+            h = h + self.context_proj.weight.new_zeros((batch, 1, 1, self.context_proj.out_features))
         h = h + self.channel_mixer(h.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
         h2 = h.permute(0, 2, 3, 1).reshape(batch, channels * self.hidden, length)
         h2 = self.shared_temporal(h2)

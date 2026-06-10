@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any
+import json
 
 import numpy as np
 import torch
@@ -10,7 +11,7 @@ import yaml
 from scipy import linalg
 from tqdm import tqdm
 
-from effectcma_flow.evaluation.sampler import euler_sample
+from effectcma_flow.evaluation.sampler import euler_sample, euler_sample_text2ts
 from effectcma_flow.training.utils import batch_to_device, text_condition_from_batch
 
 
@@ -71,6 +72,9 @@ class VerbalTSMetricComputer:
         generated_loader,
         text_encoder_mode: str,
         steps: int,
+        task_mode: str = "edit",
+        noise_scale: float = 1.0,
+        n_samples: int = 1,
         reference_series_key: str = "Y",
         reference_text_key: str = "full_text",
         generated_text_key: str = "full_text",
@@ -78,9 +82,10 @@ class VerbalTSMetricComputer:
         reference_max_batches: int | None = None,
         generated_max_batches: int | None = None,
         cache_dir: str | Path | None = None,
+        cache_metadata: dict[str, Any] | None = None,
     ) -> dict[str, float]:
         reference_cache_dir = cache_dir if reference_max_batches is None else None
-        ref_stats = self._load_reference_stats(reference_cache_dir)
+        ref_stats = self._load_reference_stats(reference_cache_dir, cache_metadata)
         if ref_stats is None:
             ref_ts, ref_joint = self._collect_reference_embeddings(
                 reference_loader,
@@ -96,13 +101,16 @@ class VerbalTSMetricComputer:
                 "joint_cov": _mean_cov(ref_joint)[1],
                 "reference_count": float(ref_ts.shape[0]),
             }
-            self._save_reference_stats(reference_cache_dir, ref_stats)
+            self._save_reference_stats(reference_cache_dir, ref_stats, cache_metadata)
 
         gen_ts, gen_joint, cttp = self._collect_generated_embeddings(
             model=model,
             loader=generated_loader,
             text_encoder_mode=text_encoder_mode,
             steps=steps,
+            task_mode=task_mode,
+            noise_scale=noise_scale,
+            n_samples=n_samples,
             text_key=generated_text_key,
             max_batches=generated_max_batches,
         )
@@ -148,6 +156,9 @@ class VerbalTSMetricComputer:
         loader,
         text_encoder_mode: str,
         steps: int,
+        task_mode: str,
+        noise_scale: float,
+        n_samples: int,
         text_key: str,
         max_batches: int | None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -160,7 +171,33 @@ class VerbalTSMetricComputer:
             if max_batches is not None and batch_no >= max_batches:
                 break
             batch = batch_to_device(batch, self.device)
-            pred, _ = euler_sample(model, batch["B"], text_condition_from_batch(batch, text_encoder_mode), steps=steps)
+            if task_mode == "text2ts":
+                preds = []
+                text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
+                for _ in range(max(1, int(n_samples))):
+                    pred_one, _ = euler_sample_text2ts(
+                        model,
+                        batch["Y"],
+                        text_condition,
+                        steps=steps,
+                        noise_scale=noise_scale,
+                    )
+                    preds.append(pred_one)
+                pred = torch.stack(preds, dim=0).median(dim=0).values
+            elif task_mode == "edit":
+                preds = []
+                text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="slots")
+                for _ in range(max(1, int(n_samples))):
+                    pred_one, _ = euler_sample(
+                        model,
+                        batch["B"],
+                        text_condition,
+                        steps=steps,
+                    )
+                    preds.append(pred_one)
+                pred = torch.stack(preds, dim=0).median(dim=0).values
+            else:
+                raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
             pred = self._denormalize(pred.float())
             text = [str(x) for x in batch[text_key]]
             ts_emb, text_emb = self._embed(pred, text)
@@ -185,7 +222,7 @@ class VerbalTSMetricComputer:
         std = self.stats["std"].to(ts.device, dtype=ts.dtype)
         return ts * std + mean
 
-    def _load_reference_stats(self, cache_dir: str | Path | None) -> dict[str, Any] | None:
+    def _load_reference_stats(self, cache_dir: str | Path | None, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         if cache_dir is None:
             return None
         cache = Path(cache_dir)
@@ -196,13 +233,20 @@ class VerbalTSMetricComputer:
             "joint_cov": cache / "verbalts_ref_joint_cov.npy",
         }
         count_path = cache / "verbalts_ref_count.npy"
+        meta_path = cache / "verbalts_ref_meta.json"
         if not all(path.exists() for path in files.values()) or not count_path.exists():
             return None
+        if metadata is not None:
+            if not meta_path.exists():
+                return None
+            cached = json.loads(meta_path.read_text(encoding="utf-8"))
+            if cached != _jsonable(metadata):
+                return None
         out = {key: np.load(path, allow_pickle=False) for key, path in files.items()}
         out["reference_count"] = float(np.load(count_path, allow_pickle=False).reshape(-1)[0])
         return out
 
-    def _save_reference_stats(self, cache_dir: str | Path | None, stats: dict[str, Any]) -> None:
+    def _save_reference_stats(self, cache_dir: str | Path | None, stats: dict[str, Any], metadata: dict[str, Any] | None) -> None:
         if cache_dir is None:
             return
         cache = Path(cache_dir)
@@ -212,6 +256,8 @@ class VerbalTSMetricComputer:
         np.save(cache / "verbalts_ref_joint_mean.npy", stats["joint_mean"])
         np.save(cache / "verbalts_ref_joint_cov.npy", stats["joint_cov"])
         np.save(cache / "verbalts_ref_count.npy", np.array([stats["reference_count"]], dtype=np.float64))
+        if metadata is not None:
+            (cache / "verbalts_ref_meta.json").write_text(json.dumps(_jsonable(metadata), sort_keys=True, indent=2), encoding="utf-8")
 
 
 def _load_verbalts_cttp(
@@ -255,3 +301,15 @@ def _cat_numpy(items: list[torch.Tensor], name: str) -> np.ndarray:
     if not items:
         raise ValueError(f"No {name} collected")
     return torch.cat(items, dim=0).numpy()
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value.resolve())
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value

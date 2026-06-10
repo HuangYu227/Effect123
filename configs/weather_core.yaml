@@ -1,7 +1,11 @@
+task:
+  mode: text2ts
+
 data:
   root: null
   window_length: null
   normalize: true
+  caption_policy: random
   include_precomputed_embeddings: false
   seed: 20260609
   effect_types:
@@ -29,12 +33,16 @@ model:
   mapper_slot_layers: 1
   mapper_slot_heads: 4
   mapper_dropout: 0.0
+  mapper_bounded_field_gate: true
+  mapper_flow_time_condition: true
   operator_hidden: 64
   operator_t_dim: 32
   operator_max_velocity: 5.0
   operator_depth: 2
   operator_kernel_size: 3
   operator_dropout: 0.0
+  operator_context_film: true
+  operator_norm: group
   mapper_normalizer: softmax
 
 text_encoder:
@@ -50,10 +58,12 @@ text_encoder:
 
 train:
   batch_size: 32
+  eval_batch_size: null
   lr: 0.0001
   weight_decay: 0.0001
   max_steps: 1000
-  cfm_loss_mode: balanced
+  cfm_loss_mode: global
+  noise_scale: 1.0
   grad_clip: 1.0
   num_workers: 0
   device: auto
@@ -61,6 +71,10 @@ train:
   log_every: 20
   eval_every: 200
   eval_batches: 4
+  eval_seed_offset: 50000
+  best_metric: mse
+  save_every: 1000
 
 sample:
   steps: 16
+  noise_scale: 1.0

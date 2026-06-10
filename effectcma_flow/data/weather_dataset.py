@@ -154,6 +154,111 @@ class WeatherSemiSyntheticDataset(Dataset):
         return EffectSpec(effect_type=effect_type, start=start, end=end, channels=channels, strength=strength)
 
 
+class WeatherRawCaptionDataset(Dataset):
+    """Weather split for VerbalTS-style text-to-time-series generation.
+
+    The model condition is the selected caption only. The raw time series is
+    returned for VerbalTS metric reference, while `Y` is normalized for CFM
+    training when `normalize=True`.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        split: str,
+        *,
+        window_length: int | None = None,
+        normalize: bool = True,
+        stats: dict[str, torch.Tensor] | None = None,
+        seed: int = 0,
+        caption_policy: str = "random",
+        include_precomputed_embeddings: bool = False,
+        precomputed_dim: int = 128,
+    ) -> None:
+        if split not in SPLITS:
+            raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+        if caption_policy not in {"random", "cyclic", "first"}:
+            raise ValueError("caption_policy must be one of {'random', 'cyclic', 'first'}")
+        self.root = Path(root)
+        self.split = split
+        self.seed = int(seed)
+        self.caption_policy = caption_policy
+        self.ts = _load_ts(self.root, split).astype(np.float32)
+        self.captions = np.load(self.root / f"{split}_text_caps.npy", allow_pickle=False)
+        self.attrs_idx = np.load(self.root / f"{split}_attrs_idx.npy", allow_pickle=False)
+        if self.ts.ndim != 3:
+            raise ValueError(f"{split}_ts.npy must have shape [N, L, C], got {self.ts.shape}")
+        if self.captions.shape[:2] != (self.ts.shape[0], 3):
+            raise ValueError(f"{split}_text_caps.npy must have shape [N, 3], got {self.captions.shape}")
+        if self.attrs_idx.shape[0] != self.ts.shape[0]:
+            raise ValueError(f"{split}_attrs_idx.npy row count does not match time series")
+
+        self.raw_length = int(self.ts.shape[1])
+        self.num_channels = int(self.ts.shape[2])
+        self.window_length = int(window_length) if window_length is not None else self.raw_length
+        if not 1 <= self.window_length <= self.raw_length:
+            raise ValueError(f"window_length must be in [1, {self.raw_length}], got {self.window_length}")
+
+        self.normalize = bool(normalize)
+        self.stats = stats if stats is not None else compute_train_stats(self.root)
+        if self.normalize:
+            self.mean = self.stats["mean"].float()
+            self.std = self.stats["std"].float()
+        else:
+            self.mean = torch.zeros(1, 1, self.num_channels)
+            self.std = torch.ones(1, 1, self.num_channels)
+
+        self.include_precomputed_embeddings = bool(include_precomputed_embeddings)
+        self.precomputed_dim = int(precomputed_dim)
+        self.epoch = 0
+        self.caption_embeddings: np.ndarray | None = None
+        if self.include_precomputed_embeddings:
+            self.caption_embeddings = load_weather_caption_embeddings(self.root, expected_dim=self.precomputed_dim)[split]
+
+    def __len__(self) -> int:
+        return int(self.ts.shape[0])
+
+    @property
+    def sequence_length(self) -> int:
+        return self.window_length
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        rng = np.random.default_rng(self.seed + int(index) + 1_000_003 * self.epoch)
+        raw = torch.from_numpy(self.ts[index]).float()
+        raw = self._crop(raw, rng)
+        target = (raw - self.mean.squeeze(0)) / self.std.squeeze(0) if self.normalize else raw
+        cap_idx = self._caption_index(index, rng)
+        caption = str(self.captions[index, cap_idx])
+        item: dict[str, Any] = {
+            "Y": target.float(),
+            "ts": raw.float(),
+            "caption": caption,
+            "caption_id": cap_idx,
+            "slots": [caption],
+            "attrs_idx": torch.from_numpy(self.attrs_idx[index]).long(),
+        }
+        if self.caption_embeddings is not None:
+            item["caption_embedding"] = torch.from_numpy(self.caption_embeddings[index, cap_idx]).float()
+        return item
+
+    def _crop(self, series: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+        if self.window_length == self.raw_length:
+            return series
+        max_start = self.raw_length - self.window_length
+        start = int(rng.integers(0, max_start + 1))
+        return series[start : start + self.window_length]
+
+    def _caption_index(self, index: int, rng: np.random.Generator) -> int:
+        if self.caption_policy == "first":
+            return 0
+        if self.caption_policy == "cyclic":
+            return int(index) % int(self.captions.shape[1])
+        return int(rng.integers(0, self.captions.shape[1]))
+
+
 def collate_effect_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     batch: dict[str, Any] = {
         "B": torch.stack([s["B"] for s in samples]),
@@ -167,6 +272,20 @@ def collate_effect_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "slot_embeddings" in samples[0]:
         batch["slot_embeddings"] = torch.stack([s["slot_embeddings"] for s in samples])
+    return batch
+
+
+def collate_raw_caption_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    batch: dict[str, Any] = {
+        "Y": torch.stack([s["Y"] for s in samples]),
+        "ts": torch.stack([s["ts"] for s in samples]),
+        "caption": [s["caption"] for s in samples],
+        "caption_id": torch.tensor([s["caption_id"] for s in samples], dtype=torch.long),
+        "slots": [s["slots"] for s in samples],
+        "attrs_idx": torch.stack([s["attrs_idx"] for s in samples]),
+    }
+    if "caption_embedding" in samples[0]:
+        batch["caption_embeddings"] = torch.stack([s["caption_embedding"] for s in samples])
     return batch
 
 

@@ -17,3 +17,33 @@ def euler_sample(model, base: torch.Tensor, text_condition, *, steps: int = 16) 
         x = x + dt * v
     return x, aux
 
+
+@torch.no_grad()
+def euler_sample_text2ts(
+    model,
+    shape_like: torch.Tensor,
+    text_condition,
+    *,
+    steps: int = 16,
+    noise_scale: float = 1.0,
+    noise: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict]:
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    if shape_like.ndim != 3:
+        raise ValueError(f"shape_like must be [B, L, C], got {tuple(shape_like.shape)}")
+    if noise is None:
+        x = torch.randn(shape_like.shape, device=shape_like.device, dtype=shape_like.dtype, generator=generator) * float(noise_scale)
+    else:
+        x = noise.to(shape_like.device, dtype=shape_like.dtype)
+    if x.shape != shape_like.shape:
+        raise ValueError(f"noise must have shape {tuple(shape_like.shape)}, got {tuple(x.shape)}")
+    aux = {}
+    batch_size = shape_like.shape[0]
+    dt = 1.0 / float(steps)
+    for n in range(steps):
+        t = torch.full((batch_size,), n / float(steps), device=shape_like.device, dtype=shape_like.dtype)
+        v, aux = model(x, t, text_condition)
+        x = x + dt * v
+    return x, aux

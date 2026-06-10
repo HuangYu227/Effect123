@@ -27,3 +27,30 @@ def dump_sample_plot(path: str | Path, base: torch.Tensor, target: torch.Tensor,
     fig.savefig(path)
     plt.close(fig)
 
+
+def dump_text2ts_plot(path: str | Path, target: torch.Tensor, pred: torch.Tensor, *, channel: int = 0) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = target.detach().cpu()
+    pred = pred.detach().cpu()
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(target[:, channel], label="target")
+    ax.plot(pred[:, channel], label="generated")
+    ax.legend(loc="best")
+    ax.set_title(f"channel {channel}")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def dump_generated_plot(path: str | Path, pred: torch.Tensor, *, channel: int = 0) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pred = pred.detach().cpu()
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(pred[:, channel], label="generated")
+    ax.legend(loc="best")
+    ax.set_title(f"channel {channel}")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)

@@ -16,17 +16,32 @@ def cfm_train_step(
     grad_clip: float | None = 1.0,
     text_encoder_mode: str = "hash",
     cfm_loss_mode: str = "global",
+    task_mode: str = "edit",
+    noise_scale: float = 1.0,
 ) -> dict[str, Any]:
     if device is not None:
         batch = batch_to_device(batch, device)
-    base = batch["B"]
-    target = batch["Y"]
-    batch_size = base.shape[0]
-    t = torch.rand(batch_size, device=base.device, dtype=base.dtype)
-    x_t = (1.0 - t[:, None, None]) * base + t[:, None, None] * target
-    target_v = target - base
-    text_condition = text_condition_from_batch(batch, text_encoder_mode)
-    pred_v, aux = model(base, x_t, t, text_condition)
+    task_mode = str(task_mode).lower()
+    if task_mode == "edit":
+        base = batch["B"]
+        target = batch["Y"]
+        batch_size = base.shape[0]
+        t = torch.rand(batch_size, device=base.device, dtype=base.dtype)
+        x_t = (1.0 - t[:, None, None]) * base + t[:, None, None] * target
+        target_v = target - base
+        text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="slots")
+        pred_v, aux = model(base, x_t, t, text_condition)
+    elif task_mode == "text2ts":
+        target = batch["Y"]
+        batch_size = target.shape[0]
+        t = torch.rand(batch_size, device=target.device, dtype=target.dtype)
+        source = torch.randn_like(target) * float(noise_scale)
+        x_t = (1.0 - t[:, None, None]) * source + t[:, None, None] * target
+        target_v = target - source
+        text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
+        pred_v, aux = model(x_t, t, text_condition)
+    else:
+        raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
     sq_error = (pred_v - target_v) ** 2
     loss, loss_parts = _cfm_loss(sq_error, batch.get("mask"), mode=cfm_loss_mode)
 

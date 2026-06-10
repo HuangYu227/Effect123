@@ -69,6 +69,21 @@ def average_metric_dicts(items: list[dict[str, float]]) -> dict[str, float]:
     return {key: float(sum(item[key] for item in items) / len(items)) for key in keys}
 
 
+def compute_text2ts_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    if pred.shape != target.shape:
+        raise ValueError(f"pred and target must have identical shapes, got {tuple(pred.shape)} and {tuple(target.shape)}")
+    mse = torch.mean((pred - target) ** 2)
+    mae = torch.mean((pred - target).abs())
+    pred_std = pred.std(dim=(0, 1)).mean()
+    target_std = target.std(dim=(0, 1)).mean()
+    return {
+        "mse": float(mse.detach().cpu()),
+        "mae": float(mae.detach().cpu()),
+        "pred_std": float(pred_std.detach().cpu()),
+        "target_std": float(target_std.detach().cpu()),
+    }
+
+
 def compute_field_metrics(aux: dict[str, torch.Tensor], mask: torch.Tensor, specs: list[dict], *, threshold: float = 1e-8) -> dict[str, float]:
     """Measure whether the learned effect field is localized like the synthetic spec."""
     if "G" not in aux:

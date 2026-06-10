@@ -4,14 +4,16 @@ from typing import Any
 
 from effectcma_flow.models.effectcma_flow import EffectCMAFlow
 from effectcma_flow.models.text_encoder import build_text_encoder
+from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 
 
-def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow:
+def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
     model_cfg = config.get("model", config)
     text_cfg = config.get("text_encoder", {"mode": "hash"})
+    task_mode = str(config.get("task", {}).get("mode", "edit")).lower()
     d_model = int(model_cfg.get("d_model", 128))
     text_encoder = build_text_encoder(text_cfg, d_model=d_model)
-    return EffectCMAFlow(
+    kwargs = dict(
         sequence_length=sequence_length,
         num_channels=num_channels,
         patch_len=int(model_cfg.get("patch_len", 6)),
@@ -37,7 +39,16 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         mapper_slot_heads=_optional_int(model_cfg.get("mapper_slot_heads")),
         mapper_dropout=float(model_cfg.get("mapper_dropout", 0.0)),
         mapper_normalizer=str(model_cfg.get("mapper_normalizer", "softmax")),
+        mapper_bounded_field_gate=bool(model_cfg.get("mapper_bounded_field_gate", True)),
+        mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
+        operator_context_film=bool(model_cfg.get("operator_context_film", True)),
+        operator_norm=str(model_cfg.get("operator_norm", "group")),
     )
+    if task_mode == "edit":
+        return EffectCMAFlow(**kwargs)
+    if task_mode == "text2ts":
+        return TextToTSFlow(**kwargs)
+    raise ValueError(f"Unknown task.mode {task_mode!r}; expected 'text2ts' or 'edit'")
 
 
 def _optional_int(value: Any) -> int | None:

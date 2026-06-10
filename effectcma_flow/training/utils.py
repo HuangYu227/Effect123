@@ -31,19 +31,31 @@ def batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, An
     return moved
 
 
-def text_condition_from_batch(batch: dict[str, Any], mode: str):
+def text_condition_from_batch(batch: dict[str, Any], mode: str, *, condition_key: str = "slots"):
     if mode == "precomputed":
-        if "slot_embeddings" not in batch:
-            raise ValueError(
-                "precomputed text encoder mode requires batch['slot_embeddings'] derived from the synthetic effect slots; "
-                "raw Weather caption embeddings are intentionally not used for semi-synthetic effect control"
-            )
-        embeddings = batch["slot_embeddings"]
+        embedding_key = _embedding_key(condition_key)
+        if embedding_key not in batch:
+            raise ValueError(f"precomputed text encoder mode requires batch[{embedding_key!r}] for {condition_key!r} conditioning")
+        embeddings = batch[embedding_key]
         if embeddings.ndim == 2:
             mask_shape = (embeddings.shape[0], 1)
         elif embeddings.ndim == 3:
             mask_shape = embeddings.shape[:2]
         else:
-            raise ValueError(f"slot_embeddings must be [B, D] or [B, J, D], got {tuple(embeddings.shape)}")
+            raise ValueError(f"{embedding_key} must be [B, D] or [B, J, D], got {tuple(embeddings.shape)}")
         return {"embeddings": embeddings, "mask": torch.ones(mask_shape, device=embeddings.device, dtype=embeddings.dtype)}
+    if condition_key == "caption":
+        if "caption" not in batch:
+            raise ValueError("caption conditioning requires batch['caption']")
+        return [[str(text)] for text in batch["caption"]]
     return batch["slots"]
+
+
+def _embedding_key(condition_key: str) -> str:
+    if condition_key == "slots":
+        return "slot_embeddings"
+    if condition_key == "caption":
+        return "caption_embeddings"
+    if condition_key.endswith("_embeddings"):
+        return condition_key
+    return f"{condition_key}_embeddings"

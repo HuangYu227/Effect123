@@ -18,6 +18,7 @@ class EffectMapper(nn.Module):
         tau_c: float = 1.0,
         tau_o: float = 1.0,
         normalizer: str = "softmax",
+        bounded_field_gate: bool = True,
     ) -> None:
         super().__init__()
         self.field_rank = int(field_rank)
@@ -40,11 +41,13 @@ class EffectMapper(nn.Module):
         self.w_c = nn.Linear(d_model, self.field_rank * d_model)
         self.w_o = nn.Linear(d_model, self.field_rank * d_model)
         self.op_proto = nn.Parameter(torch.randn(num_operators, d_model) * 0.02)
-        self.alpha = nn.Sequential(nn.Linear(d_model, self.field_rank), nn.Softplus())
+        self.alpha = nn.Linear(d_model, self.field_rank)
+        self.field_log_amplitude = nn.Parameter(torch.zeros(()))
         self.tau_t = float(tau_t)
         self.tau_c = float(tau_c)
         self.tau_o = float(tau_o)
         self.normalizer = normalizer
+        self.bounded_field_gate = bool(bounded_field_gate)
         self.scale = d_model**-0.5
 
     def forward(
@@ -75,9 +78,16 @@ class EffectMapper(nn.Module):
         a_t = _normalize(score_t / self.tau_t, dim=-1, normalizer=self.normalizer)
         a_c = torch.softmax(score_c / self.tau_c, dim=-1)
         a_o = torch.softmax(score_o / self.tau_o, dim=-1)
-        alpha = self.alpha(slot_tokens)
-        if slot_mask is not None:
-            alpha = alpha * slot_mask[:, :, None]
+        alpha_logits = self.alpha(slot_tokens)
+        if self.bounded_field_gate:
+            alpha = self._bounded_alpha(alpha_logits, slot_mask)
+            field_amplitude = 2.0 * torch.sigmoid(self.field_log_amplitude)
+            alpha = alpha * field_amplitude
+        else:
+            alpha = torch.nn.functional.softplus(alpha_logits)
+            if slot_mask is not None:
+                alpha = alpha * slot_mask[:, :, None]
+            field_amplitude = alpha.new_tensor(float("nan"))
 
         g_patch = torch.einsum("bjrp,bjrc,bjrk,bjr->bpck", a_t, a_c, a_o, alpha)
         rank_weight = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -89,8 +99,23 @@ class EffectMapper(nn.Module):
             "A_c_rank": a_c,
             "A_o_rank": a_o,
             "alpha": alpha,
+            "field_amplitude": field_amplitude.detach(),
+            "field_mass": alpha.sum(dim=(1, 2)).detach(),
         }
         return g_patch, aux
+
+    def _bounded_alpha(self, alpha_logits: torch.Tensor, slot_mask: torch.Tensor | None) -> torch.Tensor:
+        batch, slots, _ = alpha_logits.shape
+        if slot_mask is None:
+            return torch.softmax(alpha_logits.flatten(1), dim=-1).view(batch, slots, self.field_rank)
+        alpha_mask = slot_mask[:, :, None].expand_as(alpha_logits) > 0
+        masked_logits = alpha_logits.masked_fill(~alpha_mask, torch.finfo(alpha_logits.dtype).min)
+        valid = alpha_mask.flatten(1).any(dim=1)
+        alpha = torch.zeros_like(alpha_logits)
+        if bool(valid.any().detach().cpu()):
+            valid_alpha = torch.softmax(masked_logits[valid].flatten(1), dim=-1).view(-1, slots, self.field_rank)
+            alpha[valid] = valid_alpha
+        return alpha
 
 
 def _normalize(scores: torch.Tensor, *, dim: int, normalizer: str) -> torch.Tensor:

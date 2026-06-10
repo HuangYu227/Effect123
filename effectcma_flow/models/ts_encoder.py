@@ -77,7 +77,8 @@ class ChannelEncoder(nn.Module):
         self.patch_len = max(1, min(self.patch_len, self.sequence_length))
         self.stride = int(stride or self.patch_len)
         self.stride = max(1, min(self.stride, self.patch_len))
-        self.num_patches = 1 + max(0, (self.sequence_length - self.patch_len) // self.stride)
+        self.num_patches = 1 + max(0, (self.sequence_length - self.patch_len + self.stride - 1) // self.stride)
+        self.padded_length = (self.num_patches - 1) * self.stride + self.patch_len
         if d_model % heads != 0:
             raise ValueError(f"d_model={d_model} must be divisible by channel encoder heads={heads}")
 
@@ -113,6 +114,9 @@ class ChannelEncoder(nn.Module):
         if length != self.sequence_length or channels != self.num_channels:
             raise ValueError(f"Expected [*, {self.sequence_length}, {self.num_channels}], got {tuple(base.shape)}")
         x = base.transpose(1, 2)
+        if self.padded_length > length:
+            pad = x.new_zeros(batch, channels, self.padded_length - length)
+            x = torch.cat([x, pad], dim=-1)
         patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         if patches.shape[2] != self.num_patches:
             patches = patches[:, :, : self.num_patches, :]

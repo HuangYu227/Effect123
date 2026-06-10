@@ -33,6 +33,22 @@ def _text2ts_config():
     return cfg
 
 
+def _v2_text2ts_config():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "mapper_field_gate_mode": "relaxed",
+            "mapper_bounded_field_gate": False,
+            "mapper_relative_time_position": True,
+            "mapper_channel_identity": True,
+            "operator_architecture": "heterogeneous",
+            "operator_types": ["trend", "local", "volatility", "spectral", "channel"],
+            "base_velocity_branch": True,
+        }
+    )
+    return cfg
+
+
 def _batch(batch_size=2, length=12, channels=4):
     base = torch.randn(batch_size, length, channels)
     ys, masks = [], []
@@ -69,6 +85,17 @@ def test_model_forward_finite():
     assert aux["alpha"].shape == (2, 1, 4)
 
 
+def test_edit_operator_bank_receives_text_context():
+    model = build_model(_config(), sequence_length=12, num_channels=4)
+    batch = _batch()
+    t = torch.full((2,), 0.5)
+    x_t = 0.5 * batch["B"] + 0.5 * batch["Y"]
+    _, aux_up = model(batch["B"], x_t, t, [["temperature rises"], ["temperature rises"]])
+    _, aux_down = model(batch["B"], x_t, t, [["pressure drops sharply"], ["pressure drops sharply"]])
+    assert "text_context" in aux_up
+    assert not torch.allclose(aux_up["V"], aux_down["V"])
+
+
 def test_cfm_train_step_updates_trainable_params():
     model = build_model(_config(), sequence_length=12, num_channels=4)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -102,6 +129,17 @@ def test_text2ts_model_supports_non_divisible_patch_length():
     out, aux = model(x_t, torch.rand(2), [["caption"], ["caption"]])
     assert out.shape == (2, 13, 3)
     assert aux["G"].shape[:3] == (2, 13, 3)
+    assert torch.isfinite(out).all()
+
+
+def test_text2ts_v2_residual_heterogeneous_forward():
+    model = build_model(_v2_text2ts_config(), sequence_length=13, num_channels=3)
+    x_t = torch.randn(2, 13, 3)
+    out, aux = model(x_t, torch.rand(2), [["caption"], ["caption"]])
+    assert out.shape == (2, 13, 3)
+    assert aux["base_v"].shape == (2, 13, 3)
+    assert aux["residual_v"].shape == (2, 13, 3)
+    assert aux["G"].shape == (2, 13, 3, 3)
     assert torch.isfinite(out).all()
 
 
@@ -171,6 +209,17 @@ def test_channel_encoder_patch_and_channel_mixing_shape():
     assert torch.isfinite(out).all()
 
 
+def test_channel_encoder_non_divisible_length_uses_tail_values():
+    torch.manual_seed(7)
+    encoder = ChannelEncoder(13, 2, 8, patch_len=6, stride=4, temporal_layers=1, channel_layers=1, heads=4)
+    base = torch.zeros(1, 13, 2)
+    changed = base.clone()
+    changed[:, -1, :] = 5.0
+    out_base = encoder(base)
+    out_changed = encoder(changed)
+    assert not torch.allclose(out_base, out_changed)
+
+
 def test_effect_mapper_multirank_field_shapes():
     mapper = EffectMapper(d_model=16, num_operators=5, field_rank=3, slot_heads=4)
     slot_tokens = torch.randn(2, 2, 16)
@@ -183,6 +232,25 @@ def test_effect_mapper_multirank_field_shapes():
     assert torch.isfinite(g).all()
 
 
+def test_effect_mapper_signed_gate_can_produce_negative_field():
+    mapper = EffectMapper(
+        d_model=16,
+        num_operators=5,
+        field_rank=3,
+        slot_heads=4,
+        field_gate_mode="signed",
+        field_max_amplitude=4.0,
+        relative_time_position=True,
+    )
+    with torch.no_grad():
+        mapper.alpha_polarity.bias.fill_(-2.0)
+    g, aux = mapper(torch.randn(2, 2, 16), torch.randn(2, 4, 16), torch.randn(2, 3, 16), torch.ones(2, 2))
+    assert g.shape == (2, 4, 3, 5)
+    assert (g < 0).any()
+    assert torch.isfinite(aux["A_c"]).all()
+    assert torch.isfinite(aux["A_o"]).all()
+
+
 def test_operator_bank_has_independent_temporal_experts():
     bank = ResidualOperatorBank(num_channels=4, num_operators=3, hidden=8, t_dim=4, depth=2)
     assert len(bank.experts) == 3
@@ -190,4 +258,21 @@ def test_operator_bank_has_independent_temporal_experts():
     x_t = torch.randn(2, 12, 4)
     out = bank(x_t, x_t * 0.5, torch.rand(2))
     assert out.shape == (2, 12, 4, 3)
+    assert torch.isfinite(out).all()
+
+
+def test_operator_bank_heterogeneous_experts_have_distinct_biases():
+    bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=5,
+        hidden=8,
+        t_dim=4,
+        depth=2,
+        architecture="heterogeneous",
+    )
+    names = [expert.__class__.__name__ for expert in bank.experts]
+    assert len(set(names)) >= 4
+    x_t = torch.randn(2, 12, 4)
+    out = bank(x_t, None, torch.rand(2), context=None)
+    assert out.shape == (2, 12, 4, 5)
     assert torch.isfinite(out).all()

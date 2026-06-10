@@ -40,9 +40,16 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         mapper_dropout=float(model_cfg.get("mapper_dropout", 0.0)),
         mapper_normalizer=str(model_cfg.get("mapper_normalizer", "softmax")),
         mapper_bounded_field_gate=bool(model_cfg.get("mapper_bounded_field_gate", True)),
+        mapper_field_gate_mode=model_cfg.get("mapper_field_gate_mode"),
+        mapper_field_max_amplitude=float(model_cfg.get("mapper_field_max_amplitude", 8.0)),
+        mapper_relative_time_position=bool(model_cfg.get("mapper_relative_time_position", False)),
+        mapper_channel_identity=bool(model_cfg.get("mapper_channel_identity", False)),
         mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
         operator_context_film=bool(model_cfg.get("operator_context_film", True)),
         operator_norm=str(model_cfg.get("operator_norm", "group")),
+        operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
+        operator_types=model_cfg.get("operator_types"),
+        base_velocity_branch=bool(model_cfg.get("base_velocity_branch", False)),
     )
     if task_mode == "edit":
         return EffectCMAFlow(**kwargs)

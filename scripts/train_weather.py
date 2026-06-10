@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -38,6 +39,10 @@ def main() -> None:
     parser.add_argument("--text-encoder-model", default=None, help="Override hf_model_name or longclip_model_name")
     parser.add_argument("--task-mode", default=None, choices=["text2ts", "edit"])
     parser.add_argument("--unbounded-field-gate", action="store_true", help="Ablation: replace bounded normalized field gate with unbounded Softplus alpha")
+    parser.add_argument("--field-gate-mode", default=None, choices=["bounded", "relaxed", "unbounded", "signed"])
+    parser.add_argument("--field-max-amplitude", type=float, default=None)
+    parser.add_argument("--heterogeneous-operators", action="store_true", help="Use heterogeneous temporal/channel/spectral operator experts")
+    parser.add_argument("--base-velocity-branch", action="store_true", help="Add unconditional base velocity branch before text-gated residual velocity")
     parser.add_argument("--disable-text-film", action="store_true", help="Ablation: disable text FiLM modulation inside the operator bank")
     parser.add_argument("--disable-flow-time-field", action="store_true", help="Ablation: do not inject flow time into mapper slot tokens")
     parser.add_argument("--operator-norm", default=None, choices=["group", "batch"], help="Ablation: operator expert normalization")
@@ -61,6 +66,16 @@ def main() -> None:
         cfg.setdefault("task", {})["mode"] = args.task_mode
     if args.unbounded_field_gate:
         cfg.setdefault("model", {})["mapper_bounded_field_gate"] = False
+        cfg.setdefault("model", {})["mapper_field_gate_mode"] = "unbounded"
+    if args.field_gate_mode is not None:
+        cfg.setdefault("model", {})["mapper_field_gate_mode"] = args.field_gate_mode
+        cfg.setdefault("model", {})["mapper_bounded_field_gate"] = args.field_gate_mode == "bounded"
+    if args.field_max_amplitude is not None:
+        cfg.setdefault("model", {})["mapper_field_max_amplitude"] = args.field_max_amplitude
+    if args.heterogeneous_operators:
+        cfg.setdefault("model", {})["operator_architecture"] = "heterogeneous"
+    if args.base_velocity_branch:
+        cfg.setdefault("model", {})["base_velocity_branch"] = True
     if args.disable_text_film:
         cfg.setdefault("model", {})["operator_context_film"] = False
     if args.disable_flow_time_field:
@@ -100,9 +115,10 @@ def run_train(cfg: dict) -> None:
     )
     model = build_model(cfg, sequence_length=train_ds.sequence_length, num_channels=train_ds.num_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"].get("lr", 1e-4)), weight_decay=float(cfg["train"].get("weight_decay", 1e-4)))
+    max_steps = int(cfg["train"].get("max_steps", 1000))
+    scheduler = build_scheduler(optimizer, cfg, max_steps=max_steps)
     checkpoint_dir = Path(cfg["train"].get("checkpoint_dir", "checkpoints/weather_core"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    max_steps = int(cfg["train"].get("max_steps", 1000))
     log_every = int(cfg["train"].get("log_every", 20))
     eval_every = int(cfg["train"].get("eval_every", 200))
     save_every = int(cfg["train"].get("save_every", eval_every))
@@ -129,6 +145,8 @@ def run_train(cfg: dict) -> None:
                 task_mode=task_mode,
                 noise_scale=float(cfg["train"].get("noise_scale", 1.0)),
             )
+            if scheduler is not None:
+                scheduler.step()
             step += 1
             progress.update(1)
             if step % log_every == 0 or step == 1:
@@ -139,6 +157,10 @@ def run_train(cfg: dict) -> None:
                     "cH": f"{_scalar(out, 'channel_gate_entropy'):.2f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
+                if "base_velocity_ratio" in out:
+                    base_ratio = _scalar(out, "base_velocity_ratio")
+                    if base_ratio == base_ratio:
+                        postfix["baseR"] = f"{base_ratio:.2f}"
                 if "loss_inside" in out:
                     postfix["inside"] = f"{_scalar(out, 'loss_inside'):.4f}"
                     postfix["outside"] = f"{_scalar(out, 'loss_outside'):.4f}"
@@ -214,6 +236,32 @@ def build_datasets(cfg: dict, stats: dict, *, include_embeddings: bool, task_mod
     raise ValueError(f"Unknown task.mode {task_mode!r}; expected 'text2ts' or 'edit'")
 
 
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict, *, max_steps: int):
+    sched_cfg = cfg["train"].get("lr_scheduler", "none")
+    if isinstance(sched_cfg, dict):
+        name = str(sched_cfg.get("name", "none")).lower()
+        warmup_steps = int(sched_cfg.get("warmup_steps", 0))
+        min_lr_ratio = float(sched_cfg.get("min_lr_ratio", 0.05))
+    else:
+        name = str(sched_cfg).lower()
+        warmup_steps = int(cfg["train"].get("warmup_steps", 0))
+        min_lr_ratio = float(cfg["train"].get("min_lr_ratio", 0.05))
+    if name in {"none", "constant", ""}:
+        return None
+    if name != "cosine":
+        raise ValueError(f"Unknown train.lr_scheduler {name!r}; expected 'none' or 'cosine'")
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return max(float(current_step + 1) / float(warmup_steps), 1e-8)
+        denom = max(1, max_steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(current_step - warmup_steps) / float(denom)))
+        cosine = 0.5 * (1.0 + math.cos(progress * math.pi))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 @torch.no_grad()
 def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int) -> dict[str, float]:
     model.eval()
@@ -256,19 +304,32 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         p = aux["A_o"].detach().clamp_min(1e-8)
         out["operator_entropy"] = float((-(p * p.log()).sum(dim=-1).mean()).detach().cpu())
     if "G" in aux:
-        out["field_abs_mean"] = float(aux["G"].detach().abs().mean().cpu())
+        g = aux["G"].detach()
+        out["field_abs_mean"] = float(g.abs().mean().cpu())
+        out["field_positive_mean"] = float(g.clamp_min(0).mean().cpu())
+        out["field_negative_mean"] = float((-g.clamp_max(0)).mean().cpu())
+    if "base_v" in aux and "residual_v" in aux:
+        base_energy = aux["base_v"].detach().square().mean().sqrt()
+        residual_energy = aux["residual_v"].detach().square().mean().sqrt()
+        out["base_velocity_ratio"] = float((base_energy / (base_energy + residual_energy).clamp_min(1e-8)).cpu())
     return out
 
 
 def save_checkpoint(path: Path, model, optimizer, cfg: dict, stats: dict, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     task_mode = str(cfg.get("task", {}).get("mode", "")).lower()
+    model_metadata = {}
+    operator_bank = getattr(model, "operator_bank", None)
+    if operator_bank is not None:
+        model_metadata["operator_architecture"] = getattr(operator_bank, "architecture", None)
+        model_metadata["operator_type_names"] = list(getattr(operator_bank, "operator_type_names", []))
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "task_mode": task_mode,
         "model_class": model.__class__.__name__,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "model_metadata": model_metadata,
         "config": cfg,
         "stats": {k: v.cpu() for k, v in stats.items()},
         "step": step,

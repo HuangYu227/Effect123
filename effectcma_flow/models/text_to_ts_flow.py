@@ -45,9 +45,16 @@ class TextToTSFlow(nn.Module):
         mapper_dropout: float = 0.0,
         mapper_normalizer: str = "softmax",
         mapper_bounded_field_gate: bool = True,
+        mapper_field_gate_mode: str | None = None,
+        mapper_field_max_amplitude: float = 8.0,
+        mapper_relative_time_position: bool = False,
+        mapper_channel_identity: bool = False,
         mapper_flow_time_condition: bool = True,
         operator_context_film: bool = True,
         operator_norm: str = "group",
+        operator_architecture: str = "homogeneous",
+        operator_types: list[str] | tuple[str, ...] | None = None,
+        base_velocity_branch: bool = False,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -81,8 +88,11 @@ class TextToTSFlow(nn.Module):
                 nn.SiLU(),
                 nn.Linear(d_model, d_model),
             )
-            nn.init.zeros_(self.flow_time_proj[-1].weight)
+            nn.init.normal_(self.flow_time_proj[-1].weight, mean=0.0, std=0.02)
             nn.init.zeros_(self.flow_time_proj[-1].bias)
+        self.channel_identity = None
+        if mapper_channel_identity:
+            self.channel_identity = nn.Parameter(torch.randn(self.num_channels, d_model) * 0.02)
         self.mapper = EffectMapper(
             d_model=d_model,
             num_operators=num_operators,
@@ -92,6 +102,9 @@ class TextToTSFlow(nn.Module):
             dropout=mapper_dropout,
             normalizer=mapper_normalizer,
             bounded_field_gate=mapper_bounded_field_gate,
+            field_gate_mode=mapper_field_gate_mode,
+            field_max_amplitude=mapper_field_max_amplitude,
+            relative_time_position=mapper_relative_time_position,
         )
         self.operator_bank = ResidualOperatorBank(
             num_channels=self.num_channels,
@@ -105,7 +118,24 @@ class TextToTSFlow(nn.Module):
             context_dim=d_model,
             context_film=operator_context_film,
             norm_type=operator_norm,
+            architecture=operator_architecture,
+            operator_types=operator_types,
         )
+        self.base_velocity_branch = bool(base_velocity_branch)
+        self.base_operator = None
+        if self.base_velocity_branch:
+            self.base_operator = ResidualOperatorBank(
+                num_channels=self.num_channels,
+                num_operators=1,
+                hidden=operator_hidden,
+                t_dim=operator_t_dim,
+                max_velocity=operator_max_velocity,
+                depth=operator_depth,
+                kernel_size=operator_kernel_size,
+                dropout=operator_dropout,
+                norm_type=operator_norm,
+                architecture="homogeneous",
+            )
 
     def forward(
         self,
@@ -124,6 +154,8 @@ class TextToTSFlow(nn.Module):
 
         time_tokens = self.time_encoder(x_t)
         channel_tokens = self.channel_encoder(x_t)
+        if self.channel_identity is not None:
+            channel_tokens = channel_tokens + self.channel_identity[None].to(channel_tokens.dtype)
         slot_tokens, slot_mask = self.text_encoder(text_condition)
         if self.flow_time_proj is not None:
             slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(x_t.dtype))[:, None, :]
@@ -134,8 +166,17 @@ class TextToTSFlow(nn.Module):
             raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
         g = g[:, : self.sequence_length]
         velocities = self.operator_bank(x_t, None, t, context=text_context)
-        v_hat = (g * velocities).sum(dim=-1)
+        residual_v = (g * velocities).sum(dim=-1)
+        base_v = None
+        if self.base_operator is not None:
+            base_v = self.base_operator(x_t, None, t).squeeze(-1)
+            v_hat = base_v + residual_v
+        else:
+            v_hat = residual_v
         aux = {**aux, "G_patch": g_patch, "G": g, "V": velocities, "text_context": text_context}
+        if base_v is not None:
+            aux["base_v"] = base_v
+            aux["residual_v"] = residual_v
         return v_hat, aux
 
 

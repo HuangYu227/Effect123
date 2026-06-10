@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from effectcma_flow.training.checkpoint import checkpoint_eval_config, checkpoint_stats_or_none, validate_checkpoint_payload
+from effectcma_flow.training.checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
+    checkpoint_eval_config,
+    checkpoint_stats_or_none,
+    validate_checkpoint_payload,
+)
 from scripts.eval_weather import run_eval
 from scripts.sample_weather import run_sample
 
@@ -118,7 +123,7 @@ def test_checkpoint_payload_requires_schema_version(fake_weather_root):
 
 def test_checkpoint_payload_requires_task_mode(fake_weather_root):
     payload = {
-        "schema_version": 2,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "model": {},
         "model_class": "TextToTSFlow",
         "config": _cfg(fake_weather_root),

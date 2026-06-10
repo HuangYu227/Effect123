@@ -58,6 +58,7 @@ def cfm_train_step(
         contribution = _operator_contribution(aux)
         time_entropy = _maybe_entropy(aux, "A_t")
         channel_entropy = _maybe_entropy(aux, "A_c")
+        branch_energy = _branch_energy(aux)
     return {
         "loss": loss.detach(),
         **loss_parts,
@@ -69,6 +70,7 @@ def cfm_train_step(
         "operator_gate_entropy": gate_entropy,
         "time_gate_entropy": time_entropy,
         "channel_gate_entropy": channel_entropy,
+        **branch_energy,
     }
 
 
@@ -87,6 +89,21 @@ def _operator_contribution(aux: dict[str, torch.Tensor]) -> torch.Tensor:
     if "G" not in aux or "V" not in aux:
         return torch.full((aux["A_o"].shape[-1],), float("nan"), device=aux["A_o"].device)
     return (aux["G"] * aux["V"]).abs().mean(dim=(0, 1, 2)).detach()
+
+
+def _branch_energy(aux: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if "base_v" not in aux or "residual_v" not in aux:
+        device = aux["A_o"].device
+        nan = torch.tensor(float("nan"), device=device)
+        return {"base_velocity_energy": nan, "residual_velocity_energy": nan, "base_velocity_ratio": nan}
+    base_energy = aux["base_v"].detach().square().mean().sqrt()
+    residual_energy = aux["residual_v"].detach().square().mean().sqrt()
+    ratio = base_energy / (base_energy + residual_energy).clamp_min(1e-8)
+    return {
+        "base_velocity_energy": base_energy,
+        "residual_velocity_energy": residual_energy,
+        "base_velocity_ratio": ratio,
+    }
 
 
 def _cfm_loss(sq_error: torch.Tensor, mask: torch.Tensor | None, *, mode: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:

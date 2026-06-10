@@ -19,6 +19,9 @@ class EffectMapper(nn.Module):
         tau_o: float = 1.0,
         normalizer: str = "softmax",
         bounded_field_gate: bool = True,
+        field_gate_mode: str | None = None,
+        field_max_amplitude: float = 8.0,
+        relative_time_position: bool = False,
     ) -> None:
         super().__init__()
         self.field_rank = int(field_rank)
@@ -42,12 +45,34 @@ class EffectMapper(nn.Module):
         self.w_o = nn.Linear(d_model, self.field_rank * d_model)
         self.op_proto = nn.Parameter(torch.randn(num_operators, d_model) * 0.02)
         self.alpha = nn.Linear(d_model, self.field_rank)
+        self.alpha_amplitude = nn.Linear(d_model, self.field_rank)
+        self.alpha_polarity = nn.Linear(d_model, self.field_rank)
+        nn.init.zeros_(self.alpha_polarity.weight)
+        nn.init.ones_(self.alpha_polarity.bias)
         self.field_log_amplitude = nn.Parameter(torch.zeros(()))
         self.tau_t = float(tau_t)
         self.tau_c = float(tau_c)
         self.tau_o = float(tau_o)
         self.normalizer = normalizer
         self.bounded_field_gate = bool(bounded_field_gate)
+        if field_gate_mode is None:
+            field_gate_mode = "bounded" if self.bounded_field_gate else "unbounded"
+        self.field_gate_mode = str(field_gate_mode).lower()
+        if self.field_gate_mode not in {"bounded", "relaxed", "unbounded", "signed"}:
+            raise ValueError(
+                f"field_gate_mode must be one of 'bounded', 'relaxed', 'unbounded', 'signed', got {field_gate_mode!r}"
+            )
+        self.field_max_amplitude = float(field_max_amplitude)
+        self.relative_time_position = bool(relative_time_position)
+        self.time_pos_proj = None
+        if self.relative_time_position:
+            self.time_pos_proj = nn.Sequential(
+                nn.Linear(4, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            nn.init.normal_(self.time_pos_proj[-1].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.time_pos_proj[-1].bias)
         self.scale = d_model**-0.5
 
     def forward(
@@ -63,10 +88,17 @@ class EffectMapper(nn.Module):
             slot_mask = slot_mask.to(slot_tokens.device, dtype=slot_tokens.dtype)
             if slot_mask.shape != slot_tokens.shape[:2]:
                 raise ValueError(f"slot_mask must have shape {tuple(slot_tokens.shape[:2])}, got {tuple(slot_mask.shape)}")
-            if bool((slot_mask > 0).any(dim=1).all().detach().cpu()):
-                padding_mask = slot_mask <= 0
+            padding_mask = slot_mask <= 0
+            all_empty = ~(slot_mask > 0).any(dim=1)
+            if bool(all_empty.any().detach().cpu()):
+                padding_mask = padding_mask.clone()
+                padding_mask[all_empty, 0] = False
         mixed_slots = self.slot_mixer(slot_tokens, src_key_padding_mask=padding_mask)
         slot_tokens = self.slot_norm(slot_tokens + mixed_slots)
+        if self.time_pos_proj is not None:
+            time_tokens = time_tokens + self._relative_time_features(
+                time_tokens.shape[1], time_tokens.device, time_tokens.dtype
+            )[None]
 
         q_t = self.w_t(slot_tokens).view(batch, slots, self.field_rank, d_model)
         q_c = self.w_c(slot_tokens).view(batch, slots, self.field_rank, d_model)
@@ -76,13 +108,24 @@ class EffectMapper(nn.Module):
         score_o = torch.einsum("bjrd,kd->bjrk", q_o, self.op_proto) * self.scale
 
         a_t = _normalize(score_t / self.tau_t, dim=-1, normalizer=self.normalizer)
-        a_c = torch.softmax(score_c / self.tau_c, dim=-1)
-        a_o = torch.softmax(score_o / self.tau_o, dim=-1)
+        a_c = _normalize(score_c / self.tau_c, dim=-1, normalizer=self.normalizer)
+        a_o = _normalize(score_o / self.tau_o, dim=-1, normalizer=self.normalizer)
         alpha_logits = self.alpha(slot_tokens)
-        if self.bounded_field_gate:
+        if self.field_gate_mode == "bounded":
             alpha = self._bounded_alpha(alpha_logits, slot_mask)
             field_amplitude = 2.0 * torch.sigmoid(self.field_log_amplitude)
             alpha = alpha * field_amplitude
+        elif self.field_gate_mode == "relaxed":
+            allocation = self._bounded_alpha(alpha_logits, slot_mask)
+            amplitude = self.field_max_amplitude * torch.sigmoid(self.alpha_amplitude(slot_tokens))
+            alpha = allocation * amplitude
+            field_amplitude = amplitude.detach().mean()
+        elif self.field_gate_mode == "signed":
+            allocation = self._bounded_alpha(alpha_logits, slot_mask)
+            amplitude = self.field_max_amplitude * torch.sigmoid(self.alpha_amplitude(slot_tokens))
+            polarity = torch.tanh(self.alpha_polarity(slot_tokens))
+            alpha = allocation * amplitude * polarity
+            field_amplitude = amplitude.detach().mean()
         else:
             alpha = torch.nn.functional.softplus(alpha_logits)
             if slot_mask is not None:
@@ -90,7 +133,8 @@ class EffectMapper(nn.Module):
             field_amplitude = alpha.new_tensor(float("nan"))
 
         g_patch = torch.einsum("bjrp,bjrc,bjrk,bjr->bpck", a_t, a_c, a_o, alpha)
-        rank_weight = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        alpha_abs = alpha.abs()
+        rank_weight = alpha_abs / alpha_abs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         aux = {
             "A_t": torch.einsum("bjrp,bjr->bjp", a_t, rank_weight),
             "A_c": torch.einsum("bjrc,bjr->bjc", a_c, rank_weight),
@@ -101,6 +145,9 @@ class EffectMapper(nn.Module):
             "alpha": alpha,
             "field_amplitude": field_amplitude.detach(),
             "field_mass": alpha.sum(dim=(1, 2)).detach(),
+            "field_abs_mass": alpha_abs.sum(dim=(1, 2)).detach(),
+            "field_positive_mass": alpha.clamp_min(0).sum(dim=(1, 2)).detach(),
+            "field_negative_mass": (-alpha.clamp_max(0)).sum(dim=(1, 2)).detach(),
         }
         return g_patch, aux
 
@@ -116,6 +163,21 @@ class EffectMapper(nn.Module):
             valid_alpha = torch.softmax(masked_logits[valid].flatten(1), dim=-1).view(-1, slots, self.field_rank)
             alpha[valid] = valid_alpha
         return alpha
+
+    def _relative_time_features(self, patches: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self.time_pos_proj is None:
+            raise RuntimeError("relative time position is disabled")
+        pos = torch.linspace(-1.0, 1.0, patches, device=device, dtype=dtype)
+        features = torch.stack(
+            [
+                pos,
+                pos.square(),
+                torch.sin(torch.pi * pos),
+                torch.cos(torch.pi * pos),
+            ],
+            dim=-1,
+        )
+        return self.time_pos_proj(features)
 
 
 def _normalize(scores: torch.Tensor, *, dim: int, normalizer: str) -> torch.Tensor:

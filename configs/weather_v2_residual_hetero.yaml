@@ -1,0 +1,96 @@
+task:
+  mode: text2ts
+
+data:
+  root: null
+  window_length: null
+  normalize: true
+  caption_policy: random
+  include_precomputed_embeddings: false
+  seed: 20260610
+  effect_types:
+    - level_shift
+    - trend_up
+    - trend_down
+    - volatility_up
+    - volatility_down
+    - spike
+    - drop
+
+model:
+  d_model: 128
+  patch_len: 6
+  num_operators: 5
+  transformer_layers: 2
+  transformer_heads: 4
+  channel_patch_len: 6
+  channel_stride: 3
+  channel_temporal_layers: 1
+  channel_layers: 1
+  channel_heads: 4
+  channel_dropout: 0.0
+  mapper_field_rank: 4
+  mapper_slot_layers: 1
+  mapper_slot_heads: 4
+  mapper_dropout: 0.0
+  mapper_normalizer: softmax
+  mapper_bounded_field_gate: false
+  mapper_field_gate_mode: relaxed
+  mapper_field_max_amplitude: 8.0
+  mapper_relative_time_position: true
+  mapper_channel_identity: true
+  mapper_flow_time_condition: true
+  operator_hidden: 96
+  operator_t_dim: 32
+  operator_max_velocity: 5.0
+  operator_depth: 3
+  operator_kernel_size: 3
+  operator_dropout: 0.0
+  operator_context_film: true
+  operator_norm: group
+  operator_architecture: heterogeneous
+  operator_types:
+    - trend
+    - local
+    - volatility
+    - spectral
+    - channel
+  base_velocity_branch: true
+
+text_encoder:
+  mode: longclip
+  hash_dim: 256
+  precomputed_dim: 128
+  hf_model_name: "BAAI/bge-small-en-v1.5"
+  longclip_model_name: "save/Longclip"
+  longclip_local_files_only: true
+  local_files_only: false
+  fallback_mode: error
+  fallback_hash_dim: 256
+
+train:
+  batch_size: 32
+  eval_batch_size: null
+  lr: 0.0001
+  weight_decay: 0.0001
+  lr_scheduler:
+    name: cosine
+    warmup_steps: 500
+    min_lr_ratio: 0.05
+  max_steps: 1000
+  cfm_loss_mode: global
+  noise_scale: 1.0
+  grad_clip: 1.0
+  num_workers: 0
+  device: auto
+  checkpoint_dir: checkpoints/weather_v2_residual_hetero
+  log_every: 20
+  eval_every: 200
+  eval_batches: 4
+  eval_seed_offset: 50000
+  best_metric: mse
+  save_every: 1000
+
+sample:
+  steps: 16
+  noise_scale: 1.0

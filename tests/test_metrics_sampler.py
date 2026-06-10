@@ -48,6 +48,7 @@ def test_field_metrics_report_localization():
 
 def test_euler_sampler_smoke():
     cfg = {
+        "task": {"mode": "edit"},
         "model": {
             "d_model": 16,
             "patch_len": 3,

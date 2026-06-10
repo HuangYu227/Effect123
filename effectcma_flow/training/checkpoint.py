@@ -78,7 +78,7 @@ def checkpoint_stats_or_none(payload: dict[str, Any]) -> dict[str, torch.Tensor]
 
 
 def _task_mode_from_config(cfg: dict[str, Any]) -> str:
-    task_mode = str(cfg.get("task", {}).get("mode", "")).lower()
+    task_mode = str(cfg.get("task", {}).get("mode", "text2ts")).lower()
     if task_mode not in TASK_MODES:
         raise ValueError(f"Checkpoint config must contain task.mode in {sorted(TASK_MODES)}, got {task_mode!r}")
     return task_mode

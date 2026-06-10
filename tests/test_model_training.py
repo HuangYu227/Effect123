@@ -8,12 +8,15 @@ from effectcma_flow.models.effect_mapper import EffectMapper
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
 from effectcma_flow.models.build import build_model
 from effectcma_flow.models.ts_encoder import ChannelEncoder
+from effectcma_flow.models.text_to_ts_flow import TextToTSFlow, _series_router_stats as text2ts_series_router_stats
+from effectcma_flow.evaluation.sampler import euler_sample_text2ts
 from effectcma_flow.training.train_step import cfm_train_step
 from effectcma_flow.training.utils import text_condition_from_batch
 
 
 def _config():
     return {
+        "task": {"mode": "edit"},
         "model": {
             "d_model": 16,
             "patch_len": 3,
@@ -30,6 +33,24 @@ def _config():
 def _text2ts_config():
     cfg = _config()
     cfg["task"] = {"mode": "text2ts"}
+    return cfg
+
+
+def _v3_text2ts_config():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "num_operators": 3,
+            "mapper_bounded_field_gate": False,
+            "mapper_flow_time_condition": False,
+            "mapper_operator_router": "dual",
+            "mapper_time_segment_scales": [1, 3],
+            "operator_architecture": "structural",
+            "operator_channel_heads": 2,
+            "operator_context_mode": "none",
+            "operator_context_film": False,
+        }
+    )
     return cfg
 
 
@@ -67,6 +88,13 @@ def test_model_forward_finite():
     assert aux["G"].shape[:3] == (2, 12, 4)
     assert aux["A_t_rank"].shape[:3] == (2, 1, 4)
     assert aux["alpha"].shape == (2, 1, 4)
+
+
+def test_missing_task_mode_defaults_to_text2ts():
+    cfg = _config()
+    cfg.pop("task")
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    assert isinstance(model, TextToTSFlow)
 
 
 def test_cfm_train_step_updates_trainable_params():
@@ -191,3 +219,98 @@ def test_operator_bank_has_independent_temporal_experts():
     out = bank(x_t, x_t * 0.5, torch.rand(2))
     assert out.shape == (2, 12, 4, 3)
     assert torch.isfinite(out).all()
+
+
+def test_v3_structural_text2ts_forward_and_sampler():
+    model = build_model(_v3_text2ts_config(), sequence_length=13, num_channels=3)
+    x_t = torch.randn(2, 13, 3)
+    text = [["steady rain and falling pressure"], ["clear sky and rising temperature"]]
+    out, aux = model(x_t, torch.rand(2), text)
+    assert out.shape == (2, 13, 3)
+    assert torch.isfinite(out).all()
+    assert aux["G"].shape == (2, 13, 3, 3)
+    assert aux["V"].shape == (2, 13, 3, 3)
+    assert aux["A_o_text"].shape[-1] == 3
+    assert aux["A_o_series"].shape[-1] == 3
+    sampled, sample_aux = euler_sample_text2ts(model, torch.zeros(2, 13, 3), text, steps=2)
+    assert sampled.shape == (2, 13, 3)
+    assert sample_aux["G"].shape[-1] == 3
+    assert torch.isfinite(sampled).all()
+
+
+def test_v3_dual_router_has_distinct_text_and_series_paths():
+    model = build_model(_v3_text2ts_config(), sequence_length=12, num_channels=3)
+    model.eval()
+    t = torch.full((2,), 0.4)
+    x_a = torch.randn(2, 12, 3)
+    x_b = x_a * 0.1 + 2.0
+    text_a = [["low-frequency seasonal weather"], ["low-frequency seasonal weather"]]
+    text_b = [["sharp high-frequency noisy spikes"], ["sharp high-frequency noisy spikes"]]
+    _, aux_a = model(x_a, t, text_a)
+    _, aux_text_changed = model(x_a, t, text_b)
+    _, aux_series_changed = model(x_b, t, text_a)
+    assert not torch.allclose(aux_a["A_o_text"], aux_text_changed["A_o_text"])
+    assert not torch.allclose(aux_a["G"], aux_text_changed["G"])
+    assert torch.allclose(aux_a["V"], aux_text_changed["V"])
+    assert not torch.allclose(aux_a["A_o_series"], aux_series_changed["A_o_series"])
+    assert torch.allclose(aux_a["A_o_text"], aux_series_changed["A_o_text"])
+
+
+def test_structural_operator_bank_requires_three_operators():
+    cfg = _v3_text2ts_config()
+    cfg["model"]["num_operators"] = 4
+    try:
+        build_model(cfg, sequence_length=12, num_channels=3)
+    except ValueError as exc:
+        assert "num_operators=3" in str(exc)
+    else:
+        raise AssertionError("structural operator bank accepted a non-3 operator count")
+
+
+def test_edit_mode_can_use_dual_router_and_structural_bank():
+    cfg = _config()
+    cfg["model"].update(
+        {
+            "mapper_operator_router": "dual",
+            "operator_architecture": "structural",
+            "operator_channel_heads": 2,
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _batch()
+    t = torch.rand(2)
+    x_t = (1 - t[:, None, None]) * batch["B"] + t[:, None, None] * batch["Y"]
+    out, aux = model(batch["B"], x_t, t, batch["slots"])
+    assert out.shape == (2, 12, 4)
+    assert aux["A_o_series"].shape == (2, 3)
+    assert aux["text_context"].shape[0] == 2
+    assert torch.isfinite(out).all()
+
+
+def test_structural_bank_is_router_only_and_channel_expert_owns_channel_mixing():
+    bank = ResidualOperatorBank(
+        num_channels=3,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+        context_mode="none",
+        context_film=False,
+        channel_heads=2,
+    )
+    assert bank.channel_mixer is None
+    x_t = torch.randn(2, 12, 3)
+    t = torch.rand(2)
+    out_a = bank(x_t, None, t, context=torch.randn(2, 16))
+    out_b = bank(x_t, None, t, context=torch.randn(2, 16))
+    assert torch.allclose(out_a, out_b)
+    assert out_a.shape == (2, 12, 3, 3)
+
+
+def test_series_router_stats_support_half_precision_cpu_fft_path():
+    x = torch.randn(2, 12, 3).half()
+    stats = text2ts_series_router_stats(x)
+    assert stats.shape == (2, 7)
+    assert stats.dtype == torch.float16
+    assert torch.isfinite(stats.float()).all()

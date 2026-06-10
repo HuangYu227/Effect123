@@ -58,6 +58,7 @@ def cfm_train_step(
         contribution = _operator_contribution(aux)
         time_entropy = _maybe_entropy(aux, "A_t")
         channel_entropy = _maybe_entropy(aux, "A_c")
+        router_stats = _router_stats(aux)
     return {
         "loss": loss.detach(),
         **loss_parts,
@@ -69,6 +70,7 @@ def cfm_train_step(
         "operator_gate_entropy": gate_entropy,
         "time_gate_entropy": time_entropy,
         "channel_gate_entropy": channel_entropy,
+        **router_stats,
     }
 
 
@@ -87,6 +89,25 @@ def _operator_contribution(aux: dict[str, torch.Tensor]) -> torch.Tensor:
     if "G" not in aux or "V" not in aux:
         return torch.full((aux["A_o"].shape[-1],), float("nan"), device=aux["A_o"].device)
     return (aux["G"] * aux["V"]).abs().mean(dim=(0, 1, 2)).detach()
+
+
+def _router_stats(aux: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    device = aux["A_o"].device
+    nan = torch.tensor(float("nan"), device=device)
+    out = {
+        "text_operator_entropy": nan,
+        "series_operator_entropy": nan,
+        "router_top1_agreement": nan,
+    }
+    if "A_o_text" in aux:
+        out["text_operator_entropy"] = _entropy(aux["A_o_text"], dim=-1).mean().detach()
+    if "A_o_series" in aux:
+        series = aux["A_o_series"]
+        out["series_operator_entropy"] = _entropy(series, dim=-1).mean().detach()
+        if "A_o_text" in aux:
+            text = aux["A_o_text"].mean(dim=1)
+            out["router_top1_agreement"] = (text.argmax(dim=-1) == series.argmax(dim=-1)).float().mean().detach()
+    return out
 
 
 def _cfm_loss(sq_error: torch.Tensor, mask: torch.Tensor | None, *, mode: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:

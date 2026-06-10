@@ -139,6 +139,12 @@ def run_train(cfg: dict) -> None:
                     "cH": f"{_scalar(out, 'channel_gate_entropy'):.2f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
+                if "text_operator_entropy" in out:
+                    postfix["txtH"] = f"{_scalar(out, 'text_operator_entropy'):.2f}"
+                if "series_operator_entropy" in out:
+                    postfix["serH"] = f"{_scalar(out, 'series_operator_entropy'):.2f}"
+                if "router_top1_agreement" in out:
+                    postfix["agr"] = f"{_scalar(out, 'router_top1_agreement'):.2f}"
                 if "loss_inside" in out:
                     postfix["inside"] = f"{_scalar(out, 'loss_inside'):.4f}"
                     postfix["outside"] = f"{_scalar(out, 'loss_outside'):.4f}"
@@ -255,6 +261,16 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
     if "A_o" in aux:
         p = aux["A_o"].detach().clamp_min(1e-8)
         out["operator_entropy"] = float((-(p * p.log()).sum(dim=-1).mean()).detach().cpu())
+    if "A_o_text" in aux:
+        p = aux["A_o_text"].detach().clamp_min(1e-8)
+        out["text_operator_entropy"] = float((-(p * p.log()).sum(dim=-1).mean()).detach().cpu())
+    if "A_o_series" in aux:
+        p = aux["A_o_series"].detach().clamp_min(1e-8)
+        out["series_operator_entropy"] = float((-(p * p.log()).sum(dim=-1).mean()).detach().cpu())
+        if "A_o_text" in aux:
+            text = aux["A_o_text"].detach().mean(dim=1)
+            series = aux["A_o_series"].detach()
+            out["router_top1_agreement"] = float((text.argmax(dim=-1) == series.argmax(dim=-1)).float().mean().cpu())
     if "G" in aux:
         out["field_abs_mean"] = float(aux["G"].detach().abs().mean().cpu())
     return out
@@ -273,6 +289,9 @@ def save_checkpoint(path: Path, model, optimizer, cfg: dict, stats: dict, step: 
         "stats": {k: v.cpu() for k, v in stats.items()},
         "step": step,
     }
+    operator_names = getattr(model.operator_bank, "operator_type_names", None)
+    if operator_names is not None:
+        payload["operator_type_names"] = list(operator_names)
     tmp = path.with_name(f".{path.name}.tmp")
     torch.save(payload, tmp)
     os.replace(tmp, path)

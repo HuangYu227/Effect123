@@ -10,7 +10,7 @@ from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
     model_cfg = config.get("model", config)
     text_cfg = config.get("text_encoder", {"mode": "hash"})
-    task_mode = str(config.get("task", {}).get("mode", "edit")).lower()
+    task_mode = str(config.get("task", {}).get("mode", "text2ts")).lower()
     d_model = int(model_cfg.get("d_model", 128))
     text_encoder = build_text_encoder(text_cfg, d_model=d_model)
     kwargs = dict(
@@ -40,9 +40,15 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         mapper_dropout=float(model_cfg.get("mapper_dropout", 0.0)),
         mapper_normalizer=str(model_cfg.get("mapper_normalizer", "softmax")),
         mapper_bounded_field_gate=bool(model_cfg.get("mapper_bounded_field_gate", True)),
+        mapper_operator_router=str(model_cfg.get("mapper_operator_router", "text")),
+        mapper_time_segment_scales=tuple(model_cfg.get("mapper_time_segment_scales", [1])),
+        mapper_router_epsilon=float(model_cfg.get("mapper_router_epsilon", 1e-4)),
         mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
         operator_context_film=bool(model_cfg.get("operator_context_film", True)),
+        operator_context_mode=str(model_cfg.get("operator_context_mode", "global")),
         operator_norm=str(model_cfg.get("operator_norm", "group")),
+        operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
+        operator_channel_heads=int(model_cfg.get("operator_channel_heads", model_cfg.get("channel_heads", 4))),
     )
     if task_mode == "edit":
         return EffectCMAFlow(**kwargs)

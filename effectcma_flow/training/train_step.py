@@ -25,6 +25,7 @@ def cfm_train_step(
     if task_mode == "edit":
         base = batch["B"]
         target = batch["Y"]
+        source = base
         batch_size = base.shape[0]
         t = torch.rand(batch_size, device=base.device, dtype=base.dtype)
         x_t = (1.0 - t[:, None, None]) * base + t[:, None, None] * target
@@ -39,6 +40,8 @@ def cfm_train_step(
         x_t = (1.0 - t[:, None, None]) * source + t[:, None, None] * target
         target_v = target - source
         text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
+        if hasattr(model, "prepare_condition"):
+            text_condition = model.prepare_condition(text_condition, device=target.device, dtype=target.dtype)
         pred_v, aux = model(x_t, t, text_condition)
     else:
         raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
@@ -58,6 +61,7 @@ def cfm_train_step(
         contribution = _operator_contribution(aux)
         time_entropy = _maybe_entropy(aux, "A_t")
         channel_entropy = _maybe_entropy(aux, "A_c")
+        flow_stats = _flow_diagnostics(target=target, source=source, pred_v=pred_v, target_v=target_v)
     return {
         "loss": loss.detach(),
         **loss_parts,
@@ -69,6 +73,7 @@ def cfm_train_step(
         "operator_gate_entropy": gate_entropy,
         "time_gate_entropy": time_entropy,
         "channel_gate_entropy": channel_entropy,
+        **flow_stats,
     }
 
 
@@ -87,6 +92,30 @@ def _operator_contribution(aux: dict[str, torch.Tensor]) -> torch.Tensor:
     if "G" not in aux or "V" not in aux:
         return torch.full((aux["A_o"].shape[-1],), float("nan"), device=aux["A_o"].device)
     return (aux["G"] * aux["V"]).abs().mean(dim=(0, 1, 2)).detach()
+
+
+def _flow_diagnostics(
+    *,
+    target: torch.Tensor,
+    source: torch.Tensor,
+    pred_v: torch.Tensor,
+    target_v: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    source = source.detach()
+    target = target.detach()
+    pred_v = pred_v.detach()
+    target_v = target_v.detach()
+    pred_v_rms = pred_v.square().mean().sqrt()
+    target_v_rms = target_v.square().mean().sqrt()
+    return {
+        "source_mse": (source - target).square().mean(),
+        "source_std": source.std(unbiased=False),
+        "target_std": target.std(unbiased=False),
+        "pred_v_rms": pred_v_rms,
+        "target_v_rms": target_v_rms,
+        "pred_target_rms_ratio": pred_v_rms / target_v_rms.clamp_min(1e-8),
+        "velocity_cos": (pred_v * target_v).mean() / (pred_v_rms * target_v_rms).clamp_min(1e-8),
+    }
 
 
 def _cfm_loss(sq_error: torch.Tensor, mask: torch.Tensor | None, *, mode: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:

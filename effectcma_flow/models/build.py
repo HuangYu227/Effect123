@@ -10,7 +10,10 @@ from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
     model_cfg = config.get("model", config)
     text_cfg = config.get("text_encoder", {"mode": "hash"})
-    task_mode = str(config.get("task", {}).get("mode", "edit")).lower()
+    task_cfg = config.get("task", {})
+    if "mode" not in task_cfg:
+        raise ValueError("config.task.mode must be explicitly set to 'text2ts' or 'edit'.")
+    task_mode = str(task_cfg["mode"]).lower()
     d_model = int(model_cfg.get("d_model", 128))
     text_encoder = build_text_encoder(text_cfg, d_model=d_model)
     kwargs = dict(

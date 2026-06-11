@@ -21,7 +21,7 @@ from effectcma_flow.data import (
     compute_train_stats,
 )
 from effectcma_flow.evaluation.metrics import average_metric_dicts, compute_field_metrics, compute_metrics, compute_text2ts_metrics
-from effectcma_flow.evaluation.sampler import euler_sample, euler_sample_text2ts
+from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.models import build_model
 from effectcma_flow.training import cfm_train_step, resolve_device, set_seed
 from effectcma_flow.training.checkpoint import CHECKPOINT_SCHEMA_VERSION
@@ -138,6 +138,8 @@ def run_train(cfg: dict) -> None:
                     "tH": f"{_scalar(out, 'time_gate_entropy'):.2f}",
                     "cH": f"{_scalar(out, 'channel_gate_entropy'):.2f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    "vCos": f"{_scalar(out, 'velocity_cos'):.2f}",
+                    "vR": f"{_scalar(out, 'pred_target_rms_ratio'):.2f}",
                 }
                 if "loss_inside" in out:
                     postfix["inside"] = f"{_scalar(out, 'loss_inside'):.4f}"
@@ -230,10 +232,11 @@ def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int
             text_condition = text_condition_from_batch(batch, text_mode, condition_key="caption")
             noise = torch.randn(batch["Y"].shape, dtype=batch["Y"].dtype, generator=eval_generator).to(batch["Y"].device)
             noise = noise * float(cfg.get("sample", {}).get("noise_scale", 1.0))
-            pred, aux = euler_sample_text2ts(
+            pred, aux = sample_text2ts(
                 model,
                 batch["Y"],
                 text_condition,
+                solver=str(cfg.get("sample", {}).get("solver", "euler")),
                 steps=int(cfg.get("sample", {}).get("steps", 16)),
                 noise=noise,
             )
@@ -257,6 +260,9 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         out["operator_entropy"] = float((-(p * p.log()).sum(dim=-1).mean()).detach().cpu())
     if "G" in aux:
         out["field_abs_mean"] = float(aux["G"].detach().abs().mean().cpu())
+    for key in ("gate_raw_cell_mass_mean", "gate_cell_mass_mean", "gate_rescale_factor"):
+        if key in aux:
+            out[key] = float(aux[key].detach().cpu())
     return out
 
 

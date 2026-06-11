@@ -163,6 +163,7 @@ def run(args: argparse.Namespace, cfg: dict) -> dict[str, float]:
         generated_loader=generated_loader,
         text_encoder_mode=text_mode,
         steps=int(cfg.get("sample", {}).get("steps", 16)),
+        solver=str(cfg.get("sample", {}).get("solver", "euler")),
         task_mode=task_mode,
         noise_scale=float(cfg.get("sample", {}).get("noise_scale", 1.0)),
         n_samples=int(args.n_samples),

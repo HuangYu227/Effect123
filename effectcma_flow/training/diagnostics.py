@@ -26,6 +26,13 @@ def print_core_flow_report(logs: dict[str, Any]) -> None:
         "operator_gate_entropy",
         "time_gate_entropy",
         "channel_gate_entropy",
+        "pred_v_rms",
+        "target_v_rms",
+        "pred_target_rms_ratio",
+        "velocity_cos",
+        "source_mse",
+        "source_std",
+        "target_std",
     ]:
         if key in s:
             parts.append(f"{key}={s[key]:.4f}")

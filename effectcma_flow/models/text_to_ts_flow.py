@@ -122,6 +122,20 @@ class TextToTSFlow(nn.Module):
             channel_heads=operator_channel_heads,
         )
 
+    def prepare_condition(self, text_condition, *, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        if isinstance(text_condition, dict) and text_condition.get("_text2ts_prepared", False):
+            return _move_prepared_condition(text_condition, device=device, dtype=dtype)
+        slot_tokens, slot_mask = self.text_encoder(text_condition)
+        slot_tokens = slot_tokens.to(device=device, dtype=dtype)
+        slot_mask = slot_mask.to(device=device, dtype=dtype) if slot_mask is not None else None
+        text_context = _masked_mean(slot_tokens, slot_mask)
+        return {
+            "_text2ts_prepared": True,
+            "slot_tokens": slot_tokens,
+            "slot_mask": slot_mask if slot_mask is not None else torch.ones(slot_tokens.shape[:2], device=device, dtype=dtype),
+            "text_context": text_context,
+        }
+
     def forward(
         self,
         x_t: torch.Tensor,
@@ -139,7 +153,9 @@ class TextToTSFlow(nn.Module):
 
         time_tokens = self.time_encoder(x_t)
         channel_tokens = self.channel_encoder(x_t)
-        slot_tokens, slot_mask = self.text_encoder(text_condition)
+        prepared = self.prepare_condition(text_condition, device=x_t.device, dtype=x_t.dtype)
+        slot_tokens = prepared["slot_tokens"]
+        slot_mask = prepared["slot_mask"]
         if self.flow_time_proj is not None:
             slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(x_t.dtype))[:, None, :]
         text_context = _masked_mean(slot_tokens, slot_mask)
@@ -162,6 +178,14 @@ class TextToTSFlow(nn.Module):
         if operator_aux:
             aux["operator_aux"] = operator_aux
         return v_hat, aux
+
+
+def _move_prepared_condition(condition: dict[str, torch.Tensor], *, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    moved = dict(condition)
+    for key in ("slot_tokens", "slot_mask", "text_context"):
+        if key in moved and torch.is_tensor(moved[key]):
+            moved[key] = moved[key].to(device=device, dtype=dtype)
+    return moved
 
 
 def _masked_mean(tokens: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:

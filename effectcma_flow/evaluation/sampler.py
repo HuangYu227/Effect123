@@ -109,6 +109,8 @@ def sample_text2ts(
     device = shape_like.device
     dtype = shape_like.dtype
     dt = 1.0 / float(steps)
+    if hasattr(model, "prepare_condition"):
+        text_condition = model.prepare_condition(text_condition, device=device, dtype=dtype)
 
     def velocity(x_cur: torch.Tensor, t_val: float) -> tuple[torch.Tensor, dict]:
         t = torch.full((batch_size,), t_val, device=device, dtype=dtype)

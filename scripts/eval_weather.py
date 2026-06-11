@@ -19,7 +19,7 @@ from effectcma_flow.data import (
     compute_train_stats,
 )
 from effectcma_flow.evaluation.metrics import average_metric_dicts, compute_field_metrics, compute_metrics, compute_text2ts_metrics
-from effectcma_flow.evaluation.sampler import euler_sample, euler_sample_text2ts
+from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.models import build_model
 from effectcma_flow.training import checkpoint_eval_config, checkpoint_stats_or_none, load_training_checkpoint, resolve_device
 from effectcma_flow.training.utils import batch_to_device, text_condition_from_batch
@@ -131,10 +131,11 @@ def run_eval(
             if task_mode == "text2ts":
                 noise = torch.randn(batch["Y"].shape, dtype=batch["Y"].dtype, generator=eval_generator).to(batch["Y"].device)
                 noise = noise * float(cfg.get("sample", {}).get("noise_scale", 1.0))
-                pred, aux = euler_sample_text2ts(
+                pred, aux = sample_text2ts(
                     model,
                     batch["Y"],
                     text_condition_from_batch(batch, text_mode, condition_key="caption"),
+                    solver=str(cfg.get("sample", {}).get("solver", "euler")),
                     steps=int(cfg.get("sample", {}).get("steps", 16)),
                     noise=noise,
                 )

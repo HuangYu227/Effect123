@@ -1,0 +1,877 @@
+diff --git a/effectcma_flow/evaluation/sampler.py b/effectcma_flow/evaluation/sampler.py
+index a3021ac..ef79f38 100644
+--- a/effectcma_flow/evaluation/sampler.py
++++ b/effectcma_flow/evaluation/sampler.py
+@@ -5,6 +5,7 @@ import torch
+ 
+ @torch.no_grad()
+ def euler_sample(model, base: torch.Tensor, text_condition, *, steps: int = 16) -> tuple[torch.Tensor, dict]:
++    """Euler ODE sampling for edit mode (preserved for backward compatibility)."""
+     if steps <= 0:
+         raise ValueError("steps must be positive")
+     x = base.clone()
+@@ -24,26 +25,142 @@ def euler_sample_text2ts(
+     shape_like: torch.Tensor,
+     text_condition,
+     *,
+-    steps: int = 16,
++    steps: int = 64,
+     noise_scale: float = 1.0,
+     noise: torch.Tensor | None = None,
+     generator: torch.Generator | None = None,
+ ) -> tuple[torch.Tensor, dict]:
++    """Euler sampling for text2ts. Thin wrapper around sample_text2ts."""
++    return sample_text2ts(
++        model,
++        shape_like,
++        text_condition,
++        solver="euler",
++        steps=steps,
++        noise_scale=noise_scale,
++        noise=noise,
++        generator=generator,
++    )
++
++
++@torch.no_grad()
++def rk4_sample_text2ts(
++    model,
++    shape_like: torch.Tensor,
++    text_condition,
++    *,
++    steps: int = 64,
++    noise_scale: float = 1.0,
++    noise: torch.Tensor | None = None,
++    generator: torch.Generator | None = None,
++) -> tuple[torch.Tensor, dict]:
++    """RK4 sampling for text2ts. Thin wrapper around sample_text2ts."""
++    return sample_text2ts(
++        model,
++        shape_like,
++        text_condition,
++        solver="rk4",
++        steps=steps,
++        noise_scale=noise_scale,
++        noise=noise,
++        generator=generator,
++    )
++
++
++@torch.no_grad()
++def sample_text2ts(
++    model,
++    shape_like: torch.Tensor,
++    text_condition,
++    *,
++    solver: str = "rk4",
++    steps: int = 64,
++    noise_scale: float = 1.0,
++    noise: torch.Tensor | None = None,
++    generator: torch.Generator | None = None,
++    return_trajectory: bool = False,
++) -> tuple[torch.Tensor, dict]:
++    """Unified text2ts sampling with configurable ODE solver.
++
++    Args:
++        model: TextToTSFlow or compatible model.
++        shape_like: Tensor of shape [B, L, C] defining output shape.
++        text_condition: Text encoder output (slots, dict, etc.).
++        solver: One of "euler", "midpoint", "rk4".
++        steps: Number of integration steps (default 64).
++        noise_scale: Scale factor for initial noise.
++        noise: Optional pre-sampled noise tensor.
++        generator: Optional RNG for reproducibility.
++        return_trajectory: If True, aux includes "trajectory" list.
++
++    Returns:
++        (x_final, aux) tuple.
++    """
+     if steps <= 0:
+         raise ValueError("steps must be positive")
+     if shape_like.ndim != 3:
+         raise ValueError(f"shape_like must be [B, L, C], got {tuple(shape_like.shape)}")
+-    if noise is None:
+-        x = torch.randn(shape_like.shape, device=shape_like.device, dtype=shape_like.dtype, generator=generator) * float(noise_scale)
+-    else:
+-        x = noise.to(shape_like.device, dtype=shape_like.dtype)
+-    if x.shape != shape_like.shape:
+-        raise ValueError(f"noise must have shape {tuple(shape_like.shape)}, got {tuple(x.shape)}")
+-    aux = {}
++    solver = str(solver).lower()
++    if solver not in {"euler", "midpoint", "rk4"}:
++        raise ValueError(f"Unknown solver {solver!r}; expected 'euler', 'midpoint', or 'rk4'")
++
++    x = _initial_noise(shape_like, noise_scale=noise_scale, noise=noise, generator=generator)
+     batch_size = shape_like.shape[0]
++    device = shape_like.device
++    dtype = shape_like.dtype
+     dt = 1.0 / float(steps)
++
++    def velocity(x_cur: torch.Tensor, t_val: float) -> tuple[torch.Tensor, dict]:
++        t = torch.full((batch_size,), t_val, device=device, dtype=dtype)
++        return model(x_cur, t, text_condition)
++
++    aux = {}
++    trajectory = []
++
+     for n in range(steps):
+-        t = torch.full((batch_size,), n / float(steps), device=shape_like.device, dtype=shape_like.dtype)
+-        v, aux = model(x, t, text_condition)
+-        x = x + dt * v
++        t0 = n * dt
++        if return_trajectory:
++            trajectory.append(x.detach().clone())
++
++        if solver == "euler":
++            v, aux = velocity(x, t0)
++            x = x + dt * v
++
++        elif solver == "midpoint":
++            v1, _ = velocity(x, t0)
++            x_mid = x + 0.5 * dt * v1
++            v2, aux = velocity(x_mid, min(1.0, t0 + 0.5 * dt))
++            x = x + dt * v2
++
++        elif solver == "rk4":
++            k1, _ = velocity(x, t0)
++            k2, _ = velocity(x + 0.5 * dt * k1, min(1.0, t0 + 0.5 * dt))
++            k3, _ = velocity(x + 0.5 * dt * k2, min(1.0, t0 + 0.5 * dt))
++            k4, aux = velocity(x + dt * k3, min(1.0, t0 + dt))
++            x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
++
++    aux = {**aux, "sampler_solver": solver, "sampler_steps": steps}
++    if return_trajectory:
++        aux["trajectory"] = trajectory
+     return x, aux
++
++
++def _initial_noise(
++    shape_like: torch.Tensor,
++    *,
++    noise_scale: float = 1.0,
++    noise: torch.Tensor | None = None,
++    generator: torch.Generator | None = None,
++) -> torch.Tensor:
++    if noise is not None:
++        x = noise.to(shape_like.device, dtype=shape_like.dtype)
++    else:
++        x = torch.randn(
++            shape_like.shape,
++            device=shape_like.device,
++            dtype=shape_like.dtype,
++            generator=generator,
++        )
++    if x.shape != shape_like.shape:
++        raise ValueError(f"noise must have shape {tuple(shape_like.shape)}, got {tuple(x.shape)}")
++    return x * float(noise_scale)
+diff --git a/effectcma_flow/models/build.py b/effectcma_flow/models/build.py
+index 6b4d7d6..68c0d62 100644
+--- a/effectcma_flow/models/build.py
++++ b/effectcma_flow/models/build.py
+@@ -40,9 +40,16 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
+         mapper_dropout=float(model_cfg.get("mapper_dropout", 0.0)),
+         mapper_normalizer=str(model_cfg.get("mapper_normalizer", "softmax")),
+         mapper_bounded_field_gate=bool(model_cfg.get("mapper_bounded_field_gate", True)),
++        mapper_gate_rescale=model_cfg.get("mapper_gate_rescale", "auto"),
++        mapper_operator_router=str(model_cfg.get("mapper_operator_router", "text")),
++        mapper_time_segment_scales=model_cfg.get("mapper_time_segment_scales"),
++        mapper_router_epsilon=float(model_cfg.get("mapper_router_epsilon", 1e-4)),
+         mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
+         operator_context_film=bool(model_cfg.get("operator_context_film", True)),
++        operator_context_mode=str(model_cfg.get("operator_context_mode", "global")),
+         operator_norm=str(model_cfg.get("operator_norm", "group")),
++        operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
++        operator_channel_heads=int(model_cfg.get("operator_channel_heads", 4)),
+     )
+     if task_mode == "edit":
+         return EffectCMAFlow(**kwargs)
+diff --git a/effectcma_flow/models/effect_mapper.py b/effectcma_flow/models/effect_mapper.py
+index 30dc5b6..d09126b 100644
+--- a/effectcma_flow/models/effect_mapper.py
++++ b/effectcma_flow/models/effect_mapper.py
+@@ -19,6 +19,12 @@ class EffectMapper(nn.Module):
+         tau_o: float = 1.0,
+         normalizer: str = "softmax",
+         bounded_field_gate: bool = True,
++        gate_rescale: str | float = "auto",
++        operator_router: str = "text",
++        series_stats_dim: int = 7,
++        series_router_hidden: int | None = None,
++        router_epsilon: float = 1e-4,
++        time_segment_scales: tuple[int, ...] | list[int] | None = None,
+     ) -> None:
+         super().__init__()
+         self.field_rank = int(field_rank)
+@@ -43,6 +49,29 @@ class EffectMapper(nn.Module):
+         self.op_proto = nn.Parameter(torch.randn(num_operators, d_model) * 0.02)
+         self.alpha = nn.Linear(d_model, self.field_rank)
+         self.field_log_amplitude = nn.Parameter(torch.zeros(()))
++        self.gate_rescale = gate_rescale
++        self.operator_router = str(operator_router).lower()
++        if self.operator_router not in {"text", "dual"}:
++            raise ValueError(f"operator_router must be 'text' or 'dual', got {operator_router!r}")
++        router_hidden = int(series_router_hidden or d_model)
++        self.series_router = None
++        if self.operator_router == "dual":
++            self.series_router = nn.Sequential(
++                nn.Linear(int(series_stats_dim) + 1, router_hidden),
++                nn.SiLU(),
++                nn.Linear(router_hidden, num_operators),
++            )
++            nn.init.normal_(self.series_router[-1].weight, mean=0.0, std=1e-2)
++            nn.init.zeros_(self.series_router[-1].bias)
++        self.router_epsilon = float(router_epsilon)
++        if self.router_epsilon <= 0.0:
++            raise ValueError("router_epsilon must be positive")
++        if time_segment_scales is None:
++            time_segment_scales = (1,)
++        self.time_segment_scales = tuple(sorted({max(1, int(k)) for k in time_segment_scales}))
++        self.time_resolution = None
++        if len(self.time_segment_scales) > 1:
++            self.time_resolution = nn.Linear(d_model, len(self.time_segment_scales))
+         self.tau_t = float(tau_t)
+         self.tau_c = float(tau_c)
+         self.tau_o = float(tau_o)
+@@ -56,6 +85,8 @@ class EffectMapper(nn.Module):
+         time_tokens: torch.Tensor,
+         channel_tokens: torch.Tensor,
+         slot_mask: torch.Tensor | None = None,
++        series_stats: torch.Tensor | None = None,
++        flow_time: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+         batch, slots, d_model = slot_tokens.shape
+         padding_mask = None
+@@ -74,10 +105,39 @@ class EffectMapper(nn.Module):
+         score_t = torch.einsum("bjrd,bpd->bjrp", q_t, time_tokens) * self.scale
+         score_c = torch.einsum("bjrd,bcd->bjrc", q_c, channel_tokens) * self.scale
+         score_o = torch.einsum("bjrd,kd->bjrk", q_o, self.op_proto) * self.scale
++        score_t = self._multi_resolution_time_logits(score_t, slot_tokens)
+ 
+         a_t = _normalize(score_t / self.tau_t, dim=-1, normalizer=self.normalizer)
+-        a_c = torch.softmax(score_c / self.tau_c, dim=-1)
+-        a_o = torch.softmax(score_o / self.tau_o, dim=-1)
++        a_c = _normalize(score_c / self.tau_c, dim=-1, normalizer=self.normalizer)
++        a_o_text = _normalize(score_o / self.tau_o, dim=-1, normalizer=self.normalizer)
++        a_o_series = None
++        if self.operator_router == "dual":
++            if series_stats is None or flow_time is None:
++                raise ValueError("dual operator router requires series_stats and flow_time")
++            if self.series_router is None:
++                raise RuntimeError("series router is not initialized")
++            if series_stats.shape[0] != batch:
++                raise ValueError(f"series_stats batch must be {batch}, got {series_stats.shape[0]}")
++            if series_stats.shape[-1] != self.series_router[0].in_features - 1:
++                raise ValueError(
++                    f"series_stats last dim must be {self.series_router[0].in_features - 1}, got {series_stats.shape[-1]}"
++                )
++            if flow_time.shape != (batch,):
++                raise ValueError(f"flow_time must have shape [{batch}], got {tuple(flow_time.shape)}")
++            series_input = torch.cat(
++                [
++                    series_stats.to(device=slot_tokens.device, dtype=slot_tokens.dtype),
++                    flow_time[:, None].to(device=slot_tokens.device, dtype=slot_tokens.dtype),
++                ],
++                dim=-1,
++            )
++            series_logits = self.series_router(series_input).to(score_o.dtype)
++            a_o_series = _normalize(series_logits / self.tau_o, dim=-1, normalizer=self.normalizer)
++            fused_log = (a_o_text.clamp_min(self.router_epsilon).log() +
++                         a_o_series[:, None, None, :].clamp_min(self.router_epsilon).log())
++            a_o = torch.softmax(fused_log, dim=-1)
++        else:
++            a_o = a_o_text
+         alpha_logits = self.alpha(slot_tokens)
+         if self.bounded_field_gate:
+             alpha = self._bounded_alpha(alpha_logits, slot_mask)
+@@ -89,19 +149,28 @@ class EffectMapper(nn.Module):
+                 alpha = alpha * slot_mask[:, :, None]
+             field_amplitude = alpha.new_tensor(float("nan"))
+ 
+-        g_patch = torch.einsum("bjrp,bjrc,bjrk,bjr->bpck", a_t, a_c, a_o, alpha)
++        g_patch_raw = torch.einsum("bjrp,bjrc,bjrk,bjr->bpck", a_t, a_c, a_o, alpha)
++        gate_scale = self._gate_rescale_factor(g_patch_raw.shape[1], g_patch_raw.shape[2])
++        g_patch = g_patch_raw * gate_scale
+         rank_weight = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+         aux = {
+             "A_t": torch.einsum("bjrp,bjr->bjp", a_t, rank_weight),
+             "A_c": torch.einsum("bjrc,bjr->bjc", a_c, rank_weight),
+             "A_o": torch.einsum("bjrk,bjr->bjk", a_o, rank_weight),
++            "A_o_text": torch.einsum("bjrk,bjr->bjk", a_o_text, rank_weight),
+             "A_t_rank": a_t,
+             "A_c_rank": a_c,
+             "A_o_rank": a_o,
++            "A_o_text_rank": a_o_text,
+             "alpha": alpha,
+             "field_amplitude": field_amplitude.detach(),
+             "field_mass": alpha.sum(dim=(1, 2)).detach(),
++            "gate_rescale_factor": torch.tensor(float(gate_scale), device=g_patch.device),
++            "gate_raw_cell_mass_mean": g_patch_raw.detach().abs().mean(),
++            "gate_cell_mass_mean": g_patch.detach().abs().mean(),
+         }
++        if a_o_series is not None:
++            aux["A_o_series"] = a_o_series
+         return g_patch, aux
+ 
+     def _bounded_alpha(self, alpha_logits: torch.Tensor, slot_mask: torch.Tensor | None) -> torch.Tensor:
+@@ -117,6 +186,38 @@ class EffectMapper(nn.Module):
+             alpha[valid] = valid_alpha
+         return alpha
+ 
++    def _multi_resolution_time_logits(self, score_t: torch.Tensor, slot_tokens: torch.Tensor) -> torch.Tensor:
++        if len(self.time_segment_scales) == 1:
++            return score_t
++        batch, slots, rank, patches = score_t.shape
++        flat = score_t.reshape(batch * slots * rank, 1, patches)
++        smoothed = []
++        for kernel in self.time_segment_scales:
++            if kernel <= 1:
++                smoothed.append(flat)
++                continue
++            pad_left = (kernel - 1) // 2
++            pad_right = kernel - 1 - pad_left
++            padded = torch.nn.functional.pad(flat, (pad_left, pad_right), mode="replicate")
++            smoothed.append(torch.nn.functional.avg_pool1d(padded, kernel_size=kernel, stride=1))
++        stacked = torch.stack(smoothed, dim=-1).reshape(batch, slots, rank, patches, -1)
++        if self.time_resolution is None:
++            raise RuntimeError("time_resolution was not initialized")
++        weights = torch.softmax(self.time_resolution(slot_tokens), dim=-1)
++        weights = weights[:, :, None, None, :]
++        return (stacked * weights).sum(dim=-1)
++
++    def _gate_rescale_factor(self, patches: int, channels: int) -> float:
++        if isinstance(self.gate_rescale, (int, float)):
++            return float(self.gate_rescale)
++        if self.gate_rescale == "none":
++            return 1.0
++        if self.gate_rescale == "sqrt":
++            return float((patches * channels) ** 0.5)
++        if self.gate_rescale == "auto":
++            return float(patches * channels)
++        raise ValueError(f"Unknown gate_rescale mode: {self.gate_rescale!r}")
++
+ 
+ def _normalize(scores: torch.Tensor, *, dim: int, normalizer: str) -> torch.Tensor:
+     if normalizer == "softmax":
+diff --git a/effectcma_flow/models/effectcma_flow.py b/effectcma_flow/models/effectcma_flow.py
+index 8ae6ea4..14a2429 100644
+--- a/effectcma_flow/models/effectcma_flow.py
++++ b/effectcma_flow/models/effectcma_flow.py
+@@ -38,9 +38,16 @@ class EffectCMAFlow(nn.Module):
+         mapper_dropout: float = 0.0,
+         mapper_normalizer: str = "softmax",
+         mapper_bounded_field_gate: bool = True,
++        mapper_gate_rescale: str | float = "auto",
++        mapper_operator_router: str = "text",
++        mapper_time_segment_scales: tuple[int, ...] | list[int] | None = None,
++        mapper_router_epsilon: float = 1e-4,
+         mapper_flow_time_condition: bool = True,
+         operator_context_film: bool = True,
++        operator_context_mode: str = "global",
+         operator_norm: str = "group",
++        operator_architecture: str = "homogeneous",
++        operator_channel_heads: int = 4,
+     ) -> None:
+         super().__init__()
+         self.sequence_length = int(sequence_length)
+@@ -75,6 +82,7 @@ class EffectCMAFlow(nn.Module):
+             dropout=mapper_dropout,
+             normalizer=mapper_normalizer,
+             bounded_field_gate=mapper_bounded_field_gate,
++            gate_rescale=mapper_gate_rescale,
+         )
+         self.operator_bank = ResidualOperatorBank(
+             num_channels=self.num_channels,
+@@ -86,6 +94,8 @@ class EffectCMAFlow(nn.Module):
+             kernel_size=operator_kernel_size,
+             dropout=operator_dropout,
+             norm_type=operator_norm,
++            architecture=operator_architecture,
++            channel_heads=operator_channel_heads,
+         )
+ 
+     def forward(
+diff --git a/effectcma_flow/models/operator_bank.py b/effectcma_flow/models/operator_bank.py
+index 9e18f37..e612f19 100644
+--- a/effectcma_flow/models/operator_bank.py
++++ b/effectcma_flow/models/operator_bank.py
+@@ -72,6 +72,137 @@ class TemporalOperatorExpert(nn.Module):
+         return self.head(self.blocks(features))
+ 
+ 
++class AdaFeatureNorm(nn.Module):
++    def __init__(self, hidden: int, t_dim: int) -> None:
++        super().__init__()
++        self.norm = nn.LayerNorm(hidden, elementwise_affine=False)
++        self.to_scale_shift = nn.Sequential(
++            nn.SiLU(),
++            nn.Linear(t_dim, 2 * hidden),
++        )
++        nn.init.zeros_(self.to_scale_shift[-1].weight)
++        nn.init.zeros_(self.to_scale_shift[-1].bias)
++
++    def forward(self, x: torch.Tensor, t_code: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        scale, shift = self.to_scale_shift(t_code).chunk(2, dim=-1)
++        y = self.norm(x) * (1.0 + scale[:, None, None, :]) + shift[:, None, None, :]
++        return y, scale, shift
++
++
++class TemporalSegmentExpert(nn.Module):
++    """Velocity expert constrained to the time dimension with multi-scale dilated convolutions."""
++
++    def __init__(self, *, num_channels: int, hidden: int, t_dim: int, dropout: float, norm_type: str) -> None:
++        super().__init__()
++        self.num_channels = int(num_channels)
++        self.hidden = int(hidden)
++        self.ada_norm = AdaFeatureNorm(hidden, t_dim)
++        self.local = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1, groups=hidden)
++        self.mid = nn.Conv1d(hidden, hidden, kernel_size=3, padding=2, dilation=2, groups=hidden)
++        self.long = nn.Conv1d(hidden, hidden, kernel_size=3, padding=4, dilation=4, groups=hidden)
++        self.mix = nn.Sequential(
++            nn.Conv1d(3 * hidden, hidden, kernel_size=1),
++            nn.SiLU(),
++            nn.Dropout(dropout),
++        )
++        self.head = nn.Conv1d(hidden, 1, kernel_size=1)
++        _init_small_head(self.head)
++
++    def forward(self, h: torch.Tensor, t_code: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++        batch, length, channels, hidden = h.shape
++        h_n, scale, shift = self.ada_norm(h, t_code)
++        x = h_n.permute(0, 2, 3, 1).reshape(batch * channels, hidden, length)
++        y = self.mix(torch.cat([self.local(x), self.mid(x), self.long(x)], dim=1))
++        out = self.head(y).reshape(batch, channels, length).transpose(1, 2)
++        aux = {
++            "time_film_scale_rms": scale.detach().square().mean().sqrt(),
++            "time_film_shift_rms": shift.detach().square().mean().sqrt(),
++        }
++        return out, aux
++
++
++class ChannelInteractionExpert(nn.Module):
++    """Velocity expert whose main operation is self-attention over channels."""
++
++    def __init__(self, *, num_channels: int, hidden: int, t_dim: int, heads: int, dropout: float) -> None:
++        super().__init__()
++        self.num_channels = int(num_channels)
++        self.hidden = int(hidden)
++        heads = max(1, min(int(heads), hidden))
++        while hidden % heads != 0 and heads > 1:
++            heads -= 1
++        self.ada_norm = AdaFeatureNorm(hidden, t_dim)
++        self.channel_attn = nn.MultiheadAttention(hidden, heads, dropout=dropout, batch_first=True)
++        self.ffn = nn.Sequential(
++            nn.LayerNorm(hidden),
++            nn.Linear(hidden, 2 * hidden),
++            nn.SiLU(),
++            nn.Dropout(dropout),
++            nn.Linear(2 * hidden, hidden),
++        )
++        self.head = nn.Linear(hidden, 1)
++        nn.init.normal_(self.head.weight, mean=0.0, std=1e-3)
++        nn.init.zeros_(self.head.bias)
++
++    def forward(self, h: torch.Tensor, t_code: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++        batch, length, channels, hidden = h.shape
++        h_n, scale, shift = self.ada_norm(h, t_code)
++        x = h_n.reshape(batch * length, channels, hidden)
++        attended, attn_weights = self.channel_attn(x, x, x, need_weights=True, average_attn_weights=False)
++        y = attended + self.ffn(attended)
++        out = self.head(y).reshape(batch, length, channels)
++        aux = {
++            "channel_attn_entropy": _entropy(attn_weights.detach().mean(dim=1), dim=-1).mean(),
++            "channel_film_scale_rms": scale.detach().square().mean().sqrt(),
++            "channel_film_shift_rms": shift.detach().square().mean().sqrt(),
++        }
++        return out, aux
++
++
++class FrequencyBandExpert(nn.Module):
++    """Velocity expert constrained by fixed low/mid/high FFT band decomposition."""
++
++    def __init__(self, *, num_channels: int, hidden: int, t_dim: int, dropout: float) -> None:
++        super().__init__()
++        self.num_channels = int(num_channels)
++        self.hidden = int(hidden)
++        self.ada_norm = AdaFeatureNorm(hidden, t_dim)
++        self.band_mixer = nn.Sequential(
++            nn.Linear(3 * hidden, hidden),
++            nn.SiLU(),
++            nn.Dropout(dropout),
++            nn.Linear(hidden, hidden),
++        )
++        self.head = nn.Linear(hidden, 1)
++        nn.init.normal_(self.head.weight, mean=0.0, std=1e-3)
++        nn.init.zeros_(self.head.bias)
++
++    def forward(self, h: torch.Tensor, t_code: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++        batch, length, channels, hidden = h.shape
++        h_n, scale, shift = self.ada_norm(h, t_code)
++        x = h_n.permute(0, 2, 3, 1).reshape(batch * channels, hidden, length)
++        fft_dtype = torch.float32 if x.dtype in {torch.float16, torch.bfloat16} else x.dtype
++        freq = torch.fft.rfft(x.to(fft_dtype), dim=-1)
++        bands = _fixed_frequency_bands(freq.shape[-1], freq.device)
++        components = []
++        energy = []
++        for mask in bands:
++            mask_t = mask[None, None, :]
++            filtered = torch.fft.irfft(freq * mask_t, n=length, dim=-1)
++            components.append(filtered.to(x.dtype))
++            energy.append((freq.abs().square() * mask_t).mean(dim=(1, 2)))
++        stacked = torch.cat(components, dim=1)
++        y = self.band_mixer(stacked.transpose(1, 2)).transpose(1, 2)
++        out = self.head(y.transpose(1, 2)).squeeze(-1).reshape(batch, channels, length).transpose(1, 2)
++        band_energy = torch.stack(energy, dim=-1).reshape(batch, channels, 3).mean(dim=1).to(h.dtype)
++        aux = {
++            "frequency_band_energy": band_energy.detach(),
++            "frequency_film_scale_rms": scale.detach().square().mean().sqrt(),
++            "frequency_film_shift_rms": shift.detach().square().mean().sqrt(),
++        }
++        return out, aux
++
++
+ class ResidualOperatorBank(nn.Module):
+     def __init__(
+         self,
+@@ -86,43 +217,91 @@ class ResidualOperatorBank(nn.Module):
+         dropout: float = 0.0,
+         context_dim: int | None = None,
+         context_film: bool = True,
++        context_mode: str = "global",
+         norm_type: str = "group",
++        architecture: str = "homogeneous",
++        channel_heads: int = 4,
+     ) -> None:
+         super().__init__()
+         self.num_channels = int(num_channels)
+         self.num_operators = int(num_operators)
+         self.hidden = int(hidden)
+         self.max_velocity = float(max_velocity)
++        self.architecture = str(architecture).lower()
++        if self.architecture not in {"homogeneous", "structural"}:
++            raise ValueError(f"architecture must be 'homogeneous' or 'structural', got {architecture!r}")
++        if self.architecture == "structural":
++            if self.num_operators != 3:
++                raise ValueError("structural operator bank requires num_operators=3")
++            self.operator_type_names = ["time", "channel", "frequency"]
++        else:
++            self.operator_type_names = [f"temporal_{i}" for i in range(self.num_operators)]
++        self.context_mode = str(context_mode).lower()
++        if self.context_mode not in {"global", "none"}:
++            raise ValueError(f"context_mode must be 'global' or 'none', got {context_mode!r}")
+         self.t_embed = nn.Sequential(
+             nn.Linear(1, t_dim),
+             nn.SiLU(),
+             nn.Linear(t_dim, t_dim),
+         )
+         self.in_proj = nn.Linear(4 + t_dim, hidden)
+-        width = self.hidden * self.num_channels
+-        self.channel_mixer = nn.Linear(self.num_channels, self.num_channels, bias=False)
+-        self.context_proj = nn.Linear(int(context_dim), self.hidden) if context_dim is not None else None
+-        self.context_film = nn.Linear(int(context_dim) + t_dim, 2 * self.hidden) if context_dim is not None and context_film else None
++        self.channel_mixer = (
++            nn.Linear(self.num_channels, self.num_channels, bias=False)
++            if self.architecture == "homogeneous"
++            else None
++        )
++        use_context = self.context_mode == "global" and context_dim is not None
++        self.context_proj = nn.Linear(int(context_dim), self.hidden) if use_context else None
++        self.context_film = nn.Linear(int(context_dim) + t_dim, 2 * self.hidden) if use_context and context_film else None
+         if self.context_film is not None:
+             nn.init.zeros_(self.context_film.weight)
+             nn.init.zeros_(self.context_film.bias)
+-        self.shared_temporal = nn.Sequential(
+-            nn.Conv1d(width, width, kernel_size=3, padding=1, groups=width),
+-            nn.SiLU(),
+-        )
+-        self.experts = nn.ModuleList(
+-            [
+-                TemporalOperatorExpert(
+-                    num_channels=self.num_channels,
+-                    hidden=self.hidden,
+-                    depth=depth,
+-                    kernel_size=kernel_size,
+-                    dropout=dropout,
+-                    norm_type=norm_type,
+-                )
+-                for _ in range(self.num_operators)
+-            ]
+-        )
++        if self.architecture == "homogeneous":
++            width = self.hidden * self.num_channels
++            self.shared_temporal = nn.Sequential(
++                nn.Conv1d(width, width, kernel_size=3, padding=1, groups=width),
++                nn.SiLU(),
++            )
++            self.experts = nn.ModuleList(
++                [
++                    TemporalOperatorExpert(
++                        num_channels=self.num_channels,
++                        hidden=self.hidden,
++                        depth=depth,
++                        kernel_size=kernel_size,
++                        dropout=dropout,
++                        norm_type=norm_type,
++                    )
++                    for _ in range(self.num_operators)
++                ]
++            )
++        else:
++            self.shared_temporal = None
++            self.experts = nn.ModuleList(
++                [
++                    TemporalSegmentExpert(
++                        num_channels=self.num_channels,
++                        hidden=self.hidden,
++                        t_dim=t_dim,
++                        dropout=dropout,
++                        norm_type=norm_type,
++                    ),
++                    ChannelInteractionExpert(
++                        num_channels=self.num_channels,
++                        hidden=self.hidden,
++                        t_dim=t_dim,
++                        heads=channel_heads,
++                        dropout=dropout,
++                    ),
++                    FrequencyBandExpert(
++                        num_channels=self.num_channels,
++                        hidden=self.hidden,
++                        t_dim=t_dim,
++                        dropout=dropout,
++                    ),
++                ]
++            )
++        self.last_aux: dict[str, torch.Tensor] = {}
+ 
+     def forward(self, x_t: torch.Tensor, base: torch.Tensor | None, t: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+         if base is None:
+@@ -145,7 +324,7 @@ class ResidualOperatorBank(nn.Module):
+         feat = torch.stack([x_t, base, x_t - base, pos], dim=-1)
+         feat = torch.cat([feat, t_emb], dim=-1)
+         h = self.in_proj(feat)
+-        if context is not None:
++        if context is not None and self.context_mode == "global":
+             if self.context_proj is None:
+                 raise ValueError("context was provided but this ResidualOperatorBank was created without context_dim")
+             if context.shape != (batch, self.context_proj.in_features):
+@@ -160,9 +339,47 @@ class ResidualOperatorBank(nn.Module):
+                 h = h * (1.0 + 0.1 * torch.tanh(gamma)[:, None, None, :]) + 0.1 * beta[:, None, None, :]
+         elif self.context_proj is not None:
+             h = h + self.context_proj.weight.new_zeros((batch, 1, 1, self.context_proj.out_features))
+-        h = h + self.channel_mixer(h.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
++        if self.channel_mixer is not None:
++            h = h + self.channel_mixer(h.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
++        if self.architecture == "structural":
++            expert_outputs = []
++            expert_aux: dict[str, torch.Tensor] = {}
++            for name, expert in zip(self.operator_type_names, self.experts):
++                out, one_aux = expert(h, t_code)
++                expert_outputs.append(out)
++                for key, value in one_aux.items():
++                    expert_aux[f"{name}_{key}"] = value
++            velocities = torch.stack(expert_outputs, dim=-1)
++            self.last_aux = expert_aux
++            return torch.tanh(velocities) * self.max_velocity
+         h2 = h.permute(0, 2, 3, 1).reshape(batch, channels * self.hidden, length)
++        if self.shared_temporal is None:
++            raise RuntimeError("shared_temporal is not initialized")
+         h2 = self.shared_temporal(h2)
+         expert_outputs = [expert(h2).transpose(1, 2) for expert in self.experts]
+         velocities = torch.stack(expert_outputs, dim=-1)
++        self.last_aux = {}
+         return torch.tanh(velocities) * self.max_velocity
++
++
++def _init_small_head(head: nn.Conv1d) -> None:
++    nn.init.normal_(head.weight, mean=0.0, std=1e-3)
++    if head.bias is not None:
++        nn.init.zeros_(head.bias)
++
++
++def _fixed_frequency_bands(freq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    idx = torch.arange(freq_len, device=device)
++    low_end = max(1, int(round(freq_len / 3)))
++    mid_end = max(low_end + 1, int(round(2 * freq_len / 3)))
++    low = (idx < low_end).to(torch.float32)
++    mid = ((idx >= low_end) & (idx < mid_end)).to(torch.float32)
++    high = (idx >= mid_end).to(torch.float32)
++    if high.sum() == 0:
++        high[-1] = 1.0
++    return low, mid, high
++
++
++def _entropy(prob: torch.Tensor, *, dim: int, eps: float = 1e-8) -> torch.Tensor:
++    p = prob.clamp_min(eps)
++    return -(p * p.log()).sum(dim=dim)
+diff --git a/effectcma_flow/models/text_to_ts_flow.py b/effectcma_flow/models/text_to_ts_flow.py
+index 76814a0..5ccaf9e 100644
+--- a/effectcma_flow/models/text_to_ts_flow.py
++++ b/effectcma_flow/models/text_to_ts_flow.py
+@@ -45,9 +45,16 @@ class TextToTSFlow(nn.Module):
+         mapper_dropout: float = 0.0,
+         mapper_normalizer: str = "softmax",
+         mapper_bounded_field_gate: bool = True,
++        mapper_gate_rescale: str | float = "auto",
++        mapper_operator_router: str = "text",
++        mapper_time_segment_scales: tuple[int, ...] | list[int] | None = None,
++        mapper_router_epsilon: float = 1e-4,
+         mapper_flow_time_condition: bool = True,
+         operator_context_film: bool = True,
++        operator_context_mode: str = "global",
+         operator_norm: str = "group",
++        operator_architecture: str = "homogeneous",
++        operator_channel_heads: int = 4,
+     ) -> None:
+         super().__init__()
+         self.sequence_length = int(sequence_length)
+@@ -92,6 +99,11 @@ class TextToTSFlow(nn.Module):
+             dropout=mapper_dropout,
+             normalizer=mapper_normalizer,
+             bounded_field_gate=mapper_bounded_field_gate,
++            gate_rescale=mapper_gate_rescale,
++            operator_router=mapper_operator_router,
++            series_stats_dim=7,
++            router_epsilon=mapper_router_epsilon,
++            time_segment_scales=mapper_time_segment_scales,
+         )
+         self.operator_bank = ResidualOperatorBank(
+             num_channels=self.num_channels,
+@@ -104,7 +116,10 @@ class TextToTSFlow(nn.Module):
+             dropout=operator_dropout,
+             context_dim=d_model,
+             context_film=operator_context_film,
++            context_mode=operator_context_mode,
+             norm_type=operator_norm,
++            architecture=operator_architecture,
++            channel_heads=operator_channel_heads,
+         )
+ 
+     def forward(
+@@ -128,14 +143,24 @@ class TextToTSFlow(nn.Module):
+         if self.flow_time_proj is not None:
+             slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(x_t.dtype))[:, None, :]
+         text_context = _masked_mean(slot_tokens, slot_mask)
+-        g_patch, aux = self.mapper(slot_tokens, time_tokens, channel_tokens, slot_mask)
++        series_stats = _series_router_stats(x_t)
++        g_patch, aux = self.mapper(
++            slot_tokens, time_tokens, channel_tokens, slot_mask,
++            series_stats=series_stats, flow_time=t,
++        )
+         g = g_patch.repeat_interleave(self.patch_len, dim=1)
+         if g.shape[1] < self.sequence_length:
+             raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
+         g = g[:, : self.sequence_length]
+         velocities = self.operator_bank(x_t, None, t, context=text_context)
+         v_hat = (g * velocities).sum(dim=-1)
+-        aux = {**aux, "G_patch": g_patch, "G": g, "V": velocities, "text_context": text_context}
++        aux = {
++            **aux, "G_patch": g_patch, "G": g, "V": velocities,
++            "text_context": text_context, "series_stats": series_stats.detach(),
++        }
++        operator_aux = getattr(self.operator_bank, "last_aux", {})
++        if operator_aux:
++            aux["operator_aux"] = operator_aux
+         return v_hat, aux
+ 
+ 
+@@ -147,3 +172,40 @@ def _masked_mean(tokens: torch.Tensor, mask: torch.Tensor | None) -> torch.Tenso
+         raise ValueError(f"slot mask must have shape {tuple(tokens.shape[:2])}, got {tuple(mask.shape)}")
+     denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+     return (tokens * mask[:, :, None]).sum(dim=1) / denom
++
++
++def _series_router_stats(x: torch.Tensor) -> torch.Tensor:
++    """Compute 7-dim statistics from current flow state for dual routing."""
++    if x.ndim != 3:
++        raise ValueError(f"x must be [B, L, C], got {tuple(x.shape)}")
++    batch, length, channels = x.shape
++    dtype = x.dtype
++    centered = x - x.mean(dim=1, keepdim=True)
++    level = x.mean(dim=(1, 2))
++    scale = centered.square().mean(dim=(1, 2)).sqrt()
++    if length > 1:
++        diff = x[:, 1:] - x[:, :-1]
++        roughness = diff.square().mean(dim=(1, 2)).sqrt()
++    else:
++        roughness = torch.zeros(batch, device=x.device, dtype=dtype)
++    fft_source = centered.transpose(1, 2)
++    fft_dtype = torch.float32 if fft_source.dtype in {torch.float16, torch.bfloat16} else fft_source.dtype
++    freq = torch.fft.rfft(fft_source.to(fft_dtype), dim=-1)
++    power = freq.abs().square().mean(dim=1)
++    freq_len = power.shape[-1]
++    low_end = max(1, int(round(freq_len / 3)))
++    mid_end = max(low_end + 1, int(round(2 * freq_len / 3)))
++    total = power.sum(dim=-1).clamp_min(1e-8)
++    low = power[:, :low_end].sum(dim=-1) / total
++    mid = power[:, low_end:mid_end].sum(dim=-1) / total if mid_end > low_end else torch.zeros_like(low)
++    high = power[:, mid_end:].sum(dim=-1) / total if mid_end < freq_len else torch.zeros_like(low)
++    if channels > 1:
++        normed = centered / centered.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-6)
++        corr = torch.einsum("blc,bld->bcd", normed, normed) / float(length)
++        eye = torch.eye(channels, device=x.device, dtype=torch.bool)
++        channel_corr = corr.masked_select(~eye[None]).reshape(batch, -1).abs().mean(dim=-1)
++    else:
++        channel_corr = torch.zeros(batch, device=x.device, dtype=dtype)
++    stats = torch.stack([level, scale, roughness, low.to(dtype), mid.to(dtype), high.to(dtype), channel_corr], dim=-1)
++    transformed = torch.log1p(stats.float().abs()) * stats.float().sign()
++    return transformed.to(dtype)
+diff --git a/effectcma_flow/training/diagnostics.py b/effectcma_flow/training/diagnostics.py
+new file mode 100644
+index 0000000..7cbdd96
+--- /dev/null
++++ b/effectcma_flow/training/diagnostics.py
+@@ -0,0 +1,54 @@
++from __future__ import annotations
++
++from typing import Any
++
++
++def scalarize_logs(logs: dict[str, Any]) -> dict[str, float]:
++    out = {}
++    for key, val in logs.items():
++        if hasattr(val, "item"):
++            try:
++                out[key] = float(val.item())
++            except (ValueError, RuntimeError):
++                pass
++        elif isinstance(val, (int, float)):
++            out[key] = float(val)
++    return out
++
++
++def print_core_flow_report(logs: dict[str, Any]) -> None:
++    s = scalarize_logs(logs)
++    parts = [f"loss={s.get('loss', float('nan')):.4f}"]
++    for key in [
++        "gate_rescale_factor",
++        "gate_raw_cell_mass_mean",
++        "gate_cell_mass_mean",
++        "operator_gate_entropy",
++        "time_gate_entropy",
++        "channel_gate_entropy",
++    ]:
++        if key in s:
++            parts.append(f"{key}={s[key]:.4f}")
++    print(" | ".join(parts))
++
++
++def assert_text_encoder_is_semantic(model: object) -> None:
++    from effectcma_flow.models.text_encoder import HashTextEncoder
++    text_enc = getattr(model, "text_encoder", None)
++    if isinstance(text_enc, HashTextEncoder):
++        raise RuntimeError(
++            "Model is using HashTextEncoder which has no semantic ability. "
++            "For real CTTP/J-FTSD evaluation, use mode='hf' or mode='longclip'."
++        )
++
++
++def gate_health_status(logs: dict[str, Any]) -> str:
++    s = scalarize_logs(logs)
++    raw = s.get("gate_raw_cell_mass_mean", float("nan"))
++    fixed = s.get("gate_cell_mass_mean", float("nan"))
++    ratio = s.get("pred_target_rms_ratio", float("nan"))
++    if raw < 0.05 and fixed < 0.2:
++        return f"WARNING: gate severely diluted (raw={raw:.4f}, fixed={fixed:.4f})"
++    if ratio < 0.3:
++        return f"WARNING: model velocity much smaller than target (ratio={ratio:.3f})"
++    return f"OK: gate mass={fixed:.4f}, v-ratio={ratio:.3f}"

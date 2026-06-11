@@ -147,23 +147,14 @@ class CLIPTextProjectionEncoder(nn.Module):
             mask = torch.zeros(batch_size, 1, device=device, dtype=dtype)
             return z, mask
 
-        tokens = self.tokenizer(flat, padding=True, return_tensors="pt")
-        input_ids = tokens["input_ids"].to(device)
-        attention_mask = tokens.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-        chunks = []
-        for start in range(0, input_ids.shape[1], self.max_length):
-            chunk_ids = input_ids[:, start : start + self.max_length]
-            if chunk_ids.shape[1] == 0:
-                continue
-            chunk_mask = attention_mask[:, start : start + self.max_length] if attention_mask is not None else None
-            kwargs = {"input_ids": chunk_ids}
-            if chunk_mask is not None:
-                kwargs["attention_mask"] = chunk_mask
-            with torch.no_grad():
-                chunks.append(self.backbone(**kwargs).text_embeds)
-        raw = torch.stack(chunks, dim=0).mean(dim=0)
+        input_ids, attention_mask, owners = self._tokenize_chunks(flat, device)
+        with torch.no_grad():
+            chunk_emb = self.backbone(input_ids=input_ids, attention_mask=attention_mask).text_embeds
+        raw = torch.zeros(len(flat), chunk_emb.shape[-1], device=device, dtype=chunk_emb.dtype)
+        counts = torch.zeros(len(flat), 1, device=device, dtype=chunk_emb.dtype)
+        raw.index_add_(0, owners, chunk_emb)
+        counts.index_add_(0, owners, torch.ones(owners.shape[0], 1, device=device, dtype=chunk_emb.dtype))
+        raw = raw / counts.clamp_min(1.0)
         emb = self.proj(raw)
         z = torch.zeros(len(slots), max_slots, emb.shape[-1], device=device, dtype=emb.dtype)
         mask = torch.zeros(len(slots), max_slots, device=device, dtype=emb.dtype)
@@ -173,6 +164,40 @@ class CLIPTextProjectionEncoder(nn.Module):
                 z[row, :width] = emb[start:end]
                 mask[row, :width] = 1.0
         return z, mask
+
+    def _tokenize_chunks(self, texts: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        special_len = len(self.tokenizer.build_inputs_with_special_tokens([]))
+        chunk_payload = max(1, self.max_length - special_len)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = 0
+        rows: list[list[int]] = []
+        masks: list[list[int]] = []
+        owners: list[int] = []
+        for owner, text in enumerate(texts):
+            token_ids = self.tokenizer.encode(str(text), add_special_tokens=False)
+            if not token_ids:
+                token_chunks = [[]]
+            else:
+                token_chunks = [token_ids[start : start + chunk_payload] for start in range(0, len(token_ids), chunk_payload)]
+            for chunk in token_chunks:
+                full = self.tokenizer.build_inputs_with_special_tokens(chunk)
+                if len(full) > self.max_length:
+                    full = full[: self.max_length]
+                attn = [1] * len(full)
+                pad = self.max_length - len(full)
+                if pad > 0:
+                    full = full + [int(pad_id)] * pad
+                    attn = attn + [0] * pad
+                rows.append([int(x) for x in full])
+                masks.append(attn)
+                owners.append(owner)
+        input_ids = torch.tensor(rows, device=device, dtype=torch.long)
+        attention_mask = torch.tensor(masks, device=device, dtype=torch.long)
+        owner_tensor = torch.tensor(owners, device=device, dtype=torch.long)
+        return input_ids, attention_mask, owner_tensor
 
 
 def build_text_encoder(config: dict[str, Any], d_model: int) -> nn.Module:

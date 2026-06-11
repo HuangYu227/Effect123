@@ -5,6 +5,7 @@ from torch import nn
 
 from effectcma_flow.models.effect_mapper import EffectMapper
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
+from effectcma_flow.models.text_to_ts_flow import _masked_mean, _series_router_stats
 from effectcma_flow.models.ts_encoder import ChannelEncoder, TimePatchEncoder
 
 
@@ -73,6 +74,16 @@ class EffectCMAFlow(nn.Module):
             dropout=channel_dropout,
         )
         self.text_encoder = text_encoder
+        self.mapper_flow_time_condition = bool(mapper_flow_time_condition)
+        self.flow_time_proj = None
+        if self.mapper_flow_time_condition:
+            self.flow_time_proj = nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            nn.init.zeros_(self.flow_time_proj[-1].weight)
+            nn.init.zeros_(self.flow_time_proj[-1].bias)
         self.mapper = EffectMapper(
             d_model=d_model,
             num_operators=num_operators,
@@ -83,6 +94,9 @@ class EffectCMAFlow(nn.Module):
             normalizer=mapper_normalizer,
             bounded_field_gate=mapper_bounded_field_gate,
             gate_rescale=mapper_gate_rescale,
+            operator_router=mapper_operator_router,
+            router_epsilon=mapper_router_epsilon,
+            time_segment_scales=mapper_time_segment_scales,
         )
         self.operator_bank = ResidualOperatorBank(
             num_channels=self.num_channels,
@@ -93,6 +107,9 @@ class EffectCMAFlow(nn.Module):
             depth=operator_depth,
             kernel_size=operator_kernel_size,
             dropout=operator_dropout,
+            context_dim=d_model,
+            context_film=operator_context_film,
+            context_mode=operator_context_mode,
             norm_type=operator_norm,
             architecture=operator_architecture,
             channel_heads=operator_channel_heads,
@@ -122,12 +139,26 @@ class EffectCMAFlow(nn.Module):
         time_tokens = self.time_encoder(base)
         channel_tokens = self.channel_encoder(base)
         slot_tokens, slot_mask = self.text_encoder(text_condition)
-        g_patch, aux = self.mapper(slot_tokens, time_tokens, channel_tokens, slot_mask)
+        if self.flow_time_proj is not None:
+            slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(base.dtype))[:, None, :]
+        text_context = _masked_mean(slot_tokens, slot_mask)
+        series_stats = _series_router_stats(x_t)
+        g_patch, aux = self.mapper(
+            slot_tokens,
+            time_tokens,
+            channel_tokens,
+            slot_mask,
+            series_stats=series_stats,
+            flow_time=t,
+        )
         g = g_patch.repeat_interleave(self.patch_len, dim=1)
         if g.shape[1] < self.sequence_length:
             raise RuntimeError(f"Expanded effect field length {g.shape[1]} is shorter than {self.sequence_length}")
         g = g[:, : self.sequence_length]
-        velocities = self.operator_bank(x_t, base, t)
+        velocities = self.operator_bank(x_t, base, t, context=text_context)
         v_hat = (g * velocities).sum(dim=-1)
-        aux = {**aux, "G_patch": g_patch, "G": g, "V": velocities}
+        aux = {**aux, "G_patch": g_patch, "G": g, "V": velocities, "text_context": text_context, "series_stats": series_stats.detach()}
+        operator_aux = getattr(self.operator_bank, "last_aux", {})
+        if operator_aux:
+            aux["operator_aux"] = operator_aux
         return v_hat, aux

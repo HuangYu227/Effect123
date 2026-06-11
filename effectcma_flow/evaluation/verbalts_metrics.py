@@ -11,7 +11,7 @@ import yaml
 from scipy import linalg
 from tqdm import tqdm
 
-from effectcma_flow.evaluation.sampler import euler_sample, euler_sample_text2ts
+from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.training.utils import batch_to_device, text_condition_from_batch
 
 
@@ -72,6 +72,7 @@ class VerbalTSMetricComputer:
         generated_loader,
         text_encoder_mode: str,
         steps: int,
+        solver: str = "euler",
         task_mode: str = "edit",
         noise_scale: float = 1.0,
         n_samples: int = 1,
@@ -108,6 +109,7 @@ class VerbalTSMetricComputer:
             loader=generated_loader,
             text_encoder_mode=text_encoder_mode,
             steps=steps,
+            solver=solver,
             task_mode=task_mode,
             noise_scale=noise_scale,
             n_samples=n_samples,
@@ -156,6 +158,7 @@ class VerbalTSMetricComputer:
         loader,
         text_encoder_mode: str,
         steps: int,
+        solver: str,
         task_mode: str,
         noise_scale: float,
         n_samples: int,
@@ -175,10 +178,11 @@ class VerbalTSMetricComputer:
                 preds = []
                 text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
                 for _ in range(max(1, int(n_samples))):
-                    pred_one, _ = euler_sample_text2ts(
+                    pred_one, _ = sample_text2ts(
                         model,
                         batch["Y"],
                         text_condition,
+                        solver=solver,
                         steps=steps,
                         noise_scale=noise_scale,
                     )

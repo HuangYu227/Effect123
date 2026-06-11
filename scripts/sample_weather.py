@@ -19,7 +19,7 @@ from effectcma_flow.data import (
     compute_train_stats,
 )
 from effectcma_flow.evaluation.metrics import compute_field_metrics, compute_metrics, compute_text2ts_metrics
-from effectcma_flow.evaluation.sampler import euler_sample, euler_sample_text2ts
+from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.evaluation.visualize import dump_generated_plot, dump_sample_plot, dump_text2ts_plot
 from effectcma_flow.models import build_model
 from effectcma_flow.training import checkpoint_eval_config, checkpoint_stats_or_none, load_training_checkpoint, resolve_device
@@ -143,10 +143,11 @@ def run_sample(
     model.eval()
     with torch.no_grad():
         if task_mode == "text2ts":
-            pred, aux = euler_sample_text2ts(
+            pred, aux = sample_text2ts(
                 model,
                 batch["Y"],
                 text_condition_from_batch(batch, text_mode, condition_key="caption"),
+                solver=str(cfg.get("sample", {}).get("solver", "euler")),
                 steps=int(cfg.get("sample", {}).get("steps", 16)),
                 noise_scale=float(cfg.get("sample", {}).get("noise_scale", 1.0)),
             )
@@ -191,10 +192,11 @@ def run_prompt_sample(
         model.load_state_dict(checkpoint_payload["model"])
     model.eval()
     with torch.no_grad():
-        pred, _ = euler_sample_text2ts(
+        pred, _ = sample_text2ts(
             model,
             shape_like,
             [[caption]],
+            solver=str(cfg.get("sample", {}).get("solver", "euler")),
             steps=int(cfg.get("sample", {}).get("steps", 16)),
             noise_scale=float(cfg.get("sample", {}).get("noise_scale", 1.0)),
         )

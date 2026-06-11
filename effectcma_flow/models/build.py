@@ -2,17 +2,36 @@ from __future__ import annotations
 
 from typing import Any
 
+from effectcma_flow.models.blueprint_flow import BlueprintTextToTSFlow
 from effectcma_flow.models.effectcma_flow import EffectCMAFlow
 from effectcma_flow.models.text_encoder import build_text_encoder
 from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 
 
-def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
+def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow | BlueprintTextToTSFlow:
     model_cfg = config.get("model", config)
     text_cfg = config.get("text_encoder", {"mode": "hash"})
     task_mode = str(config.get("task", {}).get("mode", "text2ts")).lower()
+    model_type = str(model_cfg.get("model_type", model_cfg.get("architecture_type", "flow"))).lower()
     d_model = int(model_cfg.get("d_model", 128))
     text_encoder = build_text_encoder(text_cfg, d_model=d_model)
+    if task_mode == "text2ts" and model_type in {"blueprint", "blueprint_flow", "v4"}:
+        return BlueprintTextToTSFlow(
+            sequence_length=sequence_length,
+            num_channels=num_channels,
+            d_model=d_model,
+            text_encoder=text_encoder,
+            blueprint_trend_degree=int(model_cfg.get("blueprint_trend_degree", 3)),
+            blueprint_num_frequencies=int(model_cfg.get("blueprint_num_frequencies", 8)),
+            blueprint_rank=int(model_cfg.get("blueprint_rank", 4)),
+            flow_hidden=int(model_cfg.get("flow_hidden", model_cfg.get("operator_hidden", 96))),
+            flow_levels=int(model_cfg.get("flow_levels", 3)),
+            flow_blocks_per_level=int(model_cfg.get("flow_blocks_per_level", 1)),
+            flow_t_dim=int(model_cfg.get("flow_t_dim", model_cfg.get("operator_t_dim", 32))),
+            flow_dropout=float(model_cfg.get("flow_dropout", model_cfg.get("operator_dropout", 0.0))),
+            flow_max_velocity=float(model_cfg.get("flow_max_velocity", model_cfg.get("operator_max_velocity", 5.0))),
+            flow_channel_heads=int(model_cfg.get("flow_channel_heads", model_cfg.get("channel_heads", 4))),
+        )
     kwargs = dict(
         sequence_length=sequence_length,
         num_channels=num_channels,

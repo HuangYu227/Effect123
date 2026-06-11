@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from effectcma_flow.data.effects import EffectSpec, apply_effect
+from effectcma_flow.models.blueprint_flow import BlueprintTextToTSFlow
 from effectcma_flow.models.effect_mapper import EffectMapper
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
 from effectcma_flow.models.build import build_model
@@ -54,6 +55,24 @@ def _v3_text2ts_config():
     return cfg
 
 
+def _v4_text2ts_config():
+    cfg = _text2ts_config()
+    cfg["model"] = {
+        "model_type": "blueprint_flow",
+        "d_model": 16,
+        "blueprint_trend_degree": 2,
+        "blueprint_num_frequencies": 3,
+        "blueprint_rank": 2,
+        "flow_hidden": 12,
+        "flow_levels": 2,
+        "flow_blocks_per_level": 1,
+        "flow_t_dim": 4,
+        "flow_channel_heads": 3,
+        "flow_max_velocity": 3.0,
+    }
+    return cfg
+
+
 def _batch(batch_size=2, length=12, channels=4):
     base = torch.randn(batch_size, length, channels)
     ys, masks = [], []
@@ -95,6 +114,94 @@ def test_missing_task_mode_defaults_to_text2ts():
     cfg.pop("task")
     model = build_model(cfg, sequence_length=12, num_channels=4)
     assert isinstance(model, TextToTSFlow)
+
+
+def test_v4_blueprint_flow_uses_text_only_initial_state_and_sampler():
+    model = build_model(_v4_text2ts_config(), sequence_length=12, num_channels=3)
+    assert isinstance(model, BlueprintTextToTSFlow)
+    shape = torch.zeros(2, 12, 3)
+    text_a = [["smooth seasonal synthetic signal"], ["smooth seasonal synthetic signal"]]
+    text_b = [["spiky noisy synthetic signal"], ["spiky noisy synthetic signal"]]
+    source_a = model.initial_state(shape, text_a, noise=torch.zeros_like(shape))
+    source_b = model.initial_state(shape, text_b, noise=torch.zeros_like(shape))
+    assert source_a.shape == shape.shape
+    assert not torch.allclose(source_a, source_b)
+    sampled, aux = euler_sample_text2ts(model, shape, text_a, steps=2, noise=torch.zeros_like(shape))
+    assert sampled.shape == shape.shape
+    assert aux["blueprint"].shape == shape.shape
+    assert aux["A_o"].shape == (2, 1, 4)
+    assert torch.isfinite(sampled).all()
+
+
+def test_v4_cfm_train_step_updates_flow_with_detached_source_label():
+    model = build_model(_v4_text2ts_config(), sequence_length=12, num_channels=3)
+    batch = _text_batch(batch_size=2, length=12, channels=3)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    flow_before = model.flow.head.weight.detach().clone()
+    result = cfm_train_step(model, batch, opt, text_encoder_mode="hash", task_mode="text2ts")
+    assert torch.isfinite(result["loss"])
+    assert torch.isfinite(result["source_mse"])
+    assert torch.isfinite(result["blueprint_mse"])
+    assert torch.isfinite(result["velocity_cos"])
+    assert torch.isfinite(result["residual_scale_mean"])
+    assert not torch.allclose(flow_before, model.flow.head.weight.detach())
+
+
+class SourceGradientSpyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.source_bias = nn.Parameter(torch.tensor(0.25))
+        self.velocity = nn.Parameter(torch.tensor(0.0))
+
+    def prepare_condition(self, text_condition, *, device, dtype):
+        return {"_blueprint_prepared": True}
+
+    def initial_state(self, shape_like, text_condition, *, noise_scale=1.0, noise=None, generator=None):
+        return self.source_bias.to(device=shape_like.device, dtype=shape_like.dtype).expand_as(shape_like)
+
+    def forward(self, x_t, t, text_condition):
+        return self.velocity.to(device=x_t.device, dtype=x_t.dtype).expand_as(x_t), {
+            "A_o": torch.ones(x_t.shape[0], 1, 1, device=x_t.device, dtype=x_t.dtype)
+        }
+
+
+def test_v4_cfm_source_does_not_move_training_label():
+    model = SourceGradientSpyModel()
+    batch = _text_batch(batch_size=2, length=12, channels=3)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+    source_before = model.source_bias.detach().clone()
+    velocity_before = model.velocity.detach().clone()
+    result = cfm_train_step(model, batch, opt, text_encoder_mode="hash", task_mode="text2ts")
+    assert torch.isfinite(result["loss"])
+    assert torch.allclose(source_before, model.source_bias.detach())
+    assert not torch.allclose(velocity_before, model.velocity.detach())
+
+
+def test_v4_half_precision_initial_state_cpu_fft_path():
+    model = build_model(_v4_text2ts_config(), sequence_length=12, num_channels=3).half()
+    shape = torch.zeros(2, 12, 3).half()
+    out = model.initial_state(shape, [["caption"], ["caption"]])
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out.float()).all()
+
+
+def test_v4_initial_state_supports_single_step_sequences():
+    model = build_model(_v4_text2ts_config(), sequence_length=1, num_channels=3)
+    shape = torch.zeros(2, 1, 3)
+    out = model.initial_state(shape, [["caption"], ["caption"]])
+    assert out.shape == shape.shape
+    assert torch.isfinite(out).all()
+
+
+def test_v4_initial_state_does_not_depend_on_shape_like_values():
+    model = build_model(_v4_text2ts_config(), sequence_length=12, num_channels=3)
+    text = [["caption"], ["caption"]]
+    noise = torch.randn(2, 12, 3)
+    shape_a = torch.zeros(2, 12, 3)
+    shape_b = torch.randn(2, 12, 3) * 100.0
+    out_a = model.initial_state(shape_a, text, noise=noise)
+    out_b = model.initial_state(shape_b, text, noise=noise)
+    assert torch.allclose(out_a, out_b)
 
 
 def test_cfm_train_step_updates_trainable_params():

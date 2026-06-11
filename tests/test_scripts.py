@@ -86,6 +86,15 @@ def test_checkpoint_text_mode_override_conflict_raises(fake_weather_root):
         checkpoint_eval_config(_cfg(fake_weather_root), payload, text_encoder_override="hf")
 
 
+def test_checkpoint_text_model_identity_override_conflict_raises(fake_weather_root):
+    payload = {"config": _cfg(fake_weather_root), "task_mode": "text2ts"}
+    payload["config"]["text_encoder"].update({"mode": "longclip", "longclip_model_name": "save/Longclip"})
+    runtime = _cfg(fake_weather_root)
+    runtime["text_encoder"].update({"mode": "longclip", "longclip_model_name": "/different/Longclip"})
+    with pytest.raises(ValueError, match="longclip_model_name"):
+        checkpoint_eval_config(runtime, payload)
+
+
 def test_checkpoint_task_mode_override_conflict_raises(fake_weather_root):
     payload = {"config": _cfg(fake_weather_root), "task_mode": "text2ts"}
     with pytest.raises(ValueError, match="task.mode"):
@@ -127,3 +136,18 @@ def test_checkpoint_payload_requires_task_mode(fake_weather_root):
     }
     with pytest.raises(ValueError, match="task_mode"):
         validate_checkpoint_payload(payload)
+
+
+def test_checkpoint_payload_accepts_blueprint_text2ts_model(fake_weather_root):
+    cfg = _cfg(fake_weather_root)
+    cfg["model"] = {"model_type": "blueprint_flow", "d_model": 16}
+    payload = {
+        "schema_version": 2,
+        "task_mode": "text2ts",
+        "model_class": "BlueprintTextToTSFlow",
+        "model": {},
+        "config": cfg,
+        "stats": {"mean": torch.zeros(1, 1, 4), "std": torch.ones(1, 1, 4)},
+        "step": 1,
+    }
+    validate_checkpoint_payload(payload)

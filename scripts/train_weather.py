@@ -145,6 +145,16 @@ def run_train(cfg: dict) -> None:
                     postfix["serH"] = f"{_scalar(out, 'series_operator_entropy'):.2f}"
                 if "router_top1_agreement" in out:
                     postfix["agr"] = f"{_scalar(out, 'router_top1_agreement'):.2f}"
+                if "source_mse" in out:
+                    postfix["srcM"] = f"{_scalar(out, 'source_mse'):.3f}"
+                if "blueprint_mse" in out:
+                    postfix["bpM"] = f"{_scalar(out, 'blueprint_mse'):.3f}"
+                if "velocity_cos" in out:
+                    postfix["vCos"] = f"{_scalar(out, 'velocity_cos'):.2f}"
+                if "pred_v_rms" in out:
+                    postfix["pvR"] = f"{_scalar(out, 'pred_v_rms'):.2f}"
+                if "residual_scale_mean" in out:
+                    postfix["rs"] = f"{_scalar(out, 'residual_scale_mean'):.2f}"
                 if "loss_inside" in out:
                     postfix["inside"] = f"{_scalar(out, 'loss_inside'):.4f}"
                     postfix["outside"] = f"{_scalar(out, 'loss_outside'):.4f}"
@@ -244,7 +254,7 @@ def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int
                 noise=noise,
             )
             one = compute_text2ts_metrics(pred, batch["Y"])
-            one.update(_field_summary(aux))
+            one.update(_field_summary(aux, target=batch["Y"]))
         else:
             text_condition = text_condition_from_batch(batch, text_mode, condition_key="slots")
             pred, aux = euler_sample(model, batch["B"], text_condition, steps=int(cfg.get("sample", {}).get("steps", 16)))
@@ -256,7 +266,7 @@ def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int
     return average_metric_dicts(metrics)
 
 
-def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
+def _field_summary(aux: dict[str, torch.Tensor], target: torch.Tensor | None = None) -> dict[str, float]:
     out: dict[str, float] = {}
     if "A_o" in aux:
         p = aux["A_o"].detach().clamp_min(1e-8)
@@ -273,6 +283,30 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
             out["router_top1_agreement"] = float((text.argmax(dim=-1) == series.argmax(dim=-1)).float().mean().cpu())
     if "G" in aux:
         out["field_abs_mean"] = float(aux["G"].detach().abs().mean().cpu())
+    if "blueprint" in aux:
+        blueprint = aux["blueprint"].detach()
+        out["blueprint_std"] = float(blueprint.std(unbiased=False).cpu())
+        if target is not None:
+            out["blueprint_mse"] = float((blueprint - target).square().mean().detach().cpu())
+    for key, metric in (
+        ("blueprint_trend", "trend_rms"),
+        ("blueprint_seasonal", "seasonal_rms"),
+        ("blueprint_channel", "channel_rms"),
+    ):
+        if key in aux:
+            out[metric] = float(aux[key].detach().square().mean().sqrt().cpu())
+    if "residual_scale" in aux:
+        scale = aux["residual_scale"].detach()
+        out["residual_scale_mean"] = float(scale.mean().cpu())
+        out["residual_scale_std"] = float(scale.std(unbiased=False).cpu())
+    if "noise_band_weights" in aux:
+        bands = aux["noise_band_weights"].detach().mean(dim=(0, 1))
+        if bands.numel() >= 3:
+            out["noise_low"] = float(bands[0].cpu())
+            out["noise_mid"] = float(bands[1].cpu())
+            out["noise_high"] = float(bands[2].cpu())
+    if "flow_hidden_rms" in aux:
+        out["flow_hidden_rms"] = float(aux["flow_hidden_rms"].detach().cpu())
     return out
 
 
@@ -289,9 +323,21 @@ def save_checkpoint(path: Path, model, optimizer, cfg: dict, stats: dict, step: 
         "stats": {k: v.cpu() for k, v in stats.items()},
         "step": step,
     }
-    operator_names = getattr(model.operator_bank, "operator_type_names", None)
+    operator_bank = getattr(model, "operator_bank", None)
+    operator_names = getattr(operator_bank, "operator_type_names", None)
     if operator_names is not None:
         payload["operator_type_names"] = list(operator_names)
+    component_names = getattr(model, "component_names", None)
+    if component_names is None:
+        try:
+            from effectcma_flow.models.blueprint_flow import COMPONENT_NAMES
+
+            if model.__class__.__name__ == "BlueprintTextToTSFlow":
+                component_names = COMPONENT_NAMES
+        except Exception:
+            component_names = None
+    if component_names is not None:
+        payload["component_names"] = list(component_names)
     tmp = path.with_name(f".{path.name}.tmp")
     torch.save(payload, tmp)
     os.replace(tmp, path)

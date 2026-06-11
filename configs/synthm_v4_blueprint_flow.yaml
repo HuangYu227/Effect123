@@ -1,0 +1,66 @@
+task:
+  mode: text2ts
+
+data:
+  root: null
+  window_length: null
+  normalize: true
+  caption_policy: random
+  include_precomputed_embeddings: false
+  seed: 20260609
+  effect_types:
+    - level_shift
+    - trend_up
+    - trend_down
+    - volatility_up
+    - volatility_down
+    - spike
+    - drop
+
+model:
+  model_type: blueprint_flow
+  d_model: 128
+  blueprint_trend_degree: 3
+  blueprint_num_frequencies: 8
+  blueprint_rank: 4
+  flow_hidden: 96
+  flow_levels: 3
+  flow_blocks_per_level: 1
+  flow_t_dim: 32
+  flow_dropout: 0.0
+  flow_max_velocity: 5.0
+  flow_channel_heads: 4
+
+text_encoder:
+  mode: hash
+  hash_dim: 256
+  precomputed_dim: 128
+  hf_model_name: "BAAI/bge-small-en-v1.5"
+  longclip_model_name: "save/Longclip"
+  longclip_local_files_only: true
+  local_files_only: false
+  fallback_mode: error
+  fallback_hash_dim: 256
+
+train:
+  batch_size: 32
+  eval_batch_size: null
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_steps: 1000
+  cfm_loss_mode: global
+  noise_scale: 1.0
+  grad_clip: 1.0
+  num_workers: 0
+  device: auto
+  checkpoint_dir: checkpoints/synthm_v4_blueprint_flow
+  log_every: 20
+  eval_every: 200
+  eval_batches: 4
+  eval_seed_offset: 50000
+  best_metric: mse
+  save_every: 1000
+
+sample:
+  steps: 16
+  noise_scale: 1.0

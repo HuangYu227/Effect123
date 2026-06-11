@@ -25,6 +25,7 @@ def cfm_train_step(
     if task_mode == "edit":
         base = batch["B"]
         target = batch["Y"]
+        source = base
         batch_size = base.shape[0]
         t = torch.rand(batch_size, device=base.device, dtype=base.dtype)
         x_t = (1.0 - t[:, None, None]) * base + t[:, None, None] * target
@@ -35,10 +36,15 @@ def cfm_train_step(
         target = batch["Y"]
         batch_size = target.shape[0]
         t = torch.rand(batch_size, device=target.device, dtype=target.dtype)
-        source = torch.randn_like(target) * float(noise_scale)
+        text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
+        if hasattr(model, "prepare_condition") and hasattr(model, "initial_state"):
+            prepared = model.prepare_condition(text_condition, device=target.device, dtype=target.dtype)
+            source = model.initial_state(target.new_zeros(target.shape), prepared, noise_scale=float(noise_scale)).detach()
+            text_condition = prepared
+        else:
+            source = torch.randn_like(target) * float(noise_scale)
         x_t = (1.0 - t[:, None, None]) * source + t[:, None, None] * target
         target_v = target - source
-        text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
         pred_v, aux = model(x_t, t, text_condition)
     else:
         raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
@@ -59,6 +65,7 @@ def cfm_train_step(
         time_entropy = _maybe_entropy(aux, "A_t")
         channel_entropy = _maybe_entropy(aux, "A_c")
         router_stats = _router_stats(aux)
+        flow_stats = _flow_diagnostics(aux, target=target, source=source, pred_v=pred_v, target_v=target_v)
     return {
         "loss": loss.detach(),
         **loss_parts,
@@ -71,6 +78,7 @@ def cfm_train_step(
         "time_gate_entropy": time_entropy,
         "channel_gate_entropy": channel_entropy,
         **router_stats,
+        **flow_stats,
     }
 
 
@@ -107,6 +115,62 @@ def _router_stats(aux: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if "A_o_text" in aux:
             text = aux["A_o_text"].mean(dim=1)
             out["router_top1_agreement"] = (text.argmax(dim=-1) == series.argmax(dim=-1)).float().mean().detach()
+    return out
+
+
+def _flow_diagnostics(
+    aux: dict[str, torch.Tensor],
+    *,
+    target: torch.Tensor,
+    source: torch.Tensor,
+    pred_v: torch.Tensor,
+    target_v: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    device = target.device
+    nan = torch.tensor(float("nan"), device=device)
+    source = source.detach()
+    target = target.detach()
+    pred_v = pred_v.detach()
+    target_v = target_v.detach()
+    pred_rms = pred_v.square().mean().sqrt()
+    target_rms = target_v.square().mean().sqrt()
+    out: dict[str, torch.Tensor] = {
+        "source_mse": (source - target).square().mean(),
+        "source_std": source.std(unbiased=False),
+        "target_std": target.std(unbiased=False),
+        "pred_v_rms": pred_rms,
+        "target_v_rms": target_rms,
+        "velocity_cos": (pred_v * target_v).mean() / (pred_rms * target_rms).clamp_min(1e-8),
+        "blueprint_mse": nan,
+        "blueprint_std": nan,
+        "trend_rms": nan,
+        "seasonal_rms": nan,
+        "channel_rms": nan,
+        "residual_scale_mean": nan,
+        "noise_low": nan,
+        "noise_mid": nan,
+        "noise_high": nan,
+        "flow_hidden_rms": nan,
+    }
+    if "blueprint" in aux:
+        blueprint = aux["blueprint"].detach()
+        out["blueprint_mse"] = (blueprint - target).square().mean()
+        out["blueprint_std"] = blueprint.std(unbiased=False)
+    for key, out_key in (
+        ("blueprint_trend", "trend_rms"),
+        ("blueprint_seasonal", "seasonal_rms"),
+        ("blueprint_channel", "channel_rms"),
+    ):
+        if key in aux:
+            out[out_key] = aux[key].detach().square().mean().sqrt()
+    if "residual_scale" in aux:
+        out["residual_scale_mean"] = aux["residual_scale"].detach().mean()
+    if "noise_band_weights" in aux:
+        bands = aux["noise_band_weights"].detach().mean(dim=(0, 1))
+        if bands.numel() >= 3:
+            out["noise_low"], out["noise_mid"], out["noise_high"] = bands[0], bands[1], bands[2]
+    if "flow_hidden_rms" in aux:
+        out["flow_hidden_rms"] = aux["flow_hidden_rms"].detach()
     return out
 
 

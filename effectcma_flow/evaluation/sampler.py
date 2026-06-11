@@ -33,10 +33,16 @@ def euler_sample_text2ts(
         raise ValueError("steps must be positive")
     if shape_like.ndim != 3:
         raise ValueError(f"shape_like must be [B, L, C], got {tuple(shape_like.shape)}")
-    if noise is None:
-        x = torch.randn(shape_like.shape, device=shape_like.device, dtype=shape_like.dtype, generator=generator) * float(noise_scale)
+    if hasattr(model, "prepare_condition") and hasattr(model, "initial_state"):
+        prepared = model.prepare_condition(text_condition, device=shape_like.device, dtype=shape_like.dtype)
+        source_shape = shape_like.new_zeros(shape_like.shape)
+        x = model.initial_state(source_shape, prepared, noise_scale=float(noise_scale), noise=noise, generator=generator)
+        text_condition = prepared
     else:
-        x = noise.to(shape_like.device, dtype=shape_like.dtype)
+        if noise is None:
+            x = torch.randn(shape_like.shape, device=shape_like.device, dtype=shape_like.dtype, generator=generator) * float(noise_scale)
+        else:
+            x = noise.to(shape_like.device, dtype=shape_like.dtype)
     if x.shape != shape_like.shape:
         raise ValueError(f"noise must have shape {tuple(shape_like.shape)}, got {tuple(x.shape)}")
     aux = {}

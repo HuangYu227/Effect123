@@ -32,9 +32,12 @@ def validate_checkpoint_payload(payload: dict[str, Any]) -> None:
     config_task_mode = _task_mode_from_config(payload["config"])
     if payload["task_mode"] != config_task_mode:
         raise ValueError(f"Checkpoint task_mode={payload['task_mode']!r} does not match config task.mode={config_task_mode!r}")
-    expected_class = "TextToTSFlow" if config_task_mode == "text2ts" else "EffectCMAFlow"
-    if payload["model_class"] != expected_class:
-        raise ValueError(f"Checkpoint model_class={payload['model_class']!r} does not match task.mode={config_task_mode!r}")
+    expected_classes = _expected_model_classes(payload["config"], config_task_mode)
+    if payload["model_class"] not in expected_classes:
+        raise ValueError(
+            f"Checkpoint model_class={payload['model_class']!r} does not match expected classes "
+            f"{sorted(expected_classes)} for task.mode={config_task_mode!r}"
+        )
 
 
 def checkpoint_eval_config(
@@ -84,6 +87,16 @@ def _task_mode_from_config(cfg: dict[str, Any]) -> str:
     return task_mode
 
 
+def _expected_model_classes(cfg: dict[str, Any], task_mode: str) -> set[str]:
+    if task_mode == "edit":
+        return {"EffectCMAFlow"}
+    model_cfg = cfg.get("model", {})
+    model_type = str(model_cfg.get("model_type", model_cfg.get("architecture_type", "flow"))).lower()
+    if model_type in {"blueprint", "blueprint_flow", "v4"}:
+        return {"BlueprintTextToTSFlow"}
+    return {"TextToTSFlow"}
+
+
 def _copy_runtime_train_overrides(cfg: dict[str, Any], runtime_cfg: dict[str, Any]) -> None:
     runtime_train = runtime_cfg.get("train", {})
     train = cfg.setdefault("train", {})
@@ -97,8 +110,16 @@ def _copy_runtime_text_model_override(cfg: dict[str, Any], runtime_cfg: dict[str
     runtime_text = runtime_cfg.get("text_encoder", {})
     text = cfg.setdefault("text_encoder", {})
     mode = str(text.get("mode", "hash")).lower()
-    for key in ("hf_model_name", "longclip_model_name", "local_files_only", "longclip_local_files_only"):
+    for key in ("hf_model_name", "longclip_model_name"):
+        runtime_value = runtime_text.get(key)
+        checkpoint_value = text.get(key)
+        if runtime_value is not None and checkpoint_value is not None and str(runtime_value) != str(checkpoint_value):
+            raise ValueError(
+                f"Checkpoint was trained with text_encoder.{key}={checkpoint_value!r}; "
+                f"refusing runtime override {runtime_value!r}. Use a checkpoint/config conversion for model path migration."
+            )
+    for key in ("local_files_only", "longclip_local_files_only"):
         if key in runtime_text:
-            if key.endswith("_model_name") and mode == "hash":
+            if mode == "hash":
                 continue
             text[key] = runtime_text[key]

@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from effectcma_flow.data.effects import EffectSpec, apply_effect
-from effectcma_flow.models.blueprint_flow import BlueprintTextToTSFlow
+from effectcma_flow.models.blueprint_flow import BlueprintTextToTSFlow, _chunked_channel_attention
 from effectcma_flow.models.effect_mapper import EffectMapper
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
 from effectcma_flow.models.build import build_model
@@ -202,6 +202,14 @@ def test_v4_initial_state_does_not_depend_on_shape_like_values():
     out_a = model.initial_state(shape_a, text, noise=noise)
     out_b = model.initial_state(shape_b, text, noise=noise)
     assert torch.allclose(out_a, out_b)
+
+
+def test_v4_channel_attention_chunked_path_large_batch_tokens():
+    attn = nn.MultiheadAttention(12, 3, batch_first=True)
+    x = torch.randn(33000, 2, 12)
+    out = _chunked_channel_attention(attn, x, max_tokens=8192)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
 
 
 def test_cfm_train_step_updates_trainable_params():

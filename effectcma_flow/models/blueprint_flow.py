@@ -440,7 +440,7 @@ class ComponentFlowBlock(nn.Module):
         temporal_in = y.permute(0, 2, 3, 1).reshape(batch * channels, hidden, length)
         temporal = self.temporal(temporal_in).reshape(batch, channels, hidden, length).permute(0, 3, 1, 2)
         channel_in = y.reshape(batch * length, channels, hidden)
-        channel, _ = self.channel_attn(channel_in, channel_in, channel_in, need_weights=False)
+        channel = _chunked_channel_attention(self.channel_attn, channel_in)
         channel = (channel + self.channel_ffn(channel)).reshape(batch, length, channels, hidden)
         frequency = self._frequency_branch(y)
         gate = torch.softmax(self.branch_gate(text_context), dim=-1)
@@ -533,6 +533,25 @@ def _upsample_time(x: torch.Tensor, length: int) -> torch.Tensor:
     series = x.permute(0, 2, 3, 1).reshape(batch * channels, hidden, -1)
     up = torch.nn.functional.interpolate(series, size=int(length), mode="linear", align_corners=False)
     return up.reshape(batch, channels, hidden, int(length)).permute(0, 3, 1, 2)
+
+
+def _chunked_channel_attention(
+    attn: nn.MultiheadAttention,
+    x: torch.Tensor,
+    *,
+    max_tokens: int = 32768,
+) -> torch.Tensor:
+    if x.ndim != 3:
+        raise ValueError(f"channel attention input must be [N, C, H], got {tuple(x.shape)}")
+    if x.shape[0] <= max_tokens:
+        out, _ = attn(x, x, x, need_weights=False)
+        return out
+    pieces = []
+    for start in range(0, x.shape[0], max_tokens):
+        chunk = x[start : start + max_tokens]
+        out, _ = attn(chunk, chunk, chunk, need_weights=False)
+        pieces.append(out)
+    return torch.cat(pieces, dim=0)
 
 
 def _fixed_frequency_bands(freq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

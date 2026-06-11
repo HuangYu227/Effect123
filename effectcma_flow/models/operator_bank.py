@@ -193,7 +193,7 @@ class FrequencyBandExpert(nn.Module):
             energy.append((freq.abs().square() * mask_t).mean(dim=(1, 2)))
         stacked = torch.cat(components, dim=1)
         y = self.band_mixer(stacked.transpose(1, 2)).transpose(1, 2)
-        out = self.head(y).reshape(batch, channels, length).transpose(1, 2)
+        out = self.head(y.transpose(1, 2)).squeeze(-1).reshape(batch, channels, length).transpose(1, 2)
         band_energy = torch.stack(energy, dim=-1).reshape(batch, channels, 3).mean(dim=1).to(h.dtype)
         aux = {
             "frequency_band_energy": band_energy.detach(),

@@ -41,9 +41,15 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         mapper_normalizer=str(model_cfg.get("mapper_normalizer", "softmax")),
         mapper_bounded_field_gate=bool(model_cfg.get("mapper_bounded_field_gate", True)),
         mapper_gate_rescale=model_cfg.get("mapper_gate_rescale", "auto"),
+        mapper_operator_router=str(model_cfg.get("mapper_operator_router", "text")),
+        mapper_time_segment_scales=model_cfg.get("mapper_time_segment_scales"),
+        mapper_router_epsilon=float(model_cfg.get("mapper_router_epsilon", 1e-4)),
         mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
         operator_context_film=bool(model_cfg.get("operator_context_film", True)),
+        operator_context_mode=str(model_cfg.get("operator_context_mode", "global")),
         operator_norm=str(model_cfg.get("operator_norm", "group")),
+        operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
+        operator_channel_heads=int(model_cfg.get("operator_channel_heads", 4)),
     )
     if task_mode == "edit":
         return EffectCMAFlow(**kwargs)

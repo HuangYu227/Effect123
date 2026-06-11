@@ -46,9 +46,15 @@ class TextToTSFlow(nn.Module):
         mapper_normalizer: str = "softmax",
         mapper_bounded_field_gate: bool = True,
         mapper_gate_rescale: str | float = "auto",
+        mapper_operator_router: str = "text",
+        mapper_time_segment_scales: tuple[int, ...] | list[int] | None = None,
+        mapper_router_epsilon: float = 1e-4,
         mapper_flow_time_condition: bool = True,
         operator_context_film: bool = True,
+        operator_context_mode: str = "global",
         operator_norm: str = "group",
+        operator_architecture: str = "homogeneous",
+        operator_channel_heads: int = 4,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -94,6 +100,10 @@ class TextToTSFlow(nn.Module):
             normalizer=mapper_normalizer,
             bounded_field_gate=mapper_bounded_field_gate,
             gate_rescale=mapper_gate_rescale,
+            operator_router=mapper_operator_router,
+            series_stats_dim=7,
+            router_epsilon=mapper_router_epsilon,
+            time_segment_scales=mapper_time_segment_scales,
         )
         self.operator_bank = ResidualOperatorBank(
             num_channels=self.num_channels,
@@ -106,7 +116,10 @@ class TextToTSFlow(nn.Module):
             dropout=operator_dropout,
             context_dim=d_model,
             context_film=operator_context_film,
+            context_mode=operator_context_mode,
             norm_type=operator_norm,
+            architecture=operator_architecture,
+            channel_heads=operator_channel_heads,
         )
 
     def forward(
@@ -130,14 +143,24 @@ class TextToTSFlow(nn.Module):
         if self.flow_time_proj is not None:
             slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(x_t.dtype))[:, None, :]
         text_context = _masked_mean(slot_tokens, slot_mask)
-        g_patch, aux = self.mapper(slot_tokens, time_tokens, channel_tokens, slot_mask)
+        series_stats = _series_router_stats(x_t)
+        g_patch, aux = self.mapper(
+            slot_tokens, time_tokens, channel_tokens, slot_mask,
+            series_stats=series_stats, flow_time=t,
+        )
         g = g_patch.repeat_interleave(self.patch_len, dim=1)
         if g.shape[1] < self.sequence_length:
             raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
         g = g[:, : self.sequence_length]
         velocities = self.operator_bank(x_t, None, t, context=text_context)
         v_hat = (g * velocities).sum(dim=-1)
-        aux = {**aux, "G_patch": g_patch, "G": g, "V": velocities, "text_context": text_context}
+        aux = {
+            **aux, "G_patch": g_patch, "G": g, "V": velocities,
+            "text_context": text_context, "series_stats": series_stats.detach(),
+        }
+        operator_aux = getattr(self.operator_bank, "last_aux", {})
+        if operator_aux:
+            aux["operator_aux"] = operator_aux
         return v_hat, aux
 
 
@@ -149,3 +172,40 @@ def _masked_mean(tokens: torch.Tensor, mask: torch.Tensor | None) -> torch.Tenso
         raise ValueError(f"slot mask must have shape {tuple(tokens.shape[:2])}, got {tuple(mask.shape)}")
     denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (tokens * mask[:, :, None]).sum(dim=1) / denom
+
+
+def _series_router_stats(x: torch.Tensor) -> torch.Tensor:
+    """Compute 7-dim statistics from current flow state for dual routing."""
+    if x.ndim != 3:
+        raise ValueError(f"x must be [B, L, C], got {tuple(x.shape)}")
+    batch, length, channels = x.shape
+    dtype = x.dtype
+    centered = x - x.mean(dim=1, keepdim=True)
+    level = x.mean(dim=(1, 2))
+    scale = centered.square().mean(dim=(1, 2)).sqrt()
+    if length > 1:
+        diff = x[:, 1:] - x[:, :-1]
+        roughness = diff.square().mean(dim=(1, 2)).sqrt()
+    else:
+        roughness = torch.zeros(batch, device=x.device, dtype=dtype)
+    fft_source = centered.transpose(1, 2)
+    fft_dtype = torch.float32 if fft_source.dtype in {torch.float16, torch.bfloat16} else fft_source.dtype
+    freq = torch.fft.rfft(fft_source.to(fft_dtype), dim=-1)
+    power = freq.abs().square().mean(dim=1)
+    freq_len = power.shape[-1]
+    low_end = max(1, int(round(freq_len / 3)))
+    mid_end = max(low_end + 1, int(round(2 * freq_len / 3)))
+    total = power.sum(dim=-1).clamp_min(1e-8)
+    low = power[:, :low_end].sum(dim=-1) / total
+    mid = power[:, low_end:mid_end].sum(dim=-1) / total if mid_end > low_end else torch.zeros_like(low)
+    high = power[:, mid_end:].sum(dim=-1) / total if mid_end < freq_len else torch.zeros_like(low)
+    if channels > 1:
+        normed = centered / centered.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-6)
+        corr = torch.einsum("blc,bld->bcd", normed, normed) / float(length)
+        eye = torch.eye(channels, device=x.device, dtype=torch.bool)
+        channel_corr = corr.masked_select(~eye[None]).reshape(batch, -1).abs().mean(dim=-1)
+    else:
+        channel_corr = torch.zeros(batch, device=x.device, dtype=dtype)
+    stats = torch.stack([level, scale, roughness, low.to(dtype), mid.to(dtype), high.to(dtype), channel_corr], dim=-1)
+    transformed = torch.log1p(stats.float().abs()) * stats.float().sign()
+    return transformed.to(dtype)

@@ -42,6 +42,8 @@ class EffectCMAFlow(nn.Module):
         mapper_flow_time_condition: bool = True,
         operator_context_film: bool = True,
         operator_norm: str = "group",
+        operator_architecture: str = "homogeneous",
+        operator_channel_heads: int = 4,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -88,6 +90,8 @@ class EffectCMAFlow(nn.Module):
             kernel_size=operator_kernel_size,
             dropout=operator_dropout,
             norm_type=operator_norm,
+            architecture=operator_architecture,
+            channel_heads=operator_channel_heads,
         )
 
     def forward(

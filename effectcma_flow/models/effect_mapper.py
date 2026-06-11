@@ -19,6 +19,7 @@ class EffectMapper(nn.Module):
         tau_o: float = 1.0,
         normalizer: str = "softmax",
         bounded_field_gate: bool = True,
+        gate_rescale: str | float = "auto",
     ) -> None:
         super().__init__()
         self.field_rank = int(field_rank)
@@ -48,6 +49,7 @@ class EffectMapper(nn.Module):
         self.tau_o = float(tau_o)
         self.normalizer = normalizer
         self.bounded_field_gate = bool(bounded_field_gate)
+        self.gate_rescale = gate_rescale
         self.scale = d_model**-0.5
 
     def forward(
@@ -89,7 +91,9 @@ class EffectMapper(nn.Module):
                 alpha = alpha * slot_mask[:, :, None]
             field_amplitude = alpha.new_tensor(float("nan"))
 
-        g_patch = torch.einsum("bjrp,bjrc,bjrk,bjr->bpck", a_t, a_c, a_o, alpha)
+        g_patch_raw = torch.einsum("bjrp,bjrc,bjrk,bjr->bpck", a_t, a_c, a_o, alpha)
+        gate_scale = self._gate_rescale_factor(g_patch_raw.shape[1], g_patch_raw.shape[2])
+        g_patch = g_patch_raw * gate_scale
         rank_weight = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         aux = {
             "A_t": torch.einsum("bjrp,bjr->bjp", a_t, rank_weight),
@@ -101,8 +105,22 @@ class EffectMapper(nn.Module):
             "alpha": alpha,
             "field_amplitude": field_amplitude.detach(),
             "field_mass": alpha.sum(dim=(1, 2)).detach(),
+            "gate_rescale_factor": torch.tensor(float(gate_scale), device=g_patch.device),
+            "gate_raw_cell_mass_mean": g_patch_raw.detach().abs().mean(),
+            "gate_cell_mass_mean": g_patch.detach().abs().mean(),
         }
         return g_patch, aux
+
+    def _gate_rescale_factor(self, patches: int, channels: int) -> float:
+        if isinstance(self.gate_rescale, (int, float)):
+            return float(self.gate_rescale)
+        if self.gate_rescale == "none":
+            return 1.0
+        if self.gate_rescale == "sqrt":
+            return float((patches * channels) ** 0.5)
+        if self.gate_rescale == "auto":
+            return float(patches * channels)
+        raise ValueError(f"Unknown gate_rescale mode: {self.gate_rescale!r}")
 
     def _bounded_alpha(self, alpha_logits: torch.Tensor, slot_mask: torch.Tensor | None) -> torch.Tensor:
         batch, slots, _ = alpha_logits.shape

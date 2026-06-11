@@ -45,6 +45,7 @@ class TextToTSFlow(nn.Module):
         mapper_dropout: float = 0.0,
         mapper_normalizer: str = "softmax",
         mapper_bounded_field_gate: bool = True,
+        mapper_gate_rescale: str | float = "auto",
         mapper_flow_time_condition: bool = True,
         operator_context_film: bool = True,
         operator_norm: str = "group",
@@ -92,6 +93,7 @@ class TextToTSFlow(nn.Module):
             dropout=mapper_dropout,
             normalizer=mapper_normalizer,
             bounded_field_gate=mapper_bounded_field_gate,
+            gate_rescale=mapper_gate_rescale,
         )
         self.operator_bank = ResidualOperatorBank(
             num_channels=self.num_channels,

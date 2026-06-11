@@ -40,6 +40,7 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         mapper_dropout=float(model_cfg.get("mapper_dropout", 0.0)),
         mapper_normalizer=str(model_cfg.get("mapper_normalizer", "softmax")),
         mapper_bounded_field_gate=bool(model_cfg.get("mapper_bounded_field_gate", True)),
+        mapper_gate_rescale=model_cfg.get("mapper_gate_rescale", "auto"),
         mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
         operator_context_film=bool(model_cfg.get("operator_context_film", True)),
         operator_norm=str(model_cfg.get("operator_norm", "group")),

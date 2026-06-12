@@ -47,6 +47,8 @@ def main() -> None:
     parser.add_argument("--clip-config", default=None)
     parser.add_argument("--clip-model", default=None)
     parser.add_argument("--cache-dir", default="cache/verbalts_metrics")
+    parser.add_argument("--caption-shuffle", action="store_true", help="Ablation: shuffle captions within each batch")
+    parser.add_argument("--blank-captions", action="store_true", help="Ablation: replace all captions with empty strings")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -135,6 +137,9 @@ def run(args: argparse.Namespace, cfg: dict) -> dict[str, float]:
         generated_text_key = "full_text"
         reference_denormalize = True
 
+    if args.caption_shuffle or args.blank_captions:
+        generated_loader = _CaptionTransformLoader(generated_loader, blank=args.blank_captions, shuffle=args.caption_shuffle)
+
     model = build_model(cfg, sequence_length=generated_ds.sequence_length, num_channels=generated_ds.num_channels).to(device)
     model.load_state_dict(payload["model"])
     model.eval()
@@ -207,6 +212,29 @@ def _file_fingerprint(path: Path) -> dict[str, object]:
         "size": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
     }
+
+
+class _CaptionTransformLoader:
+    """Wraps a DataLoader to shuffle or blank captions in each batch."""
+
+    def __init__(self, loader: DataLoader, *, blank: bool = False, shuffle: bool = False):
+        self._loader = loader
+        self._blank = blank
+        self._shuffle = shuffle
+
+    def __iter__(self):
+        import random as _random
+        for batch in self._loader:
+            if self._blank and "caption" in batch:
+                batch["caption"] = [""] * len(batch["caption"])
+            elif self._shuffle and "caption" in batch:
+                caps = list(batch["caption"])
+                _random.shuffle(caps)
+                batch["caption"] = caps
+            yield batch
+
+    def __len__(self):
+        return len(self._loader)
 
 
 if __name__ == "__main__":

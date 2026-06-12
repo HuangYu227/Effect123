@@ -41,6 +41,8 @@ def main() -> None:
     parser.add_argument("--disable-text-film", action="store_true", help="Ablation: disable text FiLM modulation inside the operator bank")
     parser.add_argument("--disable-flow-time-field", action="store_true", help="Ablation: do not inject flow time into mapper slot tokens")
     parser.add_argument("--operator-norm", default=None, choices=["group", "batch"], help="Ablation: operator expert normalization")
+    parser.add_argument("--caption-shuffle", action="store_true", help="Ablation: shuffle captions within each batch to break text-ts pairing")
+    parser.add_argument("--blank-captions", action="store_true", help="Ablation: replace all captions with empty strings")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--checkpoint-dir", default=None)
     args = parser.parse_args()
@@ -69,6 +71,10 @@ def main() -> None:
         cfg.setdefault("model", {})["operator_norm"] = args.operator_norm
     if args.checkpoint_dir is not None:
         cfg["train"]["checkpoint_dir"] = args.checkpoint_dir
+    if args.caption_shuffle:
+        cfg["train"]["caption_shuffle"] = True
+    if args.blank_captions:
+        cfg["train"]["blank_captions"] = True
     resolve_data_root(cfg, args.data_root)
     run_train(cfg)
 
@@ -117,14 +123,23 @@ def run_train(cfg: dict) -> None:
     max_caption_slots = int(train_cfg.get("max_caption_slots", 1))
     include_all_caption_candidates = bool(train_cfg.get("include_all_caption_candidates", False))
     routing_loss_weight = float(train_cfg.get("routing_loss_weight", 0.0))
+    caption_shuffle = bool(train_cfg.get("caption_shuffle", False))
+    blank_captions = bool(train_cfg.get("blank_captions", False))
     if routing_loss_weight != 0.0:
         raise ValueError("Clean V6 uses a single Flow Matching loss. Set train.routing_loss_weight: 0.0.")
+    import random as _random
     while step < max_steps:
         if hasattr(train_ds, "set_epoch"):
             train_ds.set_epoch(epoch)
         epoch += 1
         for batch in train_loader:
             model.train()
+            if blank_captions and "caption" in batch:
+                batch["caption"] = [""] * len(batch["caption"])
+            elif caption_shuffle and "caption" in batch:
+                caps = list(batch["caption"])
+                _random.shuffle(caps)
+                batch["caption"] = caps
             out = cfm_train_step(
                 model,
                 batch,

@@ -4,6 +4,8 @@ import torch
 from torch import nn
 
 from effectcma_flow.models.effect_mapper import EffectMapper
+from effectcma_flow.models.global_operator_gate import GlobalOperatorGate
+from effectcma_flow.models.latent_regime_adapter import LatentRegimeConditionAdapter
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
 from effectcma_flow.models.ts_encoder import ChannelEncoder, TimePatchEncoder
 
@@ -14,6 +16,14 @@ class TextToTSFlow(nn.Module):
     Unlike `EffectCMAFlow`, this model never receives a real base trajectory as
     condition. The current flow state `x_t` supplies state tokens, while caption
     tokens define a time-channel-operator generation field.
+
+    V6.1 adds two optional modules:
+
+    * **LatentRegimeConditionAdapter** — infers a soft regime posterior from
+      ``x_t``, ``t``, and the text context, producing an enhanced text context
+      and an optional appended regime token.
+    * **GlobalOperatorGate** — replaces the fine-grained A_t/A_c router with a
+      sample-level operator gate (set ``router_mode='global_operator'``).
     """
 
     def __init__(
@@ -55,56 +65,82 @@ class TextToTSFlow(nn.Module):
         operator_norm: str = "group",
         operator_architecture: str = "homogeneous",
         operator_channel_heads: int = 4,
+        # V6.1 latent regime adapter
+        use_latent_regime_adapter: bool = False,
+        num_regimes: int = 4,
+        regime_dim: int | None = None,
+        regime_hidden_dim: int | None = None,
+        regime_temperature: float = 0.7,
+        regime_append_token: bool = True,
+        regime_dropout: float = 0.0,
+        regime_state_weight_mode: str = "linear_t",
+        # V6.1 routing mode: "legacy" (EffectMapper) or "global_operator"
+        router_mode: str = "legacy",
+        operator_gate_temperature: float = 1.0,
+        operator_gate_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
         self.num_channels = int(num_channels)
         self.patch_len = int(patch_len)
-        self.time_encoder = TimePatchEncoder(
-            self.sequence_length,
-            self.num_channels,
-            self.patch_len,
-            d_model,
-            layers=transformer_layers,
-            heads=transformer_heads,
-        )
-        self.channel_encoder = ChannelEncoder(
-            self.sequence_length,
-            self.num_channels,
-            d_model,
-            patch_len=channel_patch_len or self.patch_len,
-            stride=channel_stride,
-            temporal_layers=channel_temporal_layers,
-            channel_layers=channel_layers,
-            heads=channel_heads or transformer_heads,
-            dropout=channel_dropout,
-        )
+        self.router_mode = str(router_mode).lower()
+        if self.router_mode not in {"legacy", "global_operator"}:
+            raise ValueError(f"router_mode must be 'legacy' or 'global_operator', got {router_mode!r}")
+        self._use_global_gate = self.router_mode == "global_operator"
+
         self.text_encoder = text_encoder
         self.mapper_flow_time_condition = bool(mapper_flow_time_condition)
         self.flow_time_proj = None
-        if self.mapper_flow_time_condition:
-            self.flow_time_proj = nn.Sequential(
-                nn.Linear(1, d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, d_model),
+
+        if self._use_global_gate:
+            # Global operator gate path: legacy encoders/mapper are not needed.
+            self.time_encoder = None
+            self.channel_encoder = None
+            self.mapper = None
+        else:
+            # Legacy EffectMapper path: create encoders and mapper.
+            self.time_encoder = TimePatchEncoder(
+                self.sequence_length,
+                self.num_channels,
+                self.patch_len,
+                d_model,
+                layers=transformer_layers,
+                heads=transformer_heads,
             )
-            nn.init.zeros_(self.flow_time_proj[-1].weight)
-            nn.init.zeros_(self.flow_time_proj[-1].bias)
-        self.mapper = EffectMapper(
-            d_model=d_model,
-            num_operators=num_operators,
-            field_rank=mapper_field_rank,
-            slot_layers=mapper_slot_layers,
-            slot_heads=mapper_slot_heads or transformer_heads,
-            dropout=mapper_dropout,
-            normalizer=mapper_normalizer,
-            bounded_field_gate=mapper_bounded_field_gate,
-            gate_rescale=mapper_gate_rescale,
-            operator_router=mapper_operator_router,
-            series_stats_dim=7,
-            router_epsilon=mapper_router_epsilon,
-            time_segment_scales=mapper_time_segment_scales,
-        )
+            self.channel_encoder = ChannelEncoder(
+                self.sequence_length,
+                self.num_channels,
+                d_model,
+                patch_len=channel_patch_len or self.patch_len,
+                stride=channel_stride,
+                temporal_layers=channel_temporal_layers,
+                channel_layers=channel_layers,
+                heads=channel_heads or transformer_heads,
+                dropout=channel_dropout,
+            )
+            if self.mapper_flow_time_condition:
+                self.flow_time_proj = nn.Sequential(
+                    nn.Linear(1, d_model),
+                    nn.SiLU(),
+                    nn.Linear(d_model, d_model),
+                )
+                nn.init.zeros_(self.flow_time_proj[-1].weight)
+                nn.init.zeros_(self.flow_time_proj[-1].bias)
+            self.mapper = EffectMapper(
+                d_model=d_model,
+                num_operators=num_operators,
+                field_rank=mapper_field_rank,
+                slot_layers=mapper_slot_layers,
+                slot_heads=mapper_slot_heads or transformer_heads,
+                dropout=mapper_dropout,
+                normalizer=mapper_normalizer,
+                bounded_field_gate=mapper_bounded_field_gate,
+                gate_rescale=mapper_gate_rescale,
+                operator_router=mapper_operator_router,
+                series_stats_dim=7,
+                router_epsilon=mapper_router_epsilon,
+                time_segment_scales=mapper_time_segment_scales,
+            )
         self.operator_bank = ResidualOperatorBank(
             num_channels=self.num_channels,
             num_operators=num_operators,
@@ -122,7 +158,39 @@ class TextToTSFlow(nn.Module):
             channel_heads=operator_channel_heads,
         )
 
-    def prepare_condition(self, text_condition, *, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        # V6.1: Latent regime condition adapter (optional)
+        # In global_operator mode the appended regime token is never consumed
+        # by a downstream mapper, so auto-disable it to avoid dead code.
+        effective_append = regime_append_token and not self._use_global_gate
+        if use_latent_regime_adapter:
+            self.regime_adapter = LatentRegimeConditionAdapter(
+                d_model=d_model,
+                num_channels=num_channels,
+                num_regimes=num_regimes,
+                regime_dim=regime_dim,
+                hidden_dim=regime_hidden_dim,
+                temperature=regime_temperature,
+                append_regime_token=effective_append,
+                state_weight_mode=regime_state_weight_mode,
+                dropout=regime_dropout,
+            )
+        else:
+            self.regime_adapter = None
+
+        # V6.1: Global operator gate (replaces mapper when active)
+        if self._use_global_gate:
+            self.global_operator_gate = GlobalOperatorGate(
+                d_model=d_model,
+                num_channels=num_channels,
+                num_operators=num_operators,
+                hidden_dim=d_model,
+                temperature=operator_gate_temperature,
+                dropout=operator_gate_dropout,
+            )
+        else:
+            self.global_operator_gate = None
+
+    def prepare_condition(self, text_condition: list[str] | list[list[str]] | dict[str, torch.Tensor], *, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
         if isinstance(text_condition, dict) and text_condition.get("_text2ts_prepared", False):
             return _move_prepared_condition(text_condition, device=device, dtype=dtype)
         slot_tokens, slot_mask = self.text_encoder(text_condition)
@@ -151,29 +219,66 @@ class TextToTSFlow(nn.Module):
         if t.device != x_t.device:
             raise ValueError(f"t and x_t must be on the same device, got {t.device} and {x_t.device}")
 
-        time_tokens = self.time_encoder(x_t)
-        channel_tokens = self.channel_encoder(x_t)
         prepared = self.prepare_condition(text_condition, device=x_t.device, dtype=x_t.dtype)
         slot_tokens = prepared["slot_tokens"]
         slot_mask = prepared["slot_mask"]
         if self.flow_time_proj is not None:
             slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(x_t.dtype))[:, None, :]
         text_context = _masked_mean(slot_tokens, slot_mask)
-        series_stats = _series_router_stats(x_t)
-        g_patch, aux = self.mapper(
-            slot_tokens, time_tokens, channel_tokens, slot_mask,
-            series_stats=series_stats, flow_time=t,
-        )
-        g = g_patch.repeat_interleave(self.patch_len, dim=1)
-        if g.shape[1] < self.sequence_length:
-            raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
-        g = g[:, : self.sequence_length]
-        velocities = self.operator_bank(x_t, None, t, context=text_context)
-        v_hat = (g * velocities).sum(dim=-1)
-        aux = {
-            **aux, "G_patch": g_patch, "G": g, "V": velocities,
-            "text_context": text_context, "series_stats": series_stats.detach(),
-        }
+
+        # V6.1: optional regime adapter (works with both routing modes)
+        regime_aux: dict[str, torch.Tensor] = {}
+        if self.regime_adapter is not None:
+            slot_tokens, slot_mask, text_context, regime_aux = self.regime_adapter(
+                x_t=x_t,
+                t=t,
+                slot_tokens=slot_tokens,
+                slot_mask=slot_mask,
+                text_context=text_context,
+            )
+
+        if self._use_global_gate:
+            # --- V6.1 global operator gate path ---
+            velocities = self.operator_bank(x_t, None, t, context=text_context)
+            _gate, g, gate_aux = self.global_operator_gate(
+                x_t=x_t,
+                t=t,
+                text_context=text_context,
+                velocity_shape=velocities.shape,
+            )
+            v_hat = (g * velocities).sum(dim=-1)
+            aux = {
+                **regime_aux,
+                **gate_aux,
+                "G": g,
+                "V": velocities,
+                "text_context": text_context,
+            }
+        else:
+            # --- Legacy EffectMapper path ---
+            time_tokens = self.time_encoder(x_t)
+            channel_tokens = self.channel_encoder(x_t)
+            series_stats = _series_router_stats(x_t)
+            g_patch, aux = self.mapper(
+                slot_tokens, time_tokens, channel_tokens, slot_mask,
+                series_stats=series_stats, flow_time=t,
+            )
+            g = g_patch.repeat_interleave(self.patch_len, dim=1)
+            if g.shape[1] < self.sequence_length:
+                raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
+            g = g[:, : self.sequence_length]
+            velocities = self.operator_bank(x_t, None, t, context=text_context)
+            v_hat = (g * velocities).sum(dim=-1)
+            aux = {
+                **aux,
+                **regime_aux,
+                "G_patch": g_patch,
+                "G": g,
+                "V": velocities,
+                "text_context": text_context,
+                "series_stats": series_stats.detach(),
+            }
+
         operator_aux = getattr(self.operator_bank, "last_aux", {})
         if operator_aux:
             aux["operator_aux"] = operator_aux

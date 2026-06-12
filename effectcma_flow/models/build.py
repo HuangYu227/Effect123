@@ -7,6 +7,13 @@ from effectcma_flow.models.text_encoder import build_text_encoder
 from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 
 
+_V61_KEYS = frozenset({
+    "use_latent_regime_adapter", "num_regimes", "regime_dim", "regime_hidden_dim",
+    "regime_temperature", "regime_append_token", "regime_dropout", "regime_state_weight_mode",
+    "router_mode", "operator_gate_temperature", "operator_gate_dropout",
+})
+
+
 def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
     model_cfg = config.get("model", config)
     text_cfg = config.get("text_encoder", {"mode": "hash"})
@@ -53,9 +60,24 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         operator_norm=str(model_cfg.get("operator_norm", "group")),
         operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
         operator_channel_heads=int(model_cfg.get("operator_channel_heads", 4)),
+        # V6.1 latent regime adapter
+        use_latent_regime_adapter=bool(model_cfg.get("use_latent_regime_adapter", False)),
+        num_regimes=int(model_cfg.get("num_regimes", 4)),
+        regime_dim=_optional_int(model_cfg.get("regime_dim")),
+        regime_hidden_dim=_optional_int(model_cfg.get("regime_hidden_dim")),
+        regime_temperature=float(model_cfg.get("regime_temperature", 0.7)),
+        regime_append_token=bool(model_cfg.get("regime_append_token", True)),
+        regime_dropout=float(model_cfg.get("regime_dropout", 0.0)),
+        regime_state_weight_mode=str(model_cfg.get("regime_state_weight_mode", "linear_t")),
+        # V6.1 routing mode
+        router_mode=str(model_cfg.get("router_mode", "legacy")),
+        operator_gate_temperature=float(model_cfg.get("operator_gate_temperature", 1.0)),
+        operator_gate_dropout=float(model_cfg.get("operator_gate_dropout", 0.0)),
     )
     if task_mode == "edit":
-        return EffectCMAFlow(**kwargs)
+        # EffectCMAFlow does not accept V6.1 regime/gate params.
+        edit_kwargs = {k: v for k, v in kwargs.items() if k not in _V61_KEYS}
+        return EffectCMAFlow(**edit_kwargs)
     if task_mode == "text2ts":
         return TextToTSFlow(**kwargs)
     raise ValueError(f"Unknown task.mode {task_mode!r}; expected 'text2ts' or 'edit'")

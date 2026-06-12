@@ -153,6 +153,8 @@ def run_train(cfg: dict) -> None:
                 caption_slot_strategy=caption_slot_strategy,
                 max_caption_slots=max_caption_slots,
                 include_all_caption_candidates=include_all_caption_candidates,
+                condition_dropout_prob=float(cfg["train"].get("condition_dropout_prob", 0.0)),
+                regime_ortho_weight=float(cfg["train"].get("regime_ortho_weight", 0.0)),
             )
             step += 1
             progress.update(1)
@@ -167,6 +169,12 @@ def run_train(cfg: dict) -> None:
                     "vCos": f"{_scalar(out, 'velocity_cos'):.2f}",
                     "vR": f"{_scalar(out, 'pred_target_rms_ratio'):.2f}",
                 }
+                regime_ortho = _scalar(out, "loss_regime_ortho")
+                if regime_ortho > 0.0:
+                    postfix["rOrtho"] = f"{regime_ortho:.6f}"
+                regime_ent = _scalar(out, "regime_entropy")
+                if regime_ent == regime_ent:  # not NaN
+                    postfix["rH"] = f"{regime_ent:.2f}"
                 if "loss_inside" in out:
                     postfix["inside"] = f"{_scalar(out, 'loss_inside'):.4f}"
                     postfix["outside"] = f"{_scalar(out, 'loss_outside'):.4f}"

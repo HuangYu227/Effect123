@@ -127,7 +127,7 @@ def test_clean_v6_rejects_routing_loss_weight():
             routing_loss_weight=0.02,
         )
     except ValueError as exc:
-        assert "Clean V6" in str(exc)
+        assert "V6.1" in str(exc) or "routing" in str(exc).lower()
     else:
         raise AssertionError("Clean V6 should reject routing_loss_weight != 0")
 
@@ -176,7 +176,7 @@ def test_routing_loss_weight_nonzero_raises_clean_v6_error():
     try:
         cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", routing_loss_weight=1.0)
     except ValueError as exc:
-        assert "Clean V6" in str(exc)
+        assert "V6.1" in str(exc) or "routing" in str(exc).lower()
     else:
         raise AssertionError("routing loss weight 1.0 should be rejected by Clean V6")
 
@@ -374,3 +374,230 @@ def test_structural_operator_bank_exposes_adaptive_frequency_aux():
     assert torch.isfinite(bank.experts[2].band_center_logits.grad).all()
     assert bank.experts[2].band_log_widths.grad is not None
     assert torch.isfinite(bank.experts[2].band_log_widths.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# V6.1 Latent Regime Adapter + Global Operator Gate tests
+# ---------------------------------------------------------------------------
+
+from effectcma_flow.models.latent_regime_adapter import (
+    LatentRegimeConditionAdapter,
+    regime_orthogonal_loss,
+)
+from effectcma_flow.models.global_operator_gate import GlobalOperatorGate
+
+
+def test_regime_adapter_forward_shapes():
+    """LatentRegimeConditionAdapter produces correct output shapes."""
+    adapter = LatentRegimeConditionAdapter(
+        d_model=16,
+        num_channels=4,
+        num_regimes=4,
+        append_regime_token=True,
+    )
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    slot_tokens = torch.randn(2, 3, 16)
+    slot_mask = torch.ones(2, 3)
+    text_context = torch.randn(2, 16)
+    st, sm, ctx, aux = adapter(x_t=x_t, t=t, slot_tokens=slot_tokens, slot_mask=slot_mask, text_context=text_context)
+    # append_regime_token=True adds one token
+    assert st.shape == (2, 4, 16)
+    assert sm.shape == (2, 4)
+    assert ctx.shape == (2, 16)
+    assert "regime_prob" in aux
+    assert "regime_ortho_loss" in aux
+    assert aux["regime_prob"].shape == (2, 4)
+    assert torch.isfinite(st).all()
+    assert torch.isfinite(ctx).all()
+
+
+def test_regime_adapter_no_append_token():
+    """With append_regime_token=False, slot tokens are unchanged."""
+    adapter = LatentRegimeConditionAdapter(
+        d_model=16,
+        num_channels=4,
+        num_regimes=4,
+        append_regime_token=False,
+    )
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    slot_tokens = torch.randn(2, 3, 16)
+    slot_mask = torch.ones(2, 3)
+    text_context = torch.randn(2, 16)
+    st, sm, ctx, aux = adapter(x_t=x_t, t=t, slot_tokens=slot_tokens, slot_mask=slot_mask, text_context=text_context)
+    assert st.shape == (2, 3, 16)  # unchanged
+    assert sm.shape == (2, 3)
+
+
+def test_regime_orthogonal_loss():
+    """Orthogonal loss is zero for orthonormal bank, positive otherwise."""
+    # Orthonormal bank
+    bank = torch.eye(4)
+    assert torch.allclose(regime_orthogonal_loss(bank), torch.tensor(0.0), atol=1e-7)
+    # Single prototype
+    single = torch.randn(1, 4)
+    assert regime_orthogonal_loss(single).item() == 0.0
+    # Non-orthogonal bank should give positive loss
+    bank2 = torch.randn(4, 4)
+    loss = regime_orthogonal_loss(bank2)
+    assert loss.item() > 0.0
+
+
+def test_global_operator_gate_forward_shapes():
+    """GlobalOperatorGate produces correct gate shapes."""
+    gate = GlobalOperatorGate(d_model=16, num_channels=4, num_operators=3)
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    text_context = torch.randn(2, 16)
+    gate_prob, g, aux = gate(x_t=x_t, t=t, text_context=text_context, velocity_shape=(2, 12, 4, 3))
+    assert gate_prob.shape == (2, 3)
+    assert g.shape == (2, 12, 4, 3)
+    assert "A_o" in aux
+    assert "operator_gate_entropy" in aux
+    assert torch.isfinite(gate_prob).all()
+    assert torch.isfinite(g).all()
+
+
+def test_global_operator_gate_without_velocity_shape():
+    """GlobalOperatorGate works without expanding to velocity_shape."""
+    gate = GlobalOperatorGate(d_model=16, num_channels=4, num_operators=3)
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    text_context = torch.randn(2, 16)
+    gate_prob, g, aux = gate(x_t=x_t, t=t, text_context=text_context)
+    assert gate_prob.shape == (2, 3)
+    assert g is None
+
+
+def test_text2ts_flow_with_regime_adapter_and_global_gate():
+    """TextToTSFlow with V6.1 regime adapter + global operator gate."""
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        use_latent_regime_adapter=True,
+        num_regimes=4,
+        router_mode="global_operator",
+    )
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    out, aux = model(x_t, t, [["caption"], ["caption"]])
+    assert out.shape == (2, 12, 4)
+    assert torch.isfinite(out).all()
+    assert "regime_prob" in aux
+    assert "A_o" in aux
+    assert "G" in aux
+    assert "V" in aux
+    # regime adapter appended a token, so encoder was called
+    assert encoder.calls == 1
+
+
+def test_text2ts_flow_regime_adapter_only():
+    """TextToTSFlow with regime adapter but legacy mapper routing."""
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        use_latent_regime_adapter=True,
+        num_regimes=4,
+        router_mode="legacy",
+    )
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    out, aux = model(x_t, t, [["caption"], ["caption"]])
+    assert out.shape == (2, 12, 4)
+    assert torch.isfinite(out).all()
+    assert "regime_prob" in aux
+    assert "A_t" in aux  # legacy mapper still produces A_t
+    assert "G" in aux
+
+
+def test_v61_train_step_includes_regime_ortho_loss():
+    """V6.1 train_step adds regime_ortho_weight * regime_ortho_loss."""
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        use_latent_regime_adapter=True,
+        num_regimes=4,
+        router_mode="global_operator",
+    )
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    result = cfm_train_step(
+        model, batch, opt,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        regime_ortho_weight=1e-4,
+    )
+    assert torch.isfinite(result["loss"])
+    assert "loss_regime_ortho" in result
+    assert "regime_entropy" in result
+    assert "operator_gate_entropy" in result
+
+
+def test_v61_train_step_regime_ortho_zero_weight():
+    """With regime_ortho_weight=0, no ortho loss is added."""
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        use_latent_regime_adapter=True,
+        num_regimes=4,
+        router_mode="global_operator",
+    )
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    result = cfm_train_step(
+        model, batch, opt,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        regime_ortho_weight=0.0,
+    )
+    assert result["loss_regime_ortho"].item() == 0.0
+
+
+def test_v61_backward_compat_no_regime_no_global_gate():
+    """Default config (no regime, legacy router) still works."""
+    cfg = _text2ts_config()
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    assert model.regime_adapter is None
+    assert model.global_operator_gate is None
+    batch = _text_batch()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    result = cfm_train_step(model, batch, opt, text_encoder_mode="hash", task_mode="text2ts")
+    assert torch.isfinite(result["loss"])
+    assert result["loss_regime_ortho"].item() == 0.0

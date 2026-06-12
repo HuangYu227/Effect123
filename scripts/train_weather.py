@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -105,7 +106,18 @@ def run_train(cfg: dict) -> None:
         collate_fn=collate_fn,
     )
     model = build_model(cfg, sequence_length=train_ds.sequence_length, num_channels=train_ds.num_channels).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"].get("lr", 1e-4)), weight_decay=float(cfg["train"].get("weight_decay", 1e-4)))
+    lr = float(cfg["train"].get("lr", 1e-4))
+    weight_decay = float(cfg["train"].get("weight_decay", 1e-4))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Learning rate scheduler: linear warmup + cosine decay
+    warmup_steps = int(cfg["train"].get("warmup_steps", 200))
+    min_lr = float(cfg["train"].get("min_lr", 1e-6))
+    def _lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return max(1e-8, current_step / max(1, warmup_steps))
+        progress = (current_step - warmup_steps) / max(1, max_steps - warmup_steps)
+        return max(min_lr / lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     checkpoint_dir = Path(cfg["train"].get("checkpoint_dir", "checkpoints/weather_core"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     max_steps = int(cfg["train"].get("max_steps", 1000))
@@ -157,6 +169,7 @@ def run_train(cfg: dict) -> None:
                 regime_ortho_weight=float(cfg["train"].get("regime_ortho_weight", 0.0)),
             )
             step += 1
+            scheduler.step()
             progress.update(1)
             if step % log_every == 0 or step == 1:
                 postfix = {

@@ -233,10 +233,12 @@ class WeatherRawCaptionDataset(Dataset):
         target = (raw - self.mean.squeeze(0)) / self.std.squeeze(0) if self.normalize else raw
         cap_idx = self._caption_index(index, rng)
         caption = str(self.captions[index, cap_idx])
+        caption_candidates = [str(text) for text in self.captions[index].tolist()]
         item: dict[str, Any] = {
             "Y": target.float(),
             "ts": raw.float(),
             "caption": caption,
+            "caption_candidates": caption_candidates,
             "caption_id": cap_idx,
             "slots": [caption],
             "attrs_idx": torch.from_numpy(self.attrs_idx[index]).long(),
@@ -281,6 +283,7 @@ def collate_raw_caption_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "Y": torch.stack([s["Y"] for s in samples]),
         "ts": torch.stack([s["ts"] for s in samples]),
         "caption": [s["caption"] for s in samples],
+        "caption_candidates": [s["caption_candidates"] for s in samples],
         "caption_id": torch.tensor([s["caption_id"] for s in samples], dtype=torch.long),
         "slots": [s["slots"] for s in samples],
         "attrs_idx": torch.stack([s["attrs_idx"] for s in samples]),

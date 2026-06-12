@@ -112,6 +112,26 @@ def test_text2ts_model_forward_and_train_step_updates_params():
     assert not torch.allclose(before, model.mapper.op_proto.detach())
 
 
+def test_clean_v6_rejects_routing_loss_weight():
+    """Clean V6 must raise ValueError if routing_loss_weight != 0."""
+    model = build_model(_text2ts_config(), sequence_length=12, num_channels=4)
+    batch = _text_batch()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    try:
+        cfm_train_step(
+            model,
+            batch,
+            opt,
+            text_encoder_mode="hash",
+            task_mode="text2ts",
+            routing_loss_weight=0.02,
+        )
+    except ValueError as exc:
+        assert "Clean V6" in str(exc)
+    else:
+        raise AssertionError("Clean V6 should reject routing_loss_weight != 0")
+
+
 def test_text2ts_model_supports_non_divisible_patch_length():
     cfg = _text2ts_config()
     cfg["model"]["patch_len"] = 6
@@ -149,6 +169,18 @@ def test_cfm_loss_is_exact_and_model_does_not_receive_eval_metadata():
     assert model.seen_text_condition is batch["slots"]
 
 
+def test_routing_loss_weight_nonzero_raises_clean_v6_error():
+    """Clean V6 rejects any non-zero routing_loss_weight."""
+    batch = _batch(batch_size=1)
+    model = SpyZeroModel()
+    try:
+        cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", routing_loss_weight=1.0)
+    except ValueError as exc:
+        assert "Clean V6" in str(exc)
+    else:
+        raise AssertionError("routing loss weight 1.0 should be rejected by Clean V6")
+
+
 def test_balanced_cfm_loss_reports_inside_outside_parts():
     batch = _batch(batch_size=1)
     model = SpyZeroModel()
@@ -156,6 +188,14 @@ def test_balanced_cfm_loss_reports_inside_outside_parts():
     assert "loss_inside" in result
     assert "loss_outside" in result
     assert torch.allclose(result["loss"], 0.5 * (result["loss_inside"] + result["loss_outside"]))
+
+
+def test_balanced_cfm_accepts_singleton_channel_mask():
+    batch = _batch(batch_size=1)
+    batch["mask"] = batch["mask"][..., :1]
+    model = SpyZeroModel()
+    result = cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", cfm_loss_mode="balanced")
+    assert torch.isfinite(result["loss"])
 
 
 def test_precomputed_text_condition_requires_slot_embeddings_not_captions():
@@ -176,6 +216,42 @@ def test_precomputed_text_condition_mask_shapes():
 
 
 def test_precomputed_caption_condition_is_allowed_for_text2ts():
+    batch = {"caption_embeddings": torch.randn(2, 128)}
+    cond = text_condition_from_batch(batch, "precomputed", condition_key="caption")
+    assert cond["embeddings"].shape == (2, 128)
+    assert cond["mask"].shape == (2, 1)
+
+
+def test_caption_condition_single_and_candidates_strategy():
+    """Clean V6 supports 'single' and 'candidates' strategies; rejects 'semantic'."""
+    batch = {
+        "caption": ["temperature rises with repeated daily oscillation"],
+        "caption_candidates": [["temperature rises with repeated daily oscillation", "humidity has local spikes"]],
+    }
+    default_single = text_condition_from_batch(batch, "hash", condition_key="caption")
+    single = text_condition_from_batch(batch, "hash", condition_key="caption", caption_slot_strategy="single")
+    candidates = text_condition_from_batch(
+        batch,
+        "hash",
+        condition_key="caption",
+        caption_slot_strategy="candidates",
+        include_all_caption_candidates=True,
+        max_caption_slots=8,
+    )
+    assert default_single == [["temperature rises with repeated daily oscillation"]]
+    assert single == [["temperature rises with repeated daily oscillation"]]
+    assert len(candidates[0]) > 1
+    # semantic strategy must be rejected
+    try:
+        text_condition_from_batch(batch, "hash", condition_key="caption", caption_slot_strategy="semantic")
+    except ValueError as exc:
+        assert "not supported" in str(exc)
+    else:
+        raise AssertionError("semantic strategy should be rejected in Clean V6")
+
+
+def test_precomputed_caption_condition_ignores_slot_strategy():
+    """Precomputed mode returns stored embeddings without inspecting caption_slot_strategy."""
     batch = {"caption_embeddings": torch.randn(2, 128)}
     cond = text_condition_from_batch(batch, "precomputed", condition_key="caption")
     assert cond["embeddings"].shape == (2, 128)
@@ -274,3 +350,27 @@ def test_operator_bank_has_independent_temporal_experts():
     out = bank(x_t, x_t * 0.5, torch.rand(2))
     assert out.shape == (2, 12, 4, 3)
     assert torch.isfinite(out).all()
+
+
+def test_structural_operator_bank_exposes_adaptive_frequency_aux():
+    bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+    )
+    x_t = torch.randn(2, 12, 4)
+    out = bank(x_t, None, torch.rand(2), context=torch.randn(2, 16))
+    assert out.shape == (2, 12, 4, 3)
+    aux = bank.last_aux
+    assert "frequency_frequency_band_centers" in aux
+    assert "frequency_frequency_band_widths" in aux
+    assert "frequency_frequency_band_gate" in aux
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert bank.experts[2].band_center_logits.grad is not None
+    assert torch.isfinite(bank.experts[2].band_center_logits.grad).all()
+    assert bank.experts[2].band_log_widths.grad is not None
+    assert torch.isfinite(bank.experts[2].band_log_widths.grad).all()

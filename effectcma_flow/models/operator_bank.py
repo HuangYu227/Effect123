@@ -98,8 +98,8 @@ class TemporalSegmentExpert(nn.Module):
         self.hidden = int(hidden)
         self.ada_norm = AdaFeatureNorm(hidden, t_dim)
         self.local = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1, groups=hidden)
-        self.mid = nn.Conv1d(hidden, hidden, kernel_size=3, padding=2, dilation=2, groups=hidden)
-        self.long = nn.Conv1d(hidden, hidden, kernel_size=3, padding=4, dilation=4, groups=hidden)
+        self.mid = nn.Conv1d(hidden, hidden, kernel_size=5, padding=4, dilation=2, groups=hidden)
+        self.long = nn.Conv1d(hidden, hidden, kernel_size=7, padding=9, dilation=3, groups=hidden)
         self.mix = nn.Sequential(
             nn.Conv1d(3 * hidden, hidden, kernel_size=1),
             nn.SiLU(),
@@ -160,13 +160,24 @@ class ChannelInteractionExpert(nn.Module):
 
 
 class FrequencyBandExpert(nn.Module):
-    """Velocity expert constrained by fixed low/mid/high FFT band decomposition."""
+    """Velocity expert constrained by adaptive FFT band decomposition."""
 
     def __init__(self, *, num_channels: int, hidden: int, t_dim: int, dropout: float) -> None:
         super().__init__()
         self.num_channels = int(num_channels)
         self.hidden = int(hidden)
         self.ada_norm = AdaFeatureNorm(hidden, t_dim)
+        centers = torch.tensor([0.08, 0.32, 0.72], dtype=torch.float32).clamp(1e-3, 0.999)
+        widths = torch.tensor([0.12, 0.18, 0.22], dtype=torch.float32).clamp_min(1e-3)
+        self.band_center_logits = nn.Parameter(torch.logit(centers))
+        self.band_log_widths = nn.Parameter(widths.log())
+        self.band_gate = nn.Sequential(
+            nn.LayerNorm(hidden + t_dim),
+            nn.Linear(hidden + t_dim, hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 3),
+        )
         self.band_mixer = nn.Sequential(
             nn.Linear(3 * hidden, hidden),
             nn.SiLU(),
@@ -183,11 +194,21 @@ class FrequencyBandExpert(nn.Module):
         x = h_n.permute(0, 2, 3, 1).reshape(batch * channels, hidden, length)
         fft_dtype = torch.float32 if x.dtype in {torch.float16, torch.bfloat16} else x.dtype
         freq = torch.fft.rfft(x.to(fft_dtype), dim=-1)
-        bands = _fixed_frequency_bands(freq.shape[-1], freq.device)
+        bands = _adaptive_frequency_bands(
+            freq.shape[-1],
+            freq.device,
+            dtype=fft_dtype,
+            center_logits=self.band_center_logits,
+            log_widths=self.band_log_widths,
+        )
+        pooled = h_n.mean(dim=(1, 2))
+        band_gate = torch.softmax(self.band_gate(torch.cat([pooled, t_code], dim=-1)), dim=-1).to(fft_dtype)
         components = []
         energy = []
-        for mask in bands:
+        for band_idx, mask in enumerate(bands):
             mask_t = mask[None, None, :]
+            sample_gate = band_gate[:, band_idx].repeat_interleave(channels)[:, None, None]
+            mask_t = mask_t * sample_gate
             filtered = torch.fft.irfft(freq * mask_t, n=length, dim=-1)
             components.append(filtered.to(x.dtype))
             energy.append((freq.abs().square() * mask_t).mean(dim=(1, 2)))
@@ -197,6 +218,9 @@ class FrequencyBandExpert(nn.Module):
         band_energy = torch.stack(energy, dim=-1).reshape(batch, channels, 3).mean(dim=1).to(h.dtype)
         aux = {
             "frequency_band_energy": band_energy.detach(),
+            "frequency_band_gate": band_gate.detach().to(h.dtype),
+            "frequency_band_centers": torch.sigmoid(self.band_center_logits).detach().to(h.dtype),
+            "frequency_band_widths": torch.exp(self.band_log_widths).detach().to(h.dtype),
             "frequency_film_scale_rms": scale.detach().square().mean().sqrt(),
             "frequency_film_shift_rms": shift.detach().square().mean().sqrt(),
         }
@@ -304,6 +328,8 @@ class ResidualOperatorBank(nn.Module):
         self.last_aux: dict[str, torch.Tensor] = {}
 
     def forward(self, x_t: torch.Tensor, base: torch.Tensor | None, t: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        if x_t.ndim != 3:
+            raise ValueError(f"x_t must be [B, L, C], got {tuple(x_t.shape)}")
         if base is None:
             base = torch.zeros_like(x_t)
         if x_t.shape != base.shape:
@@ -362,22 +388,29 @@ class ResidualOperatorBank(nn.Module):
         return torch.tanh(velocities) * self.max_velocity
 
 
-def _init_small_head(head: nn.Conv1d) -> None:
-    nn.init.normal_(head.weight, mean=0.0, std=1e-3)
-    if head.bias is not None:
+def _init_small_head(head: nn.Module) -> None:
+    if hasattr(head, "weight") and head.weight is not None:
+        nn.init.normal_(head.weight, mean=0.0, std=1e-3)
+    if hasattr(head, "bias") and head.bias is not None:
         nn.init.zeros_(head.bias)
 
 
-def _fixed_frequency_bands(freq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    idx = torch.arange(freq_len, device=device)
-    low_end = max(1, int(round(freq_len / 3)))
-    mid_end = max(low_end + 1, int(round(2 * freq_len / 3)))
-    low = (idx < low_end).to(torch.float32)
-    mid = ((idx >= low_end) & (idx < mid_end)).to(torch.float32)
-    high = (idx >= mid_end).to(torch.float32)
-    if high.sum() == 0:
-        high[-1] = 1.0
-    return low, mid, high
+def _adaptive_frequency_bands(
+    freq_len: int,
+    device: torch.device,
+    *,
+    dtype: torch.dtype,
+    center_logits: torch.Tensor,
+    log_widths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if freq_len <= 0:
+        raise ValueError("freq_len must be positive")
+    grid = torch.linspace(0.0, 1.0, freq_len, device=device, dtype=dtype)
+    centers = torch.sigmoid(center_logits).to(device=device, dtype=dtype)
+    widths = torch.exp(log_widths).to(device=device, dtype=dtype).clamp_min(1e-3)
+    logits = -((grid[None, :] - centers[:, None]) / widths[:, None]).square()
+    bands = torch.softmax(logits, dim=0)
+    return bands[0], bands[1], bands[2]
 
 
 def _entropy(prob: torch.Tensor, *, dim: int, eps: float = 1e-8) -> torch.Tensor:

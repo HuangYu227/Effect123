@@ -112,6 +112,13 @@ def run_train(cfg: dict) -> None:
     last_metrics: dict[str, float] = {}
     best_score = float("inf")
     epoch = 0
+    train_cfg = cfg.get("train", {})
+    caption_slot_strategy = str(train_cfg.get("caption_slot_strategy", "single"))
+    max_caption_slots = int(train_cfg.get("max_caption_slots", 1))
+    include_all_caption_candidates = bool(train_cfg.get("include_all_caption_candidates", False))
+    routing_loss_weight = float(train_cfg.get("routing_loss_weight", 0.0))
+    if routing_loss_weight != 0.0:
+        raise ValueError("Clean V6 uses a single Flow Matching loss. Set train.routing_loss_weight: 0.0.")
     while step < max_steps:
         if hasattr(train_ds, "set_epoch"):
             train_ds.set_epoch(epoch)
@@ -128,12 +135,16 @@ def run_train(cfg: dict) -> None:
                 cfm_loss_mode=str(cfg["train"].get("cfm_loss_mode", "global")),
                 task_mode=task_mode,
                 noise_scale=float(cfg["train"].get("noise_scale", 1.0)),
+                caption_slot_strategy=caption_slot_strategy,
+                max_caption_slots=max_caption_slots,
+                include_all_caption_candidates=include_all_caption_candidates,
             )
             step += 1
             progress.update(1)
             if step % log_every == 0 or step == 1:
                 postfix = {
                     "loss": f"{_scalar(out, 'loss'):.4f}",
+                    "cfm": f"{_scalar(out, 'loss_cfm'):.4f}",
                     "opH": f"{_scalar(out, 'operator_gate_entropy'):.2f}",
                     "tH": f"{_scalar(out, 'time_gate_entropy'):.2f}",
                     "cH": f"{_scalar(out, 'channel_gate_entropy'):.2f}",
@@ -229,7 +240,14 @@ def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int
             break
         batch = batch_to_device(batch, device)
         if task_mode == "text2ts":
-            text_condition = text_condition_from_batch(batch, text_mode, condition_key="caption")
+            text_condition = text_condition_from_batch(
+                batch,
+                text_mode,
+                condition_key="caption",
+                caption_slot_strategy=str(cfg.get("train", {}).get("caption_slot_strategy", "single")),
+                max_caption_slots=int(cfg.get("train", {}).get("max_caption_slots", 1)),
+                include_all_caption_candidates=bool(cfg.get("train", {}).get("include_all_caption_candidates", False)),
+            )
             noise = torch.randn(batch["Y"].shape, dtype=batch["Y"].dtype, generator=eval_generator).to(batch["Y"].device)
             noise = noise * float(cfg.get("sample", {}).get("noise_scale", 1.0))
             pred, aux = sample_text2ts(

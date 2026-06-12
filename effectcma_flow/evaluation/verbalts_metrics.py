@@ -76,6 +76,9 @@ class VerbalTSMetricComputer:
         task_mode: str = "edit",
         noise_scale: float = 1.0,
         n_samples: int = 1,
+        caption_slot_strategy: str = "single",
+        max_caption_slots: int = 8,
+        include_all_caption_candidates: bool = False,
         reference_series_key: str = "Y",
         reference_text_key: str = "full_text",
         generated_text_key: str = "full_text",
@@ -113,6 +116,9 @@ class VerbalTSMetricComputer:
             task_mode=task_mode,
             noise_scale=noise_scale,
             n_samples=n_samples,
+            caption_slot_strategy=caption_slot_strategy,
+            max_caption_slots=max_caption_slots,
+            include_all_caption_candidates=include_all_caption_candidates,
             text_key=generated_text_key,
             max_batches=generated_max_batches,
         )
@@ -162,6 +168,9 @@ class VerbalTSMetricComputer:
         task_mode: str,
         noise_scale: float,
         n_samples: int,
+        caption_slot_strategy: str,
+        max_caption_slots: int,
+        include_all_caption_candidates: bool,
         text_key: str,
         max_batches: int | None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -176,7 +185,14 @@ class VerbalTSMetricComputer:
             batch = batch_to_device(batch, self.device)
             if task_mode == "text2ts":
                 preds = []
-                text_condition = text_condition_from_batch(batch, text_encoder_mode, condition_key="caption")
+                text_condition = text_condition_from_batch(
+                    batch,
+                    text_encoder_mode,
+                    condition_key="caption",
+                    caption_slot_strategy=caption_slot_strategy,
+                    max_caption_slots=max_caption_slots,
+                    include_all_caption_candidates=include_all_caption_candidates,
+                )
                 for _ in range(max(1, int(n_samples))):
                     pred_one, _ = sample_text2ts(
                         model,

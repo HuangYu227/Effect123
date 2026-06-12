@@ -163,12 +163,16 @@ def run_train(cfg: dict) -> None:
                     "loss": f"{_scalar(out, 'loss'):.4f}",
                     "cfm": f"{_scalar(out, 'loss_cfm'):.4f}",
                     "opH": f"{_scalar(out, 'operator_gate_entropy'):.2f}",
-                    "tH": f"{_scalar(out, 'time_gate_entropy'):.2f}",
-                    "cH": f"{_scalar(out, 'channel_gate_entropy'):.2f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                     "vCos": f"{_scalar(out, 'velocity_cos'):.2f}",
                     "vR": f"{_scalar(out, 'pred_target_rms_ratio'):.2f}",
                 }
+                tH = _scalar(out, "time_gate_entropy")
+                cH = _scalar(out, "channel_gate_entropy")
+                if tH == tH:  # not NaN
+                    postfix["tH"] = f"{tH:.2f}"
+                if cH == cH:  # not NaN
+                    postfix["cH"] = f"{cH:.2f}"
                 regime_ortho = _scalar(out, "loss_regime_ortho")
                 if regime_ortho > 0.0:
                     postfix["rOrtho"] = f"{regime_ortho:.6f}"

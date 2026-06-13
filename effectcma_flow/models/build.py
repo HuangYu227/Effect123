@@ -12,6 +12,10 @@ _V61_KEYS = frozenset({
     "regime_temperature", "regime_posterior_mode", "regime_append_token", "regime_dropout", "regime_state_weight_mode",
     "router_mode", "operator_gate_temperature", "operator_gate_dropout",
 })
+_V62_KEYS = frozenset({
+    "use_cross_modal_bridge", "bridge_num_heads", "bridge_dropout", "bridge_patch_size",
+    "bridge_num_spectral_tokens", "bridge_alignment_temperature",
+})
 
 
 def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
@@ -74,10 +78,17 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         router_mode=str(model_cfg.get("router_mode", "legacy")),
         operator_gate_temperature=float(model_cfg.get("operator_gate_temperature", 1.0)),
         operator_gate_dropout=float(model_cfg.get("operator_gate_dropout", 0.0)),
+        # V6.2 cross-modal condition bridge
+        use_cross_modal_bridge=bool(model_cfg.get("use_cross_modal_bridge", False)),
+        bridge_num_heads=int(model_cfg.get("bridge_num_heads", 4)),
+        bridge_dropout=float(model_cfg.get("bridge_dropout", 0.0)),
+        bridge_patch_size=_optional_int(model_cfg.get("bridge_patch_size")),
+        bridge_num_spectral_tokens=int(model_cfg.get("bridge_num_spectral_tokens", 3)),
+        bridge_alignment_temperature=float(model_cfg.get("bridge_alignment_temperature", 0.07)),
     )
     if task_mode == "edit":
-        # EffectCMAFlow does not accept V6.1 regime/gate params.
-        edit_kwargs = {k: v for k, v in kwargs.items() if k not in _V61_KEYS}
+        # EffectCMAFlow does not accept text-to-series regime/gate/bridge params.
+        edit_kwargs = {k: v for k, v in kwargs.items() if k not in (_V61_KEYS | _V62_KEYS)}
         return EffectCMAFlow(**edit_kwargs)
     if task_mode == "text2ts":
         return TextToTSFlow(**kwargs)

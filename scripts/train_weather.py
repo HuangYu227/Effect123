@@ -167,6 +167,7 @@ def run_train(cfg: dict) -> None:
                 include_all_caption_candidates=include_all_caption_candidates,
                 condition_dropout_prob=float(cfg["train"].get("condition_dropout_prob", 0.0)),
                 regime_ortho_weight=float(cfg["train"].get("regime_ortho_weight", 0.0)),
+                bridge_alignment_weight=float(cfg["train"].get("bridge_alignment_weight", 0.0)),
             )
             step += 1
             scheduler.step()
@@ -201,6 +202,15 @@ def run_train(cfg: dict) -> None:
                 regime_usage = _usage_summary(out.get("regime_usage"))
                 if regime_usage is not None:
                     postfix["rU"] = regime_usage
+                bridge_align = _scalar(out, "loss_bridge_alignment")
+                if bridge_align > 0.0:
+                    postfix["bAlign"] = f"{bridge_align:.4f}"
+                bridge_t2s = _scalar(out, "bridge_text_to_state_entropy_norm")
+                if bridge_t2s == bridge_t2s:
+                    postfix["bT2S"] = f"{bridge_t2s:.2f}"
+                bridge_s2t = _scalar(out, "bridge_state_to_text_entropy_norm")
+                if bridge_s2t == bridge_s2t:
+                    postfix["bS2T"] = f"{bridge_s2t:.2f}"
                 op_max = _scalar(out, "operator_gate_max_prob")
                 if op_max == op_max:
                     postfix["opP"] = f"{op_max:.2f}"
@@ -346,6 +356,19 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "operator_gate_entropy",
         "operator_gate_entropy_norm",
         "operator_gate_max_prob",
+        "bridge_alignment_loss",
+        "bridge_text_to_state_entropy",
+        "bridge_text_to_state_entropy_norm",
+        "bridge_text_to_state_max_prob",
+        "bridge_state_to_text_entropy",
+        "bridge_state_to_text_entropy_norm",
+        "bridge_state_to_text_max_prob",
+        "bridge_context_norm",
+        "bridge_text_context_norm",
+        "bridge_state_context_norm",
+        "bridge_expert_context_norm",
+        "bridge_alignment_logit_pos",
+        "bridge_alignment_logit_std",
     ):
         if torch.is_tensor(aux.get(key)) and aux[key].numel() == 1:
             out[key] = float(aux[key].detach().cpu())

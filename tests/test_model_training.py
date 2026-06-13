@@ -5,6 +5,7 @@ from torch import nn
 
 from effectcma_flow.data.effects import EffectSpec, apply_effect
 from effectcma_flow.models.effect_mapper import EffectMapper
+from effectcma_flow.models.cross_modal_bridge import CrossModalConditionBridge
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
 from effectcma_flow.models.build import build_model
 from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
@@ -376,6 +377,53 @@ def test_structural_operator_bank_exposes_adaptive_frequency_aux():
     assert torch.isfinite(bank.experts[2].band_log_widths.grad).all()
 
 
+def test_structural_operator_bank_accepts_expert_context():
+    bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+    )
+    x_t = torch.randn(2, 12, 4)
+    context = torch.randn(2, 16)
+    expert_context = torch.randn(2, 3, 16)
+    out = bank(x_t, None, torch.rand(2), context=context, expert_context=expert_context)
+    assert out.shape == (2, 12, 4, 3)
+    assert "expert_context_norm" in bank.last_aux
+    assert torch.isfinite(out).all()
+
+
+def test_cross_modal_bridge_forward_shapes_and_mask():
+    bridge = CrossModalConditionBridge(
+        d_model=16,
+        num_channels=4,
+        sequence_length=12,
+        num_experts=3,
+        patch_size=5,
+        num_heads=4,
+        num_spectral_tokens=3,
+    )
+    slot_tokens = torch.randn(2, 3, 16)
+    slot_mask = torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    x_t = torch.randn(2, 12, 4)
+    bridged_tokens, bridge_context, expert_context, aux = bridge(
+        slot_tokens=slot_tokens,
+        slot_mask=slot_mask,
+        x_t=x_t,
+        t=torch.rand(2),
+    )
+    assert bridged_tokens.shape == (2, 3, 16)
+    assert bridge_context.shape == (2, 16)
+    assert expert_context.shape == (2, 3, 16)
+    assert torch.allclose(bridged_tokens[0, 2], torch.zeros_like(bridged_tokens[0, 2]), atol=1e-6)
+    assert torch.allclose(bridged_tokens[1], torch.zeros_like(bridged_tokens[1]), atol=1e-6)
+    assert "bridge_alignment_loss" in aux
+    assert torch.isfinite(aux["bridge_alignment_loss"])
+    assert aux["bridge_text_to_state_entropy"].requires_grad is False
+
+
 # ---------------------------------------------------------------------------
 # V6.1 Latent Regime Adapter + Global Operator Gate tests
 # ---------------------------------------------------------------------------
@@ -541,6 +589,54 @@ def test_build_model_passes_regime_posterior_mode():
     assert model.regime_adapter.posterior_mode == "uniform"
 
 
+def test_build_model_passes_cross_modal_bridge_config():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "use_cross_modal_bridge": True,
+            "bridge_num_heads": 2,
+            "bridge_patch_size": 5,
+            "bridge_num_spectral_tokens": 2,
+            "router_mode": "global_operator",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    assert model.cross_modal_bridge is not None
+    assert model.cross_modal_bridge.patch_size == 5
+    assert model.cross_modal_bridge.num_spectral_tokens == 2
+
+
+def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        operator_architecture="structural",
+        router_mode="global_operator",
+        use_cross_modal_bridge=True,
+        bridge_num_heads=4,
+        bridge_patch_size=5,
+    )
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    out, aux = model(x_t, t, [["caption"], ["caption"]])
+    assert out.shape == (2, 12, 4)
+    assert torch.isfinite(out).all()
+    assert "bridge_alignment_loss" in aux
+    assert "bridge_text_to_state_entropy" in aux
+    assert "operator_aux" in aux
+    assert "expert_context_norm" in aux["operator_aux"]
+    assert "A_o" in aux
+
+
 def test_text2ts_flow_regime_adapter_only():
     """TextToTSFlow with regime adapter but legacy mapper routing."""
     encoder = CountingTextEncoder(d_model=16)
@@ -628,6 +724,41 @@ def test_v61_train_step_regime_ortho_zero_weight():
         regime_ortho_weight=0.0,
     )
     assert result["loss_regime_ortho"].item() == 0.0
+
+
+def test_v62_train_step_includes_bridge_alignment_loss():
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        operator_architecture="structural",
+        router_mode="global_operator",
+        use_cross_modal_bridge=True,
+        bridge_num_heads=4,
+    )
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        bridge_alignment_weight=1e-3,
+    )
+    assert torch.isfinite(result["loss"])
+    assert torch.isfinite(result["loss_bridge_alignment"])
+    assert result["loss_bridge_alignment"].item() >= 0.0
+    assert "bridge_alignment_loss" in result
+    expected = result["loss_cfm"] + 1e-3 * result["loss_bridge_alignment"]
+    assert torch.allclose(result["loss"], expected, atol=1e-6)
 
 
 def test_v61_uniform_regime_train_step_exposes_uniform_diagnostics():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from effectcma_flow.models.cross_modal_bridge import CrossModalConditionBridge
 from effectcma_flow.models.effect_mapper import EffectMapper
 from effectcma_flow.models.global_operator_gate import GlobalOperatorGate
 from effectcma_flow.models.latent_regime_adapter import LatentRegimeConditionAdapter
@@ -79,6 +80,13 @@ class TextToTSFlow(nn.Module):
         router_mode: str = "legacy",
         operator_gate_temperature: float = 1.0,
         operator_gate_dropout: float = 0.0,
+        # V6.2 cross-modal condition bridge
+        use_cross_modal_bridge: bool = False,
+        bridge_num_heads: int = 4,
+        bridge_dropout: float = 0.0,
+        bridge_patch_size: int | None = None,
+        bridge_num_spectral_tokens: int = 3,
+        bridge_alignment_temperature: float = 0.07,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -92,6 +100,22 @@ class TextToTSFlow(nn.Module):
         self.text_encoder = text_encoder
         self.mapper_flow_time_condition = bool(mapper_flow_time_condition)
         self.flow_time_proj = None
+        self.use_cross_modal_bridge = bool(use_cross_modal_bridge)
+        self.cross_modal_bridge = (
+            CrossModalConditionBridge(
+                d_model=d_model,
+                num_channels=self.num_channels,
+                sequence_length=self.sequence_length,
+                num_experts=num_operators,
+                patch_size=int(bridge_patch_size or self.patch_len),
+                num_heads=bridge_num_heads,
+                dropout=bridge_dropout,
+                num_spectral_tokens=bridge_num_spectral_tokens,
+                alignment_temperature=bridge_alignment_temperature,
+            )
+            if self.use_cross_modal_bridge
+            else None
+        )
 
         if self._use_global_gate:
             # Global operator gate path: legacy encoders/mapper are not needed.
@@ -228,6 +252,17 @@ class TextToTSFlow(nn.Module):
             slot_tokens = slot_tokens + self.flow_time_proj(t[:, None].to(x_t.dtype))[:, None, :]
         text_context = _masked_mean(slot_tokens, slot_mask)
 
+        bridge_aux: dict[str, torch.Tensor] = {}
+        expert_context: torch.Tensor | None = None
+        if self.cross_modal_bridge is not None:
+            # slot_tokens: [B,J,D], x_t: [B,L,C], expert_context: [B,K,D].
+            slot_tokens, text_context, expert_context, bridge_aux = self.cross_modal_bridge(
+                slot_tokens=slot_tokens,
+                slot_mask=slot_mask,
+                x_t=x_t,
+                t=t,
+            )
+
         # V6.1: optional regime adapter (works with both routing modes)
         regime_aux: dict[str, torch.Tensor] = {}
         if self.regime_adapter is not None:
@@ -241,7 +276,7 @@ class TextToTSFlow(nn.Module):
 
         if self._use_global_gate:
             # --- V6.1 global operator gate path ---
-            velocities = self.operator_bank(x_t, None, t, context=text_context)
+            velocities = self.operator_bank(x_t, None, t, context=text_context, expert_context=expert_context)
             _gate, g, gate_aux = self.global_operator_gate(
                 x_t=x_t,
                 t=t,
@@ -250,6 +285,7 @@ class TextToTSFlow(nn.Module):
             )
             v_hat = (g * velocities).sum(dim=-1)
             aux = {
+                **bridge_aux,
                 **regime_aux,
                 **gate_aux,
                 "G": g,
@@ -269,10 +305,11 @@ class TextToTSFlow(nn.Module):
             if g.shape[1] < self.sequence_length:
                 raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
             g = g[:, : self.sequence_length]
-            velocities = self.operator_bank(x_t, None, t, context=text_context)
+            velocities = self.operator_bank(x_t, None, t, context=text_context, expert_context=expert_context)
             v_hat = (g * velocities).sum(dim=-1)
             aux = {
                 **aux,
+                **bridge_aux,
                 **regime_aux,
                 "G_patch": g_patch,
                 "G": g,

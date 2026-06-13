@@ -1,7 +1,7 @@
-"""CFM training step for V6.1.
+"""CFM training step for V6.1/V6.2.
 
 Training objective:
-    L = L_CFM + lambda_ortho * L_regime_ortho
+    L = L_CFM + lambda_ortho * L_regime_ortho + lambda_bridge * L_bridge_align
 
 No routing entropy, channel entropy, field mass, trend, frequency, volatility,
 or artificial semantic-slot losses are used.
@@ -32,6 +32,7 @@ def cfm_train_step(
     include_all_caption_candidates: bool = False,
     condition_dropout_prob: float = 0.0,
     regime_ortho_weight: float = 0.0,
+    bridge_alignment_weight: float = 0.0,
     # Backward-compatibility guard: old routing losses must stay disabled.
     routing_loss_weight: float = 0.0,
     **unused: Any,
@@ -83,7 +84,10 @@ def cfm_train_step(
     regime_ortho = pred_v.new_zeros(())
     if float(regime_ortho_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("regime_ortho_loss")):
         regime_ortho = aux["regime_ortho_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
-    loss = cfm_loss + float(regime_ortho_weight) * regime_ortho
+    bridge_alignment = pred_v.new_zeros(())
+    if float(bridge_alignment_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("bridge_alignment_loss")):
+        bridge_alignment = aux["bridge_alignment_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
+    loss = cfm_loss + float(regime_ortho_weight) * regime_ortho + float(bridge_alignment_weight) * bridge_alignment
 
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
@@ -99,6 +103,7 @@ def cfm_train_step(
         "loss": loss.detach(),
         "loss_cfm": cfm_loss.detach(),
         "loss_regime_ortho": regime_ortho.detach(),
+        "loss_bridge_alignment": bridge_alignment.detach(),
         **loss_parts,
         "pred_v": pred_v.detach(),
         "target_v": target_v.detach(),
@@ -195,7 +200,28 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
     if not isinstance(aux, dict):
         return {}
     out: dict[str, torch.Tensor] = {}
-    for key in ["regime_entropy", "regime_entropy_norm", "regime_max_prob", "regime_state_weight", "operator_gate_entropy", "operator_gate_entropy_norm", "operator_gate_max_prob"]:
+    for key in [
+        "regime_entropy",
+        "regime_entropy_norm",
+        "regime_max_prob",
+        "regime_state_weight",
+        "operator_gate_entropy",
+        "operator_gate_entropy_norm",
+        "operator_gate_max_prob",
+        "bridge_alignment_loss",
+        "bridge_text_to_state_entropy",
+        "bridge_text_to_state_entropy_norm",
+        "bridge_text_to_state_max_prob",
+        "bridge_state_to_text_entropy",
+        "bridge_state_to_text_entropy_norm",
+        "bridge_state_to_text_max_prob",
+        "bridge_context_norm",
+        "bridge_text_context_norm",
+        "bridge_state_context_norm",
+        "bridge_expert_context_norm",
+        "bridge_alignment_logit_pos",
+        "bridge_alignment_logit_std",
+    ]:
         val = aux.get(key)
         if torch.is_tensor(val):
             out[key] = val.detach()

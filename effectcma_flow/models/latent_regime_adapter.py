@@ -49,6 +49,8 @@ class LatentRegimeConditionAdapter(nn.Module):
         regime_dim: Prototype dimension. Defaults to ``d_model``.
         hidden_dim: Internal hidden dimension. Defaults to ``d_model``.
         temperature: Softmax temperature for regime posterior.
+        posterior_mode: ``learned`` uses the inferred posterior; ``uniform``
+            forces a constant posterior for mechanism ablation.
         append_regime_token: If True, append one regime token to slot tokens.
         state_weight_mode: How much the state branch should affect the regime
             posterior. ``linear_t`` uses the flow time t, so early noisy states
@@ -65,6 +67,7 @@ class LatentRegimeConditionAdapter(nn.Module):
         regime_dim: int | None = None,
         hidden_dim: int | None = None,
         temperature: float = 0.7,
+        posterior_mode: str = "learned",
         append_regime_token: bool = True,
         state_weight_mode: str = "linear_t",
         dropout: float = 0.0,
@@ -80,6 +83,9 @@ class LatentRegimeConditionAdapter(nn.Module):
         self.regime_dim = int(regime_dim or d_model)
         self.hidden_dim = int(hidden_dim or d_model)
         self.temperature = float(temperature)
+        self.posterior_mode = str(posterior_mode).lower()
+        if self.posterior_mode not in {"learned", "uniform"}:
+            raise ValueError("posterior_mode must be one of {'learned','uniform'}")
         self.append_regime_token = bool(append_regime_token)
         self.state_weight_mode = str(state_weight_mode).lower()
         if self.state_weight_mode not in {"linear_t", "learned", "constant", "none"}:
@@ -165,7 +171,10 @@ class LatentRegimeConditionAdapter(nn.Module):
         bank_norm = F.normalize(self.regime_bank.to(device=device, dtype=dtype), dim=-1)
         scores = query @ bank_norm.t()
         scores = scores / max(self.temperature, 1e-4)
-        regime_prob = torch.softmax(scores, dim=-1)
+        if self.posterior_mode == "uniform":
+            regime_prob = torch.full_like(scores, 1.0 / float(self.num_regimes))
+        else:
+            regime_prob = torch.softmax(scores, dim=-1)
         regime_context_raw = regime_prob @ bank_norm  # [B, regime_dim]
         regime_token = self.regime_to_text(regime_context_raw)
 
@@ -188,6 +197,11 @@ class LatentRegimeConditionAdapter(nn.Module):
         aux = {
             "regime_prob": regime_prob,
             "regime_scores": scores,
+            "regime_posterior_uniform": torch.as_tensor(
+                float(self.posterior_mode == "uniform"),
+                device=device,
+                dtype=dtype,
+            ).detach(),
             "regime_entropy": entropy.detach(),
             "regime_entropy_norm": (entropy / torch.log(torch.tensor(float(max(self.num_regimes, 2)), device=device, dtype=dtype))).detach(),
             "regime_max_prob": regime_prob.max(dim=-1).values.mean().detach(),

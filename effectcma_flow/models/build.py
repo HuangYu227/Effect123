@@ -9,7 +9,7 @@ from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 
 _V61_KEYS = frozenset({
     "use_latent_regime_adapter", "num_regimes", "regime_dim", "regime_hidden_dim",
-    "regime_temperature", "regime_append_token", "regime_dropout", "regime_state_weight_mode",
+    "regime_temperature", "regime_posterior_mode", "regime_append_token", "regime_dropout", "regime_state_weight_mode",
     "router_mode", "operator_gate_temperature", "operator_gate_dropout",
 })
 
@@ -66,6 +66,7 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         regime_dim=_optional_int(model_cfg.get("regime_dim")),
         regime_hidden_dim=_optional_int(model_cfg.get("regime_hidden_dim")),
         regime_temperature=float(model_cfg.get("regime_temperature", 0.7)),
+        regime_posterior_mode=str(model_cfg.get("regime_posterior_mode", "learned")),
         regime_append_token=bool(model_cfg.get("regime_append_token", True)),
         regime_dropout=float(model_cfg.get("regime_dropout", 0.0)),
         regime_state_weight_mode=str(model_cfg.get("regime_state_weight_mode", "linear_t")),

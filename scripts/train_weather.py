@@ -192,6 +192,21 @@ def run_train(cfg: dict) -> None:
                 regime_ent = _scalar(out, "regime_entropy")
                 if regime_ent == regime_ent:  # not NaN
                     postfix["rH"] = f"{regime_ent:.2f}"
+                regime_ent_norm = _scalar(out, "regime_entropy_norm")
+                if regime_ent_norm == regime_ent_norm:
+                    postfix["rHn"] = f"{regime_ent_norm:.2f}"
+                regime_max = _scalar(out, "regime_max_prob")
+                if regime_max == regime_max:
+                    postfix["rP"] = f"{regime_max:.2f}"
+                regime_usage = _usage_summary(out.get("regime_usage"))
+                if regime_usage is not None:
+                    postfix["rU"] = regime_usage
+                op_max = _scalar(out, "operator_gate_max_prob")
+                if op_max == op_max:
+                    postfix["opP"] = f"{op_max:.2f}"
+                op_usage = _usage_summary(out.get("operator_usage"))
+                if op_usage is not None:
+                    postfix["opU"] = op_usage
                 if "loss_inside" in out:
                     postfix["inside"] = f"{_scalar(out, 'loss_inside'):.4f}"
                     postfix["outside"] = f"{_scalar(out, 'loss_outside'):.4f}"
@@ -321,6 +336,21 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
     for key in ("gate_raw_cell_mass_mean", "gate_cell_mass_mean", "gate_rescale_factor"):
         if key in aux:
             out[key] = float(aux[key].detach().cpu())
+    for key in (
+        "regime_entropy",
+        "regime_entropy_norm",
+        "regime_max_prob",
+        "regime_state_weight",
+        "regime_context_norm",
+        "regime_posterior_uniform",
+        "operator_gate_entropy",
+        "operator_gate_entropy_norm",
+        "operator_gate_max_prob",
+    ):
+        if torch.is_tensor(aux.get(key)) and aux[key].numel() == 1:
+            out[key] = float(aux[key].detach().cpu())
+    _add_usage_summary(out, aux, "regime_usage")
+    _add_usage_summary(out, aux, "operator_usage")
     return out
 
 
@@ -347,8 +377,29 @@ def _scalar(output: dict, key: str) -> float:
     if value is None:
         return float("nan")
     if torch.is_tensor(value):
+        if value.numel() != 1:
+            return float("nan")
         return float(value.detach().cpu())
     return float(value)
+
+
+def _usage_summary(value) -> str | None:
+    if not torch.is_tensor(value) or value.numel() == 0:
+        return None
+    flat = value.detach().float().cpu().flatten()
+    if flat.numel() > 8:
+        flat = flat[:8]
+    return "/".join(f"{float(v):.2f}" for v in flat)
+
+
+def _add_usage_summary(out: dict[str, float], aux: dict[str, torch.Tensor], key: str) -> None:
+    value = aux.get(key)
+    if not torch.is_tensor(value) or value.numel() == 0:
+        return
+    flat = value.detach().float().cpu().flatten()
+    out[f"{key}_min"] = float(flat.min())
+    out[f"{key}_max"] = float(flat.max())
+    out[f"{key}_std"] = float(flat.std(unbiased=False))
 
 if __name__ == "__main__":
     main()

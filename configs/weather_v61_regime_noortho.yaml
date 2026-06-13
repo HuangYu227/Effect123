@@ -54,6 +54,7 @@ model:
   regime_dim: 256
   regime_hidden_dim: 256
   regime_temperature: 0.7
+  regime_posterior_mode: learned
   regime_append_token: false
   regime_state_weight_mode: linear_t
 

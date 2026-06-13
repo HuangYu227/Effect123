@@ -430,6 +430,31 @@ def test_regime_adapter_no_append_token():
     assert sm.shape == (2, 3)
 
 
+def test_regime_adapter_uniform_posterior_outputs_uniform():
+    """Uniform posterior mode keeps the adapter path but removes dynamic routing."""
+    adapter = LatentRegimeConditionAdapter(
+        d_model=16,
+        num_channels=4,
+        num_regimes=4,
+        posterior_mode="uniform",
+        append_regime_token=False,
+    )
+    x_t = torch.randn(3, 12, 4)
+    t = torch.rand(3)
+    slot_tokens = torch.randn(3, 2, 16)
+    slot_mask = torch.ones(3, 2)
+    text_context = torch.randn(3, 16)
+    st, sm, ctx, aux = adapter(x_t=x_t, t=t, slot_tokens=slot_tokens, slot_mask=slot_mask, text_context=text_context)
+    expected = torch.full_like(aux["regime_prob"], 0.25)
+    assert st.shape == (3, 2, 16)
+    assert sm.shape == (3, 2)
+    assert ctx.shape == (3, 16)
+    assert torch.allclose(aux["regime_prob"], expected)
+    assert torch.allclose(aux["regime_usage"], torch.full_like(aux["regime_usage"], 0.25))
+    assert torch.allclose(aux["regime_entropy_norm"], torch.tensor(1.0), atol=1e-6)
+    assert aux["regime_posterior_uniform"].item() == 1.0
+
+
 def test_regime_orthogonal_loss():
     """Orthogonal loss is zero for orthonormal bank, positive otherwise."""
     # Orthonormal bank
@@ -499,6 +524,21 @@ def test_text2ts_flow_with_regime_adapter_and_global_gate():
     assert "V" in aux
     # regime adapter appended a token, so encoder was called
     assert encoder.calls == 1
+
+
+def test_build_model_passes_regime_posterior_mode():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "use_latent_regime_adapter": True,
+            "num_regimes": 4,
+            "regime_posterior_mode": "uniform",
+            "router_mode": "global_operator",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    assert model.regime_adapter is not None
+    assert model.regime_adapter.posterior_mode == "uniform"
 
 
 def test_text2ts_flow_regime_adapter_only():
@@ -588,6 +628,40 @@ def test_v61_train_step_regime_ortho_zero_weight():
         regime_ortho_weight=0.0,
     )
     assert result["loss_regime_ortho"].item() == 0.0
+
+
+def test_v61_uniform_regime_train_step_exposes_uniform_diagnostics():
+    encoder = CountingTextEncoder(d_model=16)
+    model = TextToTSFlow(
+        sequence_length=12,
+        num_channels=4,
+        patch_len=3,
+        d_model=16,
+        num_operators=3,
+        text_encoder=encoder,
+        transformer_layers=1,
+        transformer_heads=4,
+        operator_hidden=8,
+        operator_t_dim=4,
+        use_latent_regime_adapter=True,
+        num_regimes=4,
+        regime_posterior_mode="uniform",
+        router_mode="global_operator",
+    )
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        regime_ortho_weight=1e-4,
+    )
+    assert torch.isfinite(result["loss"])
+    assert torch.allclose(result["aux"]["regime_prob"], torch.full_like(result["aux"]["regime_prob"], 0.25))
+    assert torch.allclose(result["regime_usage"], torch.full_like(result["regime_usage"], 0.25))
+    assert torch.allclose(result["regime_entropy_norm"], torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(result["regime_max_prob"], torch.tensor(0.25))
 
 
 def test_v61_backward_compat_no_regime_no_global_gate():

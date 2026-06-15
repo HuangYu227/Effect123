@@ -106,10 +106,11 @@ train:
   device: auto
   checkpoint_dir: checkpoints/v64_focal_tokens
   log_every: 20
-  eval_every: 200
+  eval_every: 300
   eval_batches: 4
   eval_seed_offset: 50000
-  best_metric: verbalts_jftsd
+  best_metric: mse
+  best_metric_mode: min
   save_every: 1000
 
 sample:

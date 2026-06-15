@@ -125,10 +125,12 @@ def run_train(cfg: dict) -> None:
     eval_every = int(cfg["train"].get("eval_every", 200))
     save_every = int(cfg["train"].get("save_every", eval_every))
     best_metric = str(cfg["train"].get("best_metric", "mse"))
+    best_metric_mode = str(cfg["train"].get("best_metric_mode", "auto"))
     step = 0
     progress = tqdm(total=max_steps, desc="train", dynamic_ncols=True)
     last_metrics: dict[str, float] = {}
-    best_score = float("inf")
+    best_score: float | None = None
+    warned_missing_best_metric = False
     epoch = 0
     train_cfg = cfg.get("train", {})
     caption_slot_strategy = str(train_cfg.get("caption_slot_strategy", "single"))
@@ -239,10 +241,28 @@ def run_train(cfg: dict) -> None:
                 save_checkpoint(checkpoint_dir / "latest.pt", model, optimizer, cfg, stats, step)
                 if save_every > 0 and (step % save_every == 0 or step == max_steps):
                     save_checkpoint(checkpoint_dir / f"step_{step:08d}.pt", model, optimizer, cfg, stats, step)
-                score = metrics.get(best_metric, float("inf"))
-                if score < best_score:
+                score_name, score = _select_best_metric(metrics, best_metric)
+                if score_name is None or score is None:
+                    if not warned_missing_best_metric:
+                        progress.write(
+                            f"[checkpoint] best metric {best_metric!r} is absent from validation metrics; "
+                            "best.pt will not be updated until a comparable metric is available."
+                        )
+                        warned_missing_best_metric = True
+                elif score_name != best_metric and not warned_missing_best_metric:
+                    progress.write(
+                        f"[checkpoint] best metric {best_metric!r} is absent; using {score_name!r} for best.pt."
+                    )
+                    warned_missing_best_metric = True
+                if score_name is not None and score is not None and _is_better_metric(
+                    score,
+                    best_score,
+                    metric_name=score_name,
+                    mode=best_metric_mode,
+                ):
                     best_score = score
                     save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, cfg, stats, step)
+                    progress.write(f"[checkpoint] saved best.pt at step {step} ({score_name}={score:.6g})")
             if step >= max_steps:
                 break
     progress.close()
@@ -429,6 +449,45 @@ def _usage_summary(value) -> str | None:
     if flat.numel() > 8:
         flat = flat[:8]
     return "/".join(f"{float(v):.2f}" for v in flat)
+
+
+def _select_best_metric(metrics: dict[str, float], requested: str) -> tuple[str | None, float | None]:
+    """Select a finite validation score for checkpoint ranking.
+
+    Training validation is intentionally lightweight and normally does not run
+    VerbalTS. If a config requests a missing VerbalTS metric, fall back to the
+    available validation metrics so best.pt is still useful during training.
+    """
+    candidates = [requested]
+    for fallback in ("mse", "mae", "mask_iou", "field_scope_precision"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    for name in candidates:
+        value = metrics.get(name)
+        if value is None:
+            continue
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(score):
+            return name, score
+    return None, None
+
+
+def _is_better_metric(score: float, best_score: float | None, *, metric_name: str, mode: str = "auto") -> bool:
+    if best_score is None:
+        return True
+    direction = str(mode).lower()
+    if direction == "auto":
+        lower_name = metric_name.lower()
+        higher_is_better = any(token in lower_name for token in ("cttp", "acc", "iou", "precision", "recall", "f1", "cos"))
+        direction = "max" if higher_is_better else "min"
+    if direction in {"min", "lower"}:
+        return score < best_score
+    if direction in {"max", "higher"}:
+        return score > best_score
+    raise ValueError("train.best_metric_mode must be 'auto', 'min', or 'max'")
 
 
 def _blank_caption_fields(batch: dict) -> dict:

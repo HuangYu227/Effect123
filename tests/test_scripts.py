@@ -12,6 +12,8 @@ from scripts.eval_weather import run_eval
 from scripts.sample_weather import run_sample
 from scripts.train_weather import (
     _blank_caption_fields as train_blank_caption_fields,
+    _is_better_metric,
+    _select_best_metric,
     _shuffle_caption_fields as train_shuffle_caption_fields,
 )
 
@@ -162,3 +164,16 @@ def test_caption_blank_removes_candidate_leakage():
         blanked = fn(batch)
         assert blanked["caption"] == ["", ""]
         assert blanked["caption_candidates"] == [[], []]
+
+
+def test_train_best_metric_falls_back_to_mse_when_verbalts_absent():
+    name, score = _select_best_metric({"mse": 1.2, "mae": 0.8}, "verbalts_jftsd")
+    assert name == "mse"
+    assert score == 1.2
+
+
+def test_train_best_metric_direction_auto_handles_min_and_max():
+    assert _is_better_metric(1.0, 1.2, metric_name="mse", mode="auto")
+    assert not _is_better_metric(1.3, 1.2, metric_name="mse", mode="auto")
+    assert _is_better_metric(0.7, 0.6, metric_name="mask_iou", mode="auto")
+    assert not _is_better_metric(0.5, 0.6, metric_name="mask_iou", mode="auto")

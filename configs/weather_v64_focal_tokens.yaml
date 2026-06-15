@@ -66,6 +66,8 @@ model:
   regime_state_weight_mode: linear_t
 
   router_mode: global_operator
+  operator_gate_router: attention
+  operator_gate_heads: 4
 
 text_encoder:
   mode: longclip

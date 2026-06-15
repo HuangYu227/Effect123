@@ -81,6 +81,8 @@ class TextToTSFlow(nn.Module):
         router_mode: str = "legacy",
         operator_gate_temperature: float = 1.0,
         operator_gate_dropout: float = 0.0,
+        operator_gate_router: str = "mlp",
+        operator_gate_heads: int = 4,
         # V6.2 cross-modal condition bridge
         use_cross_modal_bridge: bool = False,
         bridge_num_heads: int = 4,
@@ -218,6 +220,8 @@ class TextToTSFlow(nn.Module):
                 hidden_dim=d_model,
                 temperature=operator_gate_temperature,
                 dropout=operator_gate_dropout,
+                router_type=operator_gate_router,
+                num_heads=operator_gate_heads,
             )
         else:
             self.global_operator_gate = None
@@ -297,6 +301,8 @@ class TextToTSFlow(nn.Module):
                 x_t=x_t,
                 t=t,
                 text_context=text_context,
+                slot_tokens=slot_tokens,
+                slot_mask=slot_mask,
                 velocity_shape=velocities.shape,
             )
             v_hat = (g * velocities).sum(dim=-1)

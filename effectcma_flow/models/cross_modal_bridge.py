@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class TimestepAwareFocalAttention(nn.Module):
-    """Cross-attention from learned focal queries to text/state memory.
+class TimestepAwareCrossAttention(nn.Module):
+    """SDPA cross-attention from learned focal queries to text/state memory.
 
     A small time-dependent logit scale lets the bridge change how sharply it
     reads conditions at different flow stages without introducing a new loss.
@@ -26,7 +26,7 @@ class TimestepAwareFocalAttention(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_p = float(dropout)
         self.time_logit_scale = nn.Sequential(nn.Linear(1, d_model), nn.SiLU(), nn.Linear(d_model, heads))
 
     def forward(
@@ -52,13 +52,21 @@ class TimestepAwareFocalAttention(nn.Module):
         q = self.q_proj(query).view(batch, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(memory).view(batch, memory.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(memory).view(batch, memory.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
-        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         stage_scale = 1.0 + 0.5 * torch.tanh(self.time_logit_scale(t[:, None].to(query.dtype)))
-        logits = logits * stage_scale[:, :, None, None]
+        q = q * stage_scale[:, :, None, None]
+        attn_mask = mask[:, None, None, :]
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False,
+        )
+        logits = torch.matmul(q.detach(), k.detach().transpose(-2, -1)) * self.scale
         logits = logits.masked_fill(~mask[:, None, None, :], -torch.finfo(logits.dtype).max)
         attn = torch.softmax(logits, dim=-1)
-        attn = self.dropout(attn)
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(batch, q_len, d_model)
+        out = out.transpose(1, 2).reshape(batch, q_len, d_model)
         return self.out_proj(out), attn
 
 
@@ -155,7 +163,7 @@ class CrossModalConditionBridge(nn.Module):
             )
             self.focal_memory_norm = nn.LayerNorm(self.d_model)
             self.focal_query_norm = nn.LayerNorm(self.d_model)
-            self.focal_attn = TimestepAwareFocalAttention(self.d_model, heads, dropout)
+            self.focal_attn = TimestepAwareCrossAttention(self.d_model, heads, dropout)
             self.channel_context_norm = nn.LayerNorm(self.d_model)
             self.expert_context_norm = nn.LayerNorm(self.d_model)
             self.scale_context_norm = nn.LayerNorm(self.d_model)

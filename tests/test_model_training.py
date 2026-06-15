@@ -593,6 +593,36 @@ def test_global_operator_gate_forward_shapes():
     assert torch.isfinite(g).all()
 
 
+def test_global_operator_gate_attention_router_uses_tokens():
+    """Attention router uses operator queries over state/text/time memory."""
+    gate = GlobalOperatorGate(
+        d_model=16,
+        num_channels=4,
+        num_operators=3,
+        router_type="attention",
+        num_heads=4,
+    )
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    text_context = torch.randn(2, 16)
+    slot_tokens = torch.randn(2, 5, 16)
+    slot_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0]])
+    gate_prob, g, aux = gate(
+        x_t=x_t,
+        t=t,
+        text_context=text_context,
+        slot_tokens=slot_tokens,
+        slot_mask=slot_mask,
+        velocity_shape=(2, 12, 4, 3),
+    )
+    assert gate_prob.shape == (2, 3)
+    assert g.shape == (2, 12, 4, 3)
+    assert "operator_gate_attention_entropy_norm" in aux
+    assert "operator_gate_attention_text_mass" in aux
+    assert aux["operator_gate_attention_text_mass"].item() > 0.0
+    assert torch.isfinite(gate_prob).all()
+
+
 def test_global_operator_gate_without_velocity_shape():
     """GlobalOperatorGate works without expanding to velocity_shape."""
     gate = GlobalOperatorGate(d_model=16, num_channels=4, num_operators=3)
@@ -715,6 +745,7 @@ def test_text2ts_flow_with_latent_query_bridge_train_step():
             "operator_architecture": "structural",
             "operator_multiview_context": True,
             "router_mode": "global_operator",
+            "operator_gate_router": "attention",
             "use_cross_modal_bridge": True,
             "bridge_focal_mode": "latent_query",
             "bridge_num_stage_tokens": 3,
@@ -726,6 +757,7 @@ def test_text2ts_flow_with_latent_query_bridge_train_step():
     assert torch.isfinite(result["loss"])
     assert "bridge_focal_channel_entropy_norm" in result
     assert "bridge_memory_token_count" in result
+    assert "operator_gate_attention_entropy_norm" in result
 
 
 def test_text2ts_flow_regime_adapter_only():

@@ -14,7 +14,8 @@ _V61_KEYS = frozenset({
 })
 _V62_KEYS = frozenset({
     "use_cross_modal_bridge", "bridge_num_heads", "bridge_dropout", "bridge_patch_size",
-    "bridge_num_spectral_tokens", "bridge_alignment_temperature", "operator_multiview_context",
+    "bridge_num_spectral_tokens", "bridge_alignment_temperature", "bridge_focal_mode",
+    "bridge_num_stage_tokens", "operator_multiview_context",
 })
 
 
@@ -86,6 +87,8 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         bridge_patch_size=_optional_int(model_cfg.get("bridge_patch_size")),
         bridge_num_spectral_tokens=int(model_cfg.get("bridge_num_spectral_tokens", 3)),
         bridge_alignment_temperature=float(model_cfg.get("bridge_alignment_temperature", 0.07)),
+        bridge_focal_mode=str(model_cfg.get("bridge_focal_mode", "legacy")),
+        bridge_num_stage_tokens=int(model_cfg.get("bridge_num_stage_tokens", 3)),
     )
     if task_mode == "edit":
         # EffectCMAFlow does not accept text-to-series regime/gate/bridge params.

@@ -372,6 +372,13 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "bridge_state_context_norm",
         "bridge_expert_context_norm",
         "bridge_channel_context_norm",
+        "bridge_scale_context_norm",
+        "bridge_stage_context_norm",
+        "bridge_memory_token_count",
+        "bridge_focal_channel_entropy_norm",
+        "bridge_focal_expert_entropy_norm",
+        "bridge_focal_scale_entropy_norm",
+        "bridge_focal_stage_entropy_norm",
         "bridge_alignment_logit_pos",
         "bridge_alignment_logit_std",
     ):

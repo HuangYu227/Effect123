@@ -88,6 +88,8 @@ class TextToTSFlow(nn.Module):
         bridge_patch_size: int | None = None,
         bridge_num_spectral_tokens: int = 3,
         bridge_alignment_temperature: float = 0.07,
+        bridge_focal_mode: str = "legacy",
+        bridge_num_stage_tokens: int = 3,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -113,6 +115,8 @@ class TextToTSFlow(nn.Module):
                 dropout=bridge_dropout,
                 num_spectral_tokens=bridge_num_spectral_tokens,
                 alignment_temperature=bridge_alignment_temperature,
+                focal_mode=bridge_focal_mode,
+                num_stage_tokens=bridge_num_stage_tokens,
             )
             if self.use_cross_modal_bridge
             else None

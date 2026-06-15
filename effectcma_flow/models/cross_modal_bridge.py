@@ -7,6 +7,61 @@ import torch.nn.functional as F
 from torch import nn
 
 
+class TimestepAwareFocalAttention(nn.Module):
+    """Cross-attention from learned focal queries to text/state memory.
+
+    A small time-dependent logit scale lets the bridge change how sharply it
+    reads conditions at different flow stages without introducing a new loss.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        heads = max(1, min(int(num_heads), int(d_model)))
+        while d_model % heads != 0 and heads > 1:
+            heads -= 1
+        self.num_heads = heads
+        self.head_dim = int(d_model) // heads
+        self.scale = self.head_dim**-0.5
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.time_logit_scale = nn.Sequential(nn.Linear(1, d_model), nn.SiLU(), nn.Linear(d_model, heads))
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        memory_mask: torch.Tensor,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query.ndim != 3 or memory.ndim != 3:
+            raise ValueError("query and memory must be [B,N,D]")
+        batch, q_len, d_model = query.shape
+        if memory.shape[0] != batch or memory.shape[-1] != d_model:
+            raise ValueError("query and memory batch/dim must match")
+        if memory_mask.shape != memory.shape[:2]:
+            raise ValueError(f"memory_mask must have shape {tuple(memory.shape[:2])}, got {tuple(memory_mask.shape)}")
+        mask = memory_mask.to(device=memory.device, dtype=torch.bool)
+        empty = ~mask.any(dim=1)
+        if empty.any():
+            mask = mask.clone()
+            mask[empty, 0] = True
+
+        q = self.q_proj(query).view(batch, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(memory).view(batch, memory.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(memory).view(batch, memory.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
+        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        stage_scale = 1.0 + 0.5 * torch.tanh(self.time_logit_scale(t[:, None].to(query.dtype)))
+        logits = logits * stage_scale[:, :, None, None]
+        logits = logits.masked_fill(~mask[:, None, None, :], -torch.finfo(logits.dtype).max)
+        attn = torch.softmax(logits, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(batch, q_len, d_model)
+        return self.out_proj(out), attn
+
+
 class CrossModalConditionBridge(nn.Module):
     """Bidirectional text-state bridge for text-to-series generation.
 
@@ -27,6 +82,8 @@ class CrossModalConditionBridge(nn.Module):
         dropout: float = 0.0,
         num_spectral_tokens: int = 3,
         alignment_temperature: float = 0.07,
+        focal_mode: str = "legacy",
+        num_stage_tokens: int = 3,
     ) -> None:
         super().__init__()
         if d_model <= 0 or num_channels <= 0 or sequence_length <= 0 or num_experts <= 0:
@@ -44,6 +101,12 @@ class CrossModalConditionBridge(nn.Module):
         self.patch_size = int(patch_size)
         self.num_spectral_tokens = int(num_spectral_tokens)
         self.alignment_temperature = float(alignment_temperature)
+        self.focal_mode = str(focal_mode).lower()
+        if self.focal_mode not in {"legacy", "latent_query"}:
+            raise ValueError(f"focal_mode must be 'legacy' or 'latent_query', got {focal_mode!r}")
+        self.num_stage_tokens = int(num_stage_tokens)
+        if self.num_stage_tokens <= 0:
+            raise ValueError("num_stage_tokens must be positive")
 
         self.time_patch_proj = nn.Linear(self.patch_size * self.num_channels, self.d_model)
         self.channel_stat_proj = nn.Linear(3, self.d_model)
@@ -79,6 +142,24 @@ class CrossModalConditionBridge(nn.Module):
         )
         self.text_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
         self.state_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
+        if self.focal_mode == "latent_query":
+            init = 0.02
+            self.channel_queries = nn.Parameter(torch.randn(self.num_channels, self.d_model) * init)
+            self.expert_queries = nn.Parameter(torch.randn(self.num_experts, self.d_model) * init)
+            self.scale_queries = nn.Parameter(torch.randn(self.num_spectral_tokens, self.d_model) * init)
+            self.stage_queries = nn.Parameter(torch.randn(self.num_stage_tokens, self.d_model) * init)
+            self.stage_selector = nn.Sequential(
+                nn.Linear(1, self.d_model),
+                nn.SiLU(),
+                nn.Linear(self.d_model, self.num_stage_tokens),
+            )
+            self.focal_memory_norm = nn.LayerNorm(self.d_model)
+            self.focal_query_norm = nn.LayerNorm(self.d_model)
+            self.focal_attn = TimestepAwareFocalAttention(self.d_model, heads, dropout)
+            self.channel_context_norm = nn.LayerNorm(self.d_model)
+            self.expert_context_norm = nn.LayerNorm(self.d_model)
+            self.scale_context_norm = nn.LayerNorm(self.d_model)
+            self.stage_context_norm = nn.LayerNorm(self.d_model)
 
     def forward(
         self,
@@ -138,18 +219,29 @@ class CrossModalConditionBridge(nn.Module):
 
         text_context = _masked_mean(bridged_text, slot_mask)
         time_token_count = _num_patch_tokens(length, self.patch_size)
-        channel_context = bridged_state[:, time_token_count : time_token_count + channels]
-        if channel_context.shape != (batch, channels, self.d_model):
-            raise RuntimeError(
-                f"internal channel_context shape {tuple(channel_context.shape)} "
-                f"must be {(batch, channels, self.d_model)}"
-            )
 
         state_context = self.state_to_context(bridged_state.mean(dim=1))
-        gate = self.context_gate(torch.cat([text_context, state_context], dim=-1))
-        bridge_context = self.context_norm(text_context + gate * state_context)
-        expert_context = self.expert_context(torch.cat([bridge_context, state_context], dim=-1))
-        expert_context = expert_context.view(batch, self.num_experts, self.d_model)
+        focal_aux: dict[str, torch.Tensor] = {}
+        if self.focal_mode == "latent_query":
+            bridge_context, expert_context, channel_context, focal_aux = self._focal_contexts(
+                bridged_text=bridged_text,
+                bridged_state=bridged_state,
+                slot_mask=slot_mask,
+                text_context=text_context,
+                state_context=state_context,
+                t=t,
+            )
+        else:
+            channel_context = bridged_state[:, time_token_count : time_token_count + channels]
+            if channel_context.shape != (batch, channels, self.d_model):
+                raise RuntimeError(
+                    f"internal channel_context shape {tuple(channel_context.shape)} "
+                    f"must be {(batch, channels, self.d_model)}"
+                )
+            gate = self.context_gate(torch.cat([text_context, state_context], dim=-1))
+            bridge_context = self.context_norm(text_context + gate * state_context)
+            expert_context = self.expert_context(torch.cat([bridge_context, state_context], dim=-1))
+            expert_context = expert_context.view(batch, self.num_experts, self.d_model)
 
         alignment_loss, alignment_aux = self._alignment_loss(text_context, state_context)
         valid_slot_count = slot_mask.sum(dim=1)
@@ -171,9 +263,62 @@ class CrossModalConditionBridge(nn.Module):
             "bridge_state_context_norm": state_context.detach().norm(dim=-1).mean(),
             "bridge_expert_context_norm": expert_context.detach().norm(dim=-1).mean(),
             "bridge_channel_context_norm": channel_context.detach().norm(dim=-1).mean(),
+            **focal_aux,
             **alignment_aux,
         }
         return bridged_text, bridge_context, expert_context, channel_context, aux
+
+    def _focal_contexts(
+        self,
+        *,
+        bridged_text: torch.Tensor,
+        bridged_state: torch.Tensor,
+        slot_mask: torch.Tensor,
+        text_context: torch.Tensor,
+        state_context: torch.Tensor,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        batch = bridged_text.shape[0]
+        time_code = self.time_embed(t[:, None])[:, None, :]
+        state_mask = torch.ones(bridged_state.shape[:2], device=slot_mask.device, dtype=slot_mask.dtype)
+        memory_mask = torch.cat([slot_mask, state_mask], dim=1)
+        memory = self.focal_memory_norm(torch.cat([bridged_text, bridged_state], dim=1))
+
+        channel_query = self.channel_queries[None].expand(batch, -1, -1)
+        channel_query = channel_query + self.channel_embed.weight[None].to(dtype=bridged_text.dtype) + time_code
+        expert_query = self.expert_queries[None].expand(batch, -1, -1) + time_code
+        scale_query = self.scale_queries[None].expand(batch, -1, -1)
+        scale_query = scale_query + self.spectral_embed.weight[None].to(dtype=bridged_text.dtype) + time_code
+        stage_weight = torch.softmax(self.stage_selector(t[:, None].to(bridged_text.dtype)), dim=-1)
+        stage_query = torch.matmul(stage_weight[:, None, :], self.stage_queries[None].expand(batch, -1, -1)) + time_code
+
+        channel_raw, channel_attn = self.focal_attn(self.focal_query_norm(channel_query), memory, memory_mask, t)
+        expert_raw, expert_attn = self.focal_attn(self.focal_query_norm(expert_query), memory, memory_mask, t)
+        scale_raw, scale_attn = self.focal_attn(self.focal_query_norm(scale_query), memory, memory_mask, t)
+        stage_raw, stage_attn = self.focal_attn(self.focal_query_norm(stage_query), memory, memory_mask, t)
+
+        channel_context = self.channel_context_norm(channel_query + channel_raw)
+        scale_context = self.scale_context_norm(scale_query + scale_raw)
+        stage_context = self.stage_context_norm(stage_query + stage_raw).squeeze(1)
+        scale_summary = scale_context.mean(dim=1)
+        expert_context = self.expert_context_norm(expert_query + expert_raw + stage_context[:, None, :] + scale_summary[:, None, :])
+        gate = self.context_gate(torch.cat([text_context, state_context], dim=-1))
+        bridge_context = self.context_norm(text_context + gate * state_context + 0.25 * stage_context + 0.25 * scale_summary)
+
+        _, _, channel_h_norm = _attention_summary(channel_attn, key_mask=memory_mask)
+        _, _, expert_h_norm = _attention_summary(expert_attn, key_mask=memory_mask)
+        _, _, scale_h_norm = _attention_summary(scale_attn, key_mask=memory_mask)
+        _, _, stage_h_norm = _attention_summary(stage_attn, key_mask=memory_mask)
+        aux = {
+            "bridge_focal_channel_entropy_norm": channel_h_norm.detach(),
+            "bridge_focal_expert_entropy_norm": expert_h_norm.detach(),
+            "bridge_focal_scale_entropy_norm": scale_h_norm.detach(),
+            "bridge_focal_stage_entropy_norm": stage_h_norm.detach(),
+            "bridge_scale_context_norm": scale_context.detach().norm(dim=-1).mean(),
+            "bridge_stage_context_norm": stage_context.detach().norm(dim=-1).mean(),
+            "bridge_memory_token_count": memory_mask.detach().sum(dim=1).mean(),
+        }
+        return bridge_context, expert_context, channel_context, aux
 
     def _build_state_tokens(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         batch, length, channels = x_t.shape

@@ -105,12 +105,32 @@ class HFTextEncoder(nn.Module):
 
 
 class CLIPTextProjectionEncoder(nn.Module):
-    """Frozen CLIP/LongCLIP text encoder using projected text embeddings."""
+    """Frozen CLIP/LongCLIP text encoder.
 
-    def __init__(self, model_name: str, d_model: int, *, local_files_only: bool = False) -> None:
+    ``output_type='pooled'`` preserves the old behavior: one projected text
+    embedding per caption slot. ``output_type='tokens'`` returns token-level
+    hidden states packed per sample, which gives downstream cross-modal
+    modules real semantic tokens to attend over.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        d_model: int,
+        *,
+        local_files_only: bool = False,
+        output_type: str = "pooled",
+        max_output_tokens: int = 128,
+    ) -> None:
         super().__init__()
         from transformers import AutoTokenizer, CLIPTextConfig, CLIPTextModelWithProjection
 
+        self.output_type = str(output_type).lower()
+        if self.output_type not in {"pooled", "tokens"}:
+            raise ValueError(f"CLIPTextProjectionEncoder output_type must be 'pooled' or 'tokens', got {output_type!r}")
+        self.max_output_tokens = int(max_output_tokens)
+        if self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
         model_key = str(model_name)
         if "longclip" in model_key.lower():
             clip_config = CLIPTextConfig.from_pretrained(model_name, local_files_only=local_files_only)
@@ -126,7 +146,10 @@ class CLIPTextProjectionEncoder(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
         self.backbone.eval()
-        hidden_size = int(getattr(self.backbone.config, "projection_dim", self.backbone.config.hidden_size))
+        if self.output_type == "tokens":
+            hidden_size = int(self.backbone.config.hidden_size)
+        else:
+            hidden_size = int(getattr(self.backbone.config, "projection_dim", self.backbone.config.hidden_size))
         self.max_length = int(getattr(self.backbone.config, "max_position_embeddings", 77))
         self.proj = nn.Linear(hidden_size, d_model)
 
@@ -149,7 +172,17 @@ class CLIPTextProjectionEncoder(nn.Module):
 
         input_ids, attention_mask, owners = self._tokenize_chunks(flat, device)
         with torch.no_grad():
-            chunk_emb = self.backbone(input_ids=input_ids, attention_mask=attention_mask).text_embeds
+            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        if self.output_type == "tokens":
+            return self._pack_token_outputs(
+                last_hidden=out.last_hidden_state,
+                attention_mask=attention_mask,
+                owners=owners,
+                offsets=offsets,
+                batch_size=len(slots),
+            )
+
+        chunk_emb = out.text_embeds
         raw = torch.zeros(len(flat), chunk_emb.shape[-1], device=device, dtype=chunk_emb.dtype)
         counts = torch.zeros(len(flat), 1, device=device, dtype=chunk_emb.dtype)
         raw.index_add_(0, owners, chunk_emb)
@@ -163,6 +196,47 @@ class CLIPTextProjectionEncoder(nn.Module):
                 width = end - start
                 z[row, :width] = emb[start:end]
                 mask[row, :width] = 1.0
+        return z, mask
+
+    def _pack_token_outputs(
+        self,
+        *,
+        last_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        owners: torch.Tensor,
+        offsets: list[tuple[int, int]],
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        projected = self.proj(last_hidden)
+        per_text: list[torch.Tensor] = []
+        empty = projected.new_zeros((0, projected.shape[-1]))
+        flat_count = max((end for _, end in offsets), default=0)
+        for flat_idx in range(flat_count):
+            chunks = torch.nonzero(owners == flat_idx, as_tuple=False).flatten()
+            pieces = []
+            for chunk_idx in chunks.tolist():
+                valid = attention_mask[chunk_idx].to(dtype=torch.bool)
+                if valid.any():
+                    pieces.append(projected[chunk_idx, valid])
+            per_text.append(torch.cat(pieces, dim=0) if pieces else empty)
+
+        rows: list[torch.Tensor] = []
+        max_len = 1
+        for start, end in offsets:
+            pieces = [per_text[idx] for idx in range(start, end) if idx < len(per_text) and per_text[idx].numel() > 0]
+            row = torch.cat(pieces, dim=0) if pieces else empty
+            if row.shape[0] > self.max_output_tokens:
+                row = row[: self.max_output_tokens]
+            rows.append(row)
+            max_len = max(max_len, int(row.shape[0]))
+        max_len = min(max_len, self.max_output_tokens)
+        z = projected.new_zeros((batch_size, max_len, projected.shape[-1]))
+        mask = projected.new_zeros((batch_size, max_len))
+        for row_idx, row in enumerate(rows):
+            width = min(int(row.shape[0]), max_len)
+            if width > 0:
+                z[row_idx, :width] = row[:width]
+                mask[row_idx, :width] = 1.0
         return z, mask
 
     def _tokenize_chunks(self, texts: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -239,6 +313,8 @@ def build_text_encoder(config: dict[str, Any], d_model: int) -> nn.Module:
                 model_name=model_name,
                 d_model=d_model,
                 local_files_only=local_files_only,
+                output_type=str(config.get("output_type", "pooled")),
+                max_output_tokens=int(config.get("max_output_tokens", 128)),
             )
         except Exception as exc:
             fallback_mode = str(config.get("fallback_mode", "error")).lower()

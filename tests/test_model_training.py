@@ -454,6 +454,37 @@ def test_cross_modal_bridge_forward_shapes_and_mask():
     assert aux["bridge_text_to_state_entropy"].requires_grad is False
 
 
+def test_cross_modal_bridge_latent_query_focal_shapes():
+    bridge = CrossModalConditionBridge(
+        d_model=16,
+        num_channels=4,
+        sequence_length=12,
+        num_experts=3,
+        patch_size=4,
+        num_heads=4,
+        num_spectral_tokens=3,
+        focal_mode="latent_query",
+        num_stage_tokens=3,
+    )
+    slot_tokens = torch.randn(2, 7, 16)
+    slot_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+    x_t = torch.randn(2, 12, 4)
+    bridged_tokens, bridge_context, expert_context, channel_context, aux = bridge(
+        slot_tokens=slot_tokens,
+        slot_mask=slot_mask,
+        x_t=x_t,
+        t=torch.rand(2),
+    )
+    assert bridged_tokens.shape == (2, 7, 16)
+    assert bridge_context.shape == (2, 16)
+    assert expert_context.shape == (2, 3, 16)
+    assert channel_context.shape == (2, 4, 16)
+    assert "bridge_focal_channel_entropy_norm" in aux
+    assert "bridge_scale_context_norm" in aux
+    assert "bridge_stage_context_norm" in aux
+    assert torch.isfinite(bridge_context).all()
+
+
 # ---------------------------------------------------------------------------
 # V6.1 Latent Regime Adapter + Global Operator Gate tests
 # ---------------------------------------------------------------------------
@@ -627,6 +658,8 @@ def test_build_model_passes_cross_modal_bridge_config():
             "bridge_num_heads": 2,
             "bridge_patch_size": 5,
             "bridge_num_spectral_tokens": 2,
+            "bridge_focal_mode": "latent_query",
+            "bridge_num_stage_tokens": 4,
             "operator_multiview_context": True,
             "router_mode": "global_operator",
         }
@@ -635,6 +668,8 @@ def test_build_model_passes_cross_modal_bridge_config():
     assert model.cross_modal_bridge is not None
     assert model.cross_modal_bridge.patch_size == 5
     assert model.cross_modal_bridge.num_spectral_tokens == 2
+    assert model.cross_modal_bridge.focal_mode == "latent_query"
+    assert model.cross_modal_bridge.num_stage_tokens == 4
     assert model.operator_bank.multiview_context is True
 
 
@@ -655,6 +690,7 @@ def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
         operator_multiview_context=True,
         router_mode="global_operator",
         use_cross_modal_bridge=True,
+        bridge_focal_mode="latent_query",
         bridge_num_heads=4,
         bridge_patch_size=5,
     )
@@ -670,6 +706,26 @@ def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
     assert "channel_context_norm" in aux["operator_aux"]
     assert "expert_time_context_norm" in aux["operator_aux"]
     assert "A_o" in aux
+
+
+def test_text2ts_flow_with_latent_query_bridge_train_step():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "operator_multiview_context": True,
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+            "bridge_focal_mode": "latent_query",
+            "bridge_num_stage_tokens": 3,
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", task_mode="text2ts")
+    assert torch.isfinite(result["loss"])
+    assert "bridge_focal_channel_entropy_norm" in result
+    assert "bridge_memory_token_count" in result
 
 
 def test_text2ts_flow_regime_adapter_only():

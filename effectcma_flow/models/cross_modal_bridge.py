@@ -144,10 +144,14 @@ class CrossModalConditionBridge(nn.Module):
         expert_context = expert_context.view(batch, self.num_experts, self.d_model)
 
         alignment_loss, alignment_aux = self._alignment_loss(text_context, state_context)
-        text_entropy, text_max, text_entropy_norm = _attention_summary(text_attn)
-        state_entropy, state_max, state_entropy_norm = _attention_summary(state_attn)
+        valid_slot_count = slot_mask.sum(dim=1)
+        text_entropy, text_max, text_entropy_norm = _attention_summary(text_attn, query_mask=slot_mask)
+        state_entropy, state_max, state_entropy_norm = _attention_summary(state_attn, key_mask=slot_mask)
         aux = {
             "bridge_alignment_loss": alignment_loss,
+            "text_slot_count": valid_slot_count.detach().mean(),
+            "text_slot_count_min": valid_slot_count.detach().min(),
+            "text_slot_count_max": valid_slot_count.detach().max(),
             "bridge_text_to_state_entropy": text_entropy.detach(),
             "bridge_text_to_state_entropy_norm": text_entropy_norm.detach(),
             "bridge_text_to_state_max_prob": text_max.detach(),
@@ -259,11 +263,51 @@ def _safe_key_padding_mask(mask: torch.Tensor) -> torch.Tensor:
     return ~safe_valid
 
 
-def _attention_summary(attn: torch.Tensor, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _attention_summary(
+    attn: torch.Tensor,
+    *,
+    query_mask: torch.Tensor | None = None,
+    key_mask: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # attn: [B, heads, query_tokens, key_tokens]
-    prob = attn.clamp_min(eps)
-    entropy = -(prob * prob.log()).sum(dim=-1).mean()
-    max_prob = prob.max(dim=-1).values.mean()
-    key_count = max(int(prob.shape[-1]), 2)
-    entropy_norm = entropy / math.log(float(key_count))
+    prob = attn.detach()
+    batch, heads, queries, keys = prob.shape
+    dtype = prob.dtype
+    device = prob.device
+    if key_mask is not None:
+        key_mask = key_mask.to(device=device, dtype=dtype)
+        if key_mask.shape != (batch, keys):
+            raise ValueError(f"key_mask must have shape {(batch, keys)}, got {tuple(key_mask.shape)}")
+        key_weight = key_mask[:, None, None, :]
+        prob_for_entropy = prob * key_weight
+        valid_key_count = key_mask.sum(dim=-1).clamp_min(2.0)
+        norm_denom = valid_key_count.log()[:, None, None]
+    else:
+        key_weight = None
+        prob_for_entropy = prob
+        norm_denom = torch.full((batch, 1, 1), math.log(float(max(keys, 2))), device=device, dtype=dtype)
+
+    p = prob_for_entropy.clamp_min(eps)
+    entropy_per_query = -(p * p.log()).sum(dim=-1)
+    if key_weight is not None:
+        entropy_per_query = entropy_per_query * (key_mask.sum(dim=-1) > 0).to(dtype)[:, None, None]
+        max_per_query = (prob * key_weight).max(dim=-1).values
+    else:
+        max_per_query = prob.max(dim=-1).values
+    entropy_norm_per_query = entropy_per_query / norm_denom.clamp_min(eps)
+
+    if query_mask is not None:
+        query_mask = query_mask.to(device=device, dtype=dtype)
+        if query_mask.shape != (batch, queries):
+            raise ValueError(f"query_mask must have shape {(batch, queries)}, got {tuple(query_mask.shape)}")
+        query_weight = query_mask[:, None, :]
+        denom = (query_weight.sum() * float(heads)).clamp_min(1.0)
+        entropy = (entropy_per_query * query_weight).sum() / denom
+        max_prob = (max_per_query * query_weight).sum() / denom
+        entropy_norm = (entropy_norm_per_query * query_weight).sum() / denom
+    else:
+        entropy = entropy_per_query.mean()
+        max_prob = max_per_query.mean()
+        entropy_norm = entropy_norm_per_query.mean()
     return entropy, max_prob, entropy_norm

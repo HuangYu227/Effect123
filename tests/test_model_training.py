@@ -761,6 +761,38 @@ def test_v62_train_step_includes_bridge_alignment_loss():
     assert torch.allclose(result["loss"], expected, atol=1e-6)
 
 
+def test_v62_candidates_slots_reach_bridge_diagnostics():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    batch["caption_candidates"] = [
+        [f"weather caption {idx} candidate {slot}" for slot in range(6)]
+        for idx in range(2)
+    ]
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        caption_slot_strategy="candidates",
+        max_caption_slots=4,
+        include_all_caption_candidates=True,
+    )
+    assert torch.isfinite(result["loss"])
+    assert torch.allclose(result["text_slot_count"], torch.tensor(4.0))
+    assert result["text_slot_count_min"].item() == 4.0
+    assert result["text_slot_count_max"].item() == 4.0
+    assert result["bridge_state_to_text_entropy"].item() > 0.0
+
+
 def test_v61_uniform_regime_train_step_exposes_uniform_diagnostics():
     encoder = CountingTextEncoder(d_model=16)
     model = TextToTSFlow(

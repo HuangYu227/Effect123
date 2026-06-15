@@ -146,12 +146,10 @@ def run_train(cfg: dict) -> None:
         epoch += 1
         for batch in train_loader:
             model.train()
-            if blank_captions and "caption" in batch:
-                batch["caption"] = [""] * len(batch["caption"])
-            elif caption_shuffle and "caption" in batch:
-                caps = list(batch["caption"])
-                _random.shuffle(caps)
-                batch["caption"] = caps
+            if blank_captions:
+                batch = _blank_caption_fields(batch)
+            elif caption_shuffle:
+                batch = _shuffle_caption_fields(batch, rng=_random)
             out = cfm_train_step(
                 model,
                 batch,
@@ -205,6 +203,9 @@ def run_train(cfg: dict) -> None:
                 bridge_align = _scalar(out, "loss_bridge_alignment")
                 if bridge_align > 0.0:
                     postfix["bAlign"] = f"{bridge_align:.4f}"
+                text_slot_count = _scalar(out, "text_slot_count")
+                if text_slot_count == text_slot_count:
+                    postfix["txtJ"] = f"{text_slot_count:.1f}"
                 bridge_t2s = _scalar(out, "bridge_text_to_state_entropy_norm")
                 if bridge_t2s == bridge_t2s:
                     postfix["bT2S"] = f"{bridge_t2s:.2f}"
@@ -357,6 +358,9 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "operator_gate_entropy_norm",
         "operator_gate_max_prob",
         "bridge_alignment_loss",
+        "text_slot_count",
+        "text_slot_count_min",
+        "text_slot_count_max",
         "bridge_text_to_state_entropy",
         "bridge_text_to_state_entropy_norm",
         "bridge_text_to_state_max_prob",
@@ -413,6 +417,32 @@ def _usage_summary(value) -> str | None:
     if flat.numel() > 8:
         flat = flat[:8]
     return "/".join(f"{float(v):.2f}" for v in flat)
+
+
+def _blank_caption_fields(batch: dict) -> dict:
+    if "caption" not in batch:
+        return batch
+    out = dict(batch)
+    out["caption"] = [""] * len(batch["caption"])
+    if "caption_candidates" in batch and batch["caption_candidates"] is not None:
+        out["caption_candidates"] = [[] for _ in batch["caption"]]
+    if "captions" in batch and batch["captions"] is not None:
+        out["captions"] = [[] for _ in batch["caption"]]
+    return out
+
+
+def _shuffle_caption_fields(batch: dict, *, rng) -> dict:
+    if "caption" not in batch:
+        return batch
+    indices = list(range(len(batch["caption"])))
+    rng.shuffle(indices)
+    out = dict(batch)
+    out["caption"] = [batch["caption"][idx] for idx in indices]
+    if "caption_candidates" in batch and batch["caption_candidates"] is not None:
+        out["caption_candidates"] = [batch["caption_candidates"][idx] for idx in indices]
+    if "captions" in batch and batch["captions"] is not None:
+        out["captions"] = [batch["captions"][idx] for idx in indices]
+    return out
 
 
 def _add_usage_summary(out: dict[str, float], aux: dict[str, torch.Tensor], key: str) -> None:

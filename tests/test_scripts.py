@@ -4,8 +4,16 @@ import pytest
 import torch
 
 from effectcma_flow.training.checkpoint import checkpoint_eval_config, checkpoint_stats_or_none, validate_checkpoint_payload
+from scripts.eval_verbalts_metrics import (
+    _blank_caption_fields as eval_blank_caption_fields,
+    _shuffle_caption_fields as eval_shuffle_caption_fields,
+)
 from scripts.eval_weather import run_eval
 from scripts.sample_weather import run_sample
+from scripts.train_weather import (
+    _blank_caption_fields as train_blank_caption_fields,
+    _shuffle_caption_fields as train_shuffle_caption_fields,
+)
 
 
 def _cfg(fake_weather_root):
@@ -127,3 +135,30 @@ def test_checkpoint_payload_requires_task_mode(fake_weather_root):
     }
     with pytest.raises(ValueError, match="task_mode"):
         validate_checkpoint_payload(payload)
+
+
+class _ReverseShuffle:
+    def shuffle(self, values):
+        values.reverse()
+
+
+def test_caption_shuffle_keeps_candidates_with_caption():
+    batch = {
+        "caption": ["caption a", "caption b"],
+        "caption_candidates": [["caption a", "a alt"], ["caption b", "b alt"]],
+    }
+    for fn in (eval_shuffle_caption_fields, train_shuffle_caption_fields):
+        shuffled = fn(batch, rng=_ReverseShuffle())
+        assert shuffled["caption"] == ["caption b", "caption a"]
+        assert shuffled["caption_candidates"] == [["caption b", "b alt"], ["caption a", "a alt"]]
+
+
+def test_caption_blank_removes_candidate_leakage():
+    batch = {
+        "caption": ["caption a", "caption b"],
+        "caption_candidates": [["caption a", "a alt"], ["caption b", "b alt"]],
+    }
+    for fn in (eval_blank_caption_fields, train_blank_caption_fields):
+        blanked = fn(batch)
+        assert blanked["caption"] == ["", ""]
+        assert blanked["caption_candidates"] == [[], []]

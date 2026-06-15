@@ -225,16 +225,40 @@ class _CaptionTransformLoader:
     def __iter__(self):
         import random as _random
         for batch in self._loader:
-            if self._blank and "caption" in batch:
-                batch["caption"] = [""] * len(batch["caption"])
-            elif self._shuffle and "caption" in batch:
-                caps = list(batch["caption"])
-                _random.shuffle(caps)
-                batch["caption"] = caps
+            if self._blank:
+                batch = _blank_caption_fields(batch)
+            elif self._shuffle:
+                batch = _shuffle_caption_fields(batch, rng=_random)
             yield batch
 
     def __len__(self):
         return len(self._loader)
+
+
+def _blank_caption_fields(batch: dict) -> dict:
+    if "caption" not in batch:
+        return batch
+    out = dict(batch)
+    out["caption"] = [""] * len(batch["caption"])
+    if "caption_candidates" in batch and batch["caption_candidates"] is not None:
+        out["caption_candidates"] = [[] for _ in batch["caption"]]
+    if "captions" in batch and batch["captions"] is not None:
+        out["captions"] = [[] for _ in batch["caption"]]
+    return out
+
+
+def _shuffle_caption_fields(batch: dict, *, rng) -> dict:
+    if "caption" not in batch:
+        return batch
+    indices = list(range(len(batch["caption"])))
+    rng.shuffle(indices)
+    out = dict(batch)
+    out["caption"] = [batch["caption"][idx] for idx in indices]
+    if "caption_candidates" in batch and batch["caption_candidates"] is not None:
+        out["caption_candidates"] = [batch["caption_candidates"][idx] for idx in indices]
+    if "captions" in batch and batch["captions"] is not None:
+        out["captions"] = [batch["captions"][idx] for idx in indices]
+    return out
 
 
 if __name__ == "__main__":

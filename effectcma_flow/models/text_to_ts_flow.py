@@ -63,6 +63,7 @@ class TextToTSFlow(nn.Module):
         mapper_flow_time_condition: bool = True,
         operator_context_film: bool = True,
         operator_context_mode: str = "global",
+        operator_multiview_context: bool = False,
         operator_norm: str = "group",
         operator_architecture: str = "homogeneous",
         operator_channel_heads: int = 4,
@@ -178,6 +179,7 @@ class TextToTSFlow(nn.Module):
             context_dim=d_model,
             context_film=operator_context_film,
             context_mode=operator_context_mode,
+            multiview_context=operator_multiview_context,
             norm_type=operator_norm,
             architecture=operator_architecture,
             channel_heads=operator_channel_heads,
@@ -254,9 +256,11 @@ class TextToTSFlow(nn.Module):
 
         bridge_aux: dict[str, torch.Tensor] = {}
         expert_context: torch.Tensor | None = None
+        channel_context: torch.Tensor | None = None
         if self.cross_modal_bridge is not None:
-            # slot_tokens: [B,J,D], x_t: [B,L,C], expert_context: [B,K,D].
-            slot_tokens, text_context, expert_context, bridge_aux = self.cross_modal_bridge(
+            # slot_tokens: [B,J,D], x_t: [B,L,C],
+            # expert_context: [B,K,D], channel_context: [B,C,D].
+            slot_tokens, text_context, expert_context, channel_context, bridge_aux = self.cross_modal_bridge(
                 slot_tokens=slot_tokens,
                 slot_mask=slot_mask,
                 x_t=x_t,
@@ -274,9 +278,17 @@ class TextToTSFlow(nn.Module):
                 text_context=text_context,
             )
 
+        bank_channel_context = channel_context if getattr(self.operator_bank, "multiview_context", False) else None
         if self._use_global_gate:
             # --- V6.1 global operator gate path ---
-            velocities = self.operator_bank(x_t, None, t, context=text_context, expert_context=expert_context)
+            velocities = self.operator_bank(
+                x_t,
+                None,
+                t,
+                context=text_context,
+                expert_context=expert_context,
+                channel_context=bank_channel_context,
+            )
             _gate, g, gate_aux = self.global_operator_gate(
                 x_t=x_t,
                 t=t,
@@ -305,7 +317,14 @@ class TextToTSFlow(nn.Module):
             if g.shape[1] < self.sequence_length:
                 raise RuntimeError(f"Expanded generation field length {g.shape[1]} is shorter than {self.sequence_length}")
             g = g[:, : self.sequence_length]
-            velocities = self.operator_bank(x_t, None, t, context=text_context, expert_context=expert_context)
+            velocities = self.operator_bank(
+                x_t,
+                None,
+                t,
+                context=text_context,
+                expert_context=expert_context,
+                channel_context=bank_channel_context,
+            )
             v_hat = (g * velocities).sum(dim=-1)
             aux = {
                 **aux,

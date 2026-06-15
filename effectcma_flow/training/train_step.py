@@ -222,6 +222,7 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "bridge_text_context_norm",
         "bridge_state_context_norm",
         "bridge_expert_context_norm",
+        "bridge_channel_context_norm",
         "bridge_alignment_logit_pos",
         "bridge_alignment_logit_std",
     ]:

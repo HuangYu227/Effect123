@@ -395,6 +395,34 @@ def test_structural_operator_bank_accepts_expert_context():
     assert torch.isfinite(out).all()
 
 
+def test_structural_operator_bank_accepts_multiview_context():
+    bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+        multiview_context=True,
+    )
+    x_t = torch.randn(2, 12, 4)
+    context = torch.randn(2, 16)
+    expert_context = torch.randn(2, 3, 16)
+    channel_context = torch.randn(2, 4, 16)
+    out = bank(
+        x_t,
+        None,
+        torch.rand(2),
+        context=context,
+        expert_context=expert_context,
+        channel_context=channel_context,
+    )
+    assert out.shape == (2, 12, 4, 3)
+    assert "expert_time_context_norm" in bank.last_aux
+    assert "channel_context_norm" in bank.last_aux
+    assert torch.isfinite(out).all()
+
+
 def test_cross_modal_bridge_forward_shapes_and_mask():
     bridge = CrossModalConditionBridge(
         d_model=16,
@@ -408,7 +436,7 @@ def test_cross_modal_bridge_forward_shapes_and_mask():
     slot_tokens = torch.randn(2, 3, 16)
     slot_mask = torch.tensor([[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
     x_t = torch.randn(2, 12, 4)
-    bridged_tokens, bridge_context, expert_context, aux = bridge(
+    bridged_tokens, bridge_context, expert_context, channel_context, aux = bridge(
         slot_tokens=slot_tokens,
         slot_mask=slot_mask,
         x_t=x_t,
@@ -417,9 +445,11 @@ def test_cross_modal_bridge_forward_shapes_and_mask():
     assert bridged_tokens.shape == (2, 3, 16)
     assert bridge_context.shape == (2, 16)
     assert expert_context.shape == (2, 3, 16)
+    assert channel_context.shape == (2, 4, 16)
     assert torch.allclose(bridged_tokens[0, 2], torch.zeros_like(bridged_tokens[0, 2]), atol=1e-6)
     assert torch.allclose(bridged_tokens[1], torch.zeros_like(bridged_tokens[1]), atol=1e-6)
     assert "bridge_alignment_loss" in aux
+    assert "bridge_channel_context_norm" in aux
     assert torch.isfinite(aux["bridge_alignment_loss"])
     assert aux["bridge_text_to_state_entropy"].requires_grad is False
 
@@ -597,6 +627,7 @@ def test_build_model_passes_cross_modal_bridge_config():
             "bridge_num_heads": 2,
             "bridge_patch_size": 5,
             "bridge_num_spectral_tokens": 2,
+            "operator_multiview_context": True,
             "router_mode": "global_operator",
         }
     )
@@ -604,6 +635,7 @@ def test_build_model_passes_cross_modal_bridge_config():
     assert model.cross_modal_bridge is not None
     assert model.cross_modal_bridge.patch_size == 5
     assert model.cross_modal_bridge.num_spectral_tokens == 2
+    assert model.operator_bank.multiview_context is True
 
 
 def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
@@ -620,6 +652,7 @@ def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
         operator_hidden=8,
         operator_t_dim=4,
         operator_architecture="structural",
+        operator_multiview_context=True,
         router_mode="global_operator",
         use_cross_modal_bridge=True,
         bridge_num_heads=4,
@@ -634,6 +667,8 @@ def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
     assert "bridge_text_to_state_entropy" in aux
     assert "operator_aux" in aux
     assert "expert_context_norm" in aux["operator_aux"]
+    assert "channel_context_norm" in aux["operator_aux"]
+    assert "expert_time_context_norm" in aux["operator_aux"]
     assert "A_o" in aux
 
 

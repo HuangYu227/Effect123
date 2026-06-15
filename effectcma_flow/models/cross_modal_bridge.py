@@ -87,7 +87,7 @@ class CrossModalConditionBridge(nn.Module):
         slot_mask: torch.Tensor,
         x_t: torch.Tensor,
         t: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if slot_tokens.ndim != 3:
             raise ValueError(f"slot_tokens must be [B,J,D], got {tuple(slot_tokens.shape)}")
         if x_t.ndim != 3:
@@ -137,6 +137,14 @@ class CrossModalConditionBridge(nn.Module):
         bridged_state = bridged_state + self.state_ffn(bridged_state)
 
         text_context = _masked_mean(bridged_text, slot_mask)
+        time_token_count = _num_patch_tokens(length, self.patch_size)
+        channel_context = bridged_state[:, time_token_count : time_token_count + channels]
+        if channel_context.shape != (batch, channels, self.d_model):
+            raise RuntimeError(
+                f"internal channel_context shape {tuple(channel_context.shape)} "
+                f"must be {(batch, channels, self.d_model)}"
+            )
+
         state_context = self.state_to_context(bridged_state.mean(dim=1))
         gate = self.context_gate(torch.cat([text_context, state_context], dim=-1))
         bridge_context = self.context_norm(text_context + gate * state_context)
@@ -162,9 +170,10 @@ class CrossModalConditionBridge(nn.Module):
             "bridge_text_context_norm": text_context.detach().norm(dim=-1).mean(),
             "bridge_state_context_norm": state_context.detach().norm(dim=-1).mean(),
             "bridge_expert_context_norm": expert_context.detach().norm(dim=-1).mean(),
+            "bridge_channel_context_norm": channel_context.detach().norm(dim=-1).mean(),
             **alignment_aux,
         }
-        return bridged_text, bridge_context, expert_context, aux
+        return bridged_text, bridge_context, expert_context, channel_context, aux
 
     def _build_state_tokens(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         batch, length, channels = x_t.shape
@@ -261,6 +270,11 @@ def _safe_key_padding_mask(mask: torch.Tensor) -> torch.Tensor:
     if empty.any():
         safe_valid[empty, 0] = True
     return ~safe_valid
+
+
+def _num_patch_tokens(length: int, patch_size: int) -> int:
+    effective = min(int(patch_size), int(length))
+    return int(math.ceil(float(length) / float(max(effective, 1))))
 
 
 def _attention_summary(

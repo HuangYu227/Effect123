@@ -14,7 +14,7 @@ _V61_KEYS = frozenset({
 })
 _V62_KEYS = frozenset({
     "use_cross_modal_bridge", "bridge_num_heads", "bridge_dropout", "bridge_patch_size",
-    "bridge_num_spectral_tokens", "bridge_alignment_temperature",
+    "bridge_num_spectral_tokens", "bridge_alignment_temperature", "operator_multiview_context",
 })
 
 
@@ -61,6 +61,7 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         mapper_flow_time_condition=bool(model_cfg.get("mapper_flow_time_condition", True)),
         operator_context_film=bool(model_cfg.get("operator_context_film", True)),
         operator_context_mode=str(model_cfg.get("operator_context_mode", "global")),
+        operator_multiview_context=bool(model_cfg.get("operator_multiview_context", False)),
         operator_norm=str(model_cfg.get("operator_norm", "group")),
         operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
         operator_channel_heads=int(model_cfg.get("operator_channel_heads", 4)),

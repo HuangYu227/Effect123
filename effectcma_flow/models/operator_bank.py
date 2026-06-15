@@ -242,6 +242,7 @@ class ResidualOperatorBank(nn.Module):
         context_dim: int | None = None,
         context_film: bool = True,
         context_mode: str = "global",
+        multiview_context: bool = False,
         norm_type: str = "group",
         architecture: str = "homogeneous",
         channel_heads: int = 4,
@@ -250,6 +251,7 @@ class ResidualOperatorBank(nn.Module):
         self.num_channels = int(num_channels)
         self.num_operators = int(num_operators)
         self.hidden = int(hidden)
+        self.t_dim = int(t_dim)
         self.max_velocity = float(max_velocity)
         self.architecture = str(architecture).lower()
         if self.architecture not in {"homogeneous", "structural"}:
@@ -263,6 +265,7 @@ class ResidualOperatorBank(nn.Module):
         self.context_mode = str(context_mode).lower()
         if self.context_mode not in {"global", "none"}:
             raise ValueError(f"context_mode must be 'global' or 'none', got {context_mode!r}")
+        self.multiview_context = bool(multiview_context)
         self.t_embed = nn.Sequential(
             nn.Linear(1, t_dim),
             nn.SiLU(),
@@ -283,6 +286,15 @@ class ResidualOperatorBank(nn.Module):
             else None
         )
         self.expert_context_scale = nn.Parameter(torch.full((self.num_operators,), 0.1)) if use_context else None
+        use_multiview = use_context and self.multiview_context
+        self.channel_context_proj = nn.Linear(int(context_dim), self.hidden) if use_multiview else None
+        self.channel_context_scale = nn.Parameter(torch.tensor(0.1)) if use_multiview else None
+        self.expert_t_proj = (
+            nn.ModuleList([nn.Linear(int(context_dim), self.t_dim) for _ in range(self.num_operators)])
+            if use_multiview
+            else None
+        )
+        self.expert_t_scale = nn.Parameter(torch.full((self.num_operators,), 0.1)) if use_multiview else None
         if self.context_film is not None:
             nn.init.zeros_(self.context_film.weight)
             nn.init.zeros_(self.context_film.bias)
@@ -340,6 +352,7 @@ class ResidualOperatorBank(nn.Module):
         t: torch.Tensor,
         context: torch.Tensor | None = None,
         expert_context: torch.Tensor | None = None,
+        channel_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if x_t.ndim != 3:
             raise ValueError(f"x_t must be [B, L, C], got {tuple(x_t.shape)}")
@@ -363,6 +376,15 @@ class ResidualOperatorBank(nn.Module):
             if expert_context.shape != expected:
                 raise ValueError(f"expert_context must have shape {expected}, got {tuple(expert_context.shape)}")
             expert_context = expert_context.to(device=x_t.device, dtype=x_t.dtype)
+        if channel_context is not None:
+            if self.channel_context_proj is None or self.context_proj is None:
+                raise ValueError(
+                    "channel_context was provided but this ResidualOperatorBank was created without multiview context"
+                )
+            expected_channel = (batch, channels, self.context_proj.in_features)
+            if channel_context.shape != expected_channel:
+                raise ValueError(f"channel_context must have shape {expected_channel}, got {tuple(channel_context.shape)}")
+            channel_context = channel_context.to(device=x_t.device, dtype=x_t.dtype)
         t_code = self.t_embed(t[:, None].to(x_t.dtype))
         t_emb = t_code[:, None, None, :].expand(batch, length, channels, -1)
         pos = torch.linspace(-1.0, 1.0, length, device=x_t.device, dtype=x_t.dtype)
@@ -385,6 +407,11 @@ class ResidualOperatorBank(nn.Module):
                 h = h * (1.0 + 0.1 * torch.tanh(gamma)[:, None, None, :]) + 0.1 * beta[:, None, None, :]
         elif self.context_proj is not None:
             h = h + self.context_proj.weight.new_zeros((batch, 1, 1, self.context_proj.out_features))
+        if channel_context is not None:
+            if self.channel_context_proj is None or self.channel_context_scale is None:
+                raise RuntimeError("channel_context projection is not initialized")
+            channel_delta = self.channel_context_proj(channel_context)[:, None, :, :]
+            h = h + self.channel_context_scale.to(device=h.device, dtype=h.dtype) * channel_delta
         if self.channel_mixer is not None:
             h = h + self.channel_mixer(h.permute(0, 1, 3, 2)).permute(0, 1, 3, 2)
         if self.architecture == "structural":
@@ -392,12 +419,17 @@ class ResidualOperatorBank(nn.Module):
             expert_aux: dict[str, torch.Tensor] = {}
             for idx, (name, expert) in enumerate(zip(self.operator_type_names, self.experts)):
                 expert_h = self._apply_expert_context(h, expert_context, idx)
-                out, one_aux = expert(expert_h, t_code)
+                expert_t_code = self._apply_expert_time_context(t_code, expert_context, idx)
+                out, one_aux = expert(expert_h, expert_t_code)
                 expert_outputs.append(out)
                 for key, value in one_aux.items():
                     expert_aux[f"{name}_{key}"] = value
             if expert_context is not None:
                 expert_aux["expert_context_norm"] = expert_context.detach().norm(dim=-1).mean()
+            if channel_context is not None:
+                expert_aux["channel_context_norm"] = channel_context.detach().norm(dim=-1).mean()
+            if expert_context is not None and self.expert_t_proj is not None:
+                expert_aux["expert_time_context_norm"] = expert_context.detach().norm(dim=-1).mean()
             velocities = torch.stack(expert_outputs, dim=-1)
             self.last_aux = expert_aux
             return torch.tanh(velocities) * self.max_velocity
@@ -416,6 +448,8 @@ class ResidualOperatorBank(nn.Module):
                 h2 = self.shared_temporal(h2)
                 expert_outputs.append(expert(h2).transpose(1, 2))
             self.last_aux = {"expert_context_norm": expert_context.detach().norm(dim=-1).mean()}
+            if channel_context is not None:
+                self.last_aux["channel_context_norm"] = channel_context.detach().norm(dim=-1).mean()
         velocities = torch.stack(expert_outputs, dim=-1)
         return torch.tanh(velocities) * self.max_velocity
 
@@ -427,6 +461,20 @@ class ResidualOperatorBank(nn.Module):
         delta = self.expert_context_proj[idx](expert_context[:, idx])[:, None, None, :]
         scale = self.expert_context_scale[idx].to(device=h.device, dtype=h.dtype)
         return h + scale * delta
+
+    def _apply_expert_time_context(
+        self,
+        t_code: torch.Tensor,
+        expert_context: torch.Tensor | None,
+        idx: int,
+    ) -> torch.Tensor:
+        if expert_context is None:
+            return t_code
+        if self.expert_t_proj is None or self.expert_t_scale is None:
+            return t_code
+        delta = self.expert_t_proj[idx](expert_context[:, idx])
+        scale = self.expert_t_scale[idx].to(device=t_code.device, dtype=t_code.dtype)
+        return t_code + scale * delta
 
 
 def _init_small_head(head: nn.Module) -> None:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
 from effectcma_flow.data.effects import EffectSpec, apply_effect
 from effectcma_flow.models.effect_mapper import EffectMapper
-from effectcma_flow.models.cross_modal_bridge import CrossModalConditionBridge
+from effectcma_flow.models.cross_modal_bridge import CrossModalConditionBridge, _balanced_sigmoid_contrastive_loss
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
 from effectcma_flow.models.build import build_model
 from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
@@ -485,6 +486,64 @@ def test_cross_modal_bridge_latent_query_focal_shapes():
     assert torch.isfinite(bridge_context).all()
 
 
+def test_cross_modal_bridge_patch_merger_connector_shapes_and_gradients():
+    bridge = CrossModalConditionBridge(
+        d_model=16,
+        num_channels=4,
+        sequence_length=13,
+        num_experts=3,
+        patch_size=4,
+        num_heads=4,
+        state_connector="patch_merger",
+        temporal_merge=3,
+        channel_merge=1,
+        token_budget=5,
+        alignment_mode="siglip",
+    )
+    slot_tokens = torch.randn(2, 6, 16, requires_grad=True)
+    slot_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+    x_t = torch.randn(2, 13, 4, requires_grad=True)
+    bridged_text, bridge_context, expert_context, channel_context, aux = bridge(
+        slot_tokens=slot_tokens,
+        slot_mask=slot_mask,
+        x_t=x_t,
+        t=torch.rand(2),
+    )
+    assert bridged_text.shape == (2, 6, 16)
+    assert bridge_context.shape == (2, 16)
+    assert expert_context.shape == (2, 3, 16)
+    assert channel_context.shape == (2, 4, 16)
+    assert "bridge_alignment_loss" in aux
+    assert "bridge_connector_patch_merger" in aux
+    assert aux["bridge_memory_token_count"].item() == 5.0
+    assert aux["bridge_patch_token_count"].item() == 20.0
+    assert torch.isnan(aux["bridge_text_to_state_entropy"])
+    assert torch.isnan(aux["bridge_state_to_text_entropy"])
+    loss = (
+        bridged_text.square().mean()
+        + bridge_context.square().mean()
+        + expert_context.square().mean()
+        + channel_context.square().mean()
+        + aux["bridge_alignment_loss"]
+    )
+    loss.backward()
+    connector = bridge.patch_merger_connector
+    assert connector is not None
+    assert connector.patch_merger_mlp[0].weight.grad is not None
+    assert torch.isfinite(connector.patch_merger_mlp[0].weight.grad).all()
+    assert slot_tokens.grad is not None and torch.isfinite(slot_tokens.grad).all()
+    assert x_t.grad is not None and torch.isfinite(x_t.grad).all()
+
+
+def test_balanced_sigmoid_contrastive_loss_does_not_dilute_positives():
+    for batch in (2, 8):
+        logits = torch.zeros(batch, batch)
+        logits.diagonal().fill_(1.0)
+        loss = _balanced_sigmoid_contrastive_loss(logits)
+        expected = 0.5 * (-torch.nn.functional.logsigmoid(torch.tensor(1.0)) - torch.nn.functional.logsigmoid(torch.tensor(0.0)))
+        assert torch.allclose(loss, expected, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # V6.1 Latent Regime Adapter + Global Operator Gate tests
 # ---------------------------------------------------------------------------
@@ -703,6 +762,78 @@ def test_build_model_passes_cross_modal_bridge_config():
     assert model.operator_bank.multiview_context is True
 
 
+def test_build_model_passes_patch_merger_bridge_config():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "operator_multiview_context": True,
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+            "bridge_state_connector": "patch_merger",
+            "bridge_temporal_merge": 3,
+            "bridge_channel_merge": 1,
+            "bridge_token_budget": 5,
+            "bridge_alignment_mode": "siglip",
+        }
+    )
+    model = build_model(cfg, sequence_length=13, num_channels=4)
+    assert model.cross_modal_bridge is not None
+    assert model.cross_modal_bridge.state_connector == "patch_merger"
+    connector = model.cross_modal_bridge.patch_merger_connector
+    assert connector is not None
+    assert connector.temporal_merge == 3
+    assert connector.channel_merge == 1
+    assert connector.token_budget == 5
+    assert connector.alignment_mode == "siglip"
+    # P2: the patch-merger connector owns the forward, so the legacy bridge body
+    # must NOT be built (no inert "built but bypassed" parameters).
+    assert model.cross_modal_bridge._has_legacy_body is False
+    assert not hasattr(model.cross_modal_bridge, "time_patch_proj")
+    assert not hasattr(model.cross_modal_bridge, "state_to_context")
+
+
+def test_legacy_bridge_still_builds_its_body():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+            "bridge_state_connector": "legacy",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    assert model.cross_modal_bridge._has_legacy_body is True
+    assert hasattr(model.cross_modal_bridge, "time_patch_proj")
+    assert model.cross_modal_bridge.patch_merger_connector is None
+
+
+def test_budget_pool_active_flag_reports_correctly():
+    """bridge_budget_pool_active must be 1.0 only when patch tokens exceed budget."""
+    base = {
+        "operator_architecture": "structural",
+        "router_mode": "global_operator",
+        "use_cross_modal_bridge": True,
+        "bridge_state_connector": "patch_merger",
+        "bridge_temporal_merge": 2,
+        "bridge_channel_merge": 1,
+    }
+    # length 12, temporal_merge 2, channels 4 -> 6*4 = 24 patch tokens.
+    fires_cfg = _text2ts_config()
+    fires_cfg["model"].update({**base, "bridge_token_budget": 8})
+    model = build_model(fires_cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    out = cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", task_mode="text2ts")
+    assert out["bridge_patch_token_count"].item() == 24.0
+    assert out["bridge_budget_pool_active"].item() == 1.0
+
+    inert_cfg = _text2ts_config()
+    inert_cfg["model"].update({**base, "bridge_token_budget": 96})
+    model2 = build_model(inert_cfg, sequence_length=12, num_channels=4)
+    out2 = cfm_train_step(model2, batch, optimizer=None, text_encoder_mode="hash", task_mode="text2ts")
+    assert out2["bridge_budget_pool_active"].item() == 0.0
+
+
 def test_text2ts_flow_with_cross_modal_bridge_and_global_gate():
     encoder = CountingTextEncoder(d_model=16)
     model = TextToTSFlow(
@@ -758,6 +889,38 @@ def test_text2ts_flow_with_latent_query_bridge_train_step():
     assert "bridge_focal_channel_entropy_norm" in result
     assert "bridge_memory_token_count" in result
     assert "operator_gate_attention_entropy_norm" in result
+
+
+def test_text2ts_flow_with_patch_merger_bridge_train_step():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "operator_multiview_context": True,
+            "router_mode": "global_operator",
+            "operator_gate_router": "attention",
+            "use_cross_modal_bridge": True,
+            "bridge_state_connector": "patch_merger",
+            "bridge_temporal_merge": 3,
+            "bridge_token_budget": 5,
+            "bridge_alignment_mode": "siglip",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        bridge_alignment_weight=1e-3,
+    )
+    assert torch.isfinite(result["loss"])
+    assert torch.isfinite(result["loss_bridge_alignment"])
+    assert "bridge_connector_patch_merger" in result
+    expected = result["loss_cfm"] + 1e-3 * result["loss_bridge_alignment"]
+    assert torch.allclose(result["loss"], expected, atol=1e-6)
 
 
 def test_text2ts_flow_regime_adapter_only():
@@ -1004,3 +1167,202 @@ def test_v61_backward_compat_no_regime_no_global_gate():
     result = cfm_train_step(model, batch, opt, text_encoder_mode="hash", task_mode="text2ts")
     assert torch.isfinite(result["loss"])
     assert result["loss_regime_ortho"].item() == 0.0
+
+
+def test_spectral_loss_disabled_by_default_is_zero_and_noop():
+    model = build_model(_text2ts_config(), sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", task_mode="text2ts")
+    assert result["loss_spectral"].item() == 0.0
+    assert torch.allclose(result["loss"], result["loss_cfm"])
+
+
+def test_spectral_loss_text2ts_is_finite_and_added():
+    model = build_model(_text2ts_config(), sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        spectral_loss_weight=0.1,
+    )
+    assert torch.isfinite(result["loss_spectral"])
+    assert result["loss_spectral"].item() > 0.0
+    expected = result["loss_cfm"] + 0.1 * result["loss_spectral"]
+    assert torch.allclose(result["loss"], expected, atol=1e-6)
+
+
+def test_spectral_loss_edit_mode_respects_mask():
+    model = build_model(_config(), sequence_length=12, num_channels=4)
+    batch = _batch(batch_size=2, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="edit",
+        spectral_loss_weight=0.1,
+    )
+    assert torch.isfinite(result["loss_spectral"])
+    expected = result["loss_cfm"] + 0.1 * result["loss_spectral"]
+    assert torch.allclose(result["loss"], expected, atol=1e-6)
+
+
+def test_spectral_loss_helper_zero_on_perfect_prediction():
+    from effectcma_flow.training.train_step import _spectral_magnitude_loss
+
+    target = torch.randn(3, 16, 4)
+    loss = _spectral_magnitude_loss(target.clone(), target, mask=None, log_magnitude=True)
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_spectral_loss_helper_x0_recovery_identity():
+    """x_hat0 = x_t + (1 - t) * target_v reconstructs the target exactly."""
+    from effectcma_flow.training.train_step import _spectral_magnitude_loss
+
+    source = torch.randn(2, 16, 3)
+    target = torch.randn(2, 16, 3)
+    t = torch.rand(2)
+    x_t = (1.0 - t[:, None, None]) * source + t[:, None, None] * target
+    target_v = target - source
+    pred_x0 = x_t + (1.0 - t[:, None, None]) * target_v
+    assert torch.allclose(pred_x0, target, atol=1e-5)
+    loss = _spectral_magnitude_loss(pred_x0, target, mask=None, log_magnitude=False)
+    assert loss.item() == pytest.approx(0.0, abs=1e-5)
+
+
+def test_operator_balance_loss_is_optional_finite_and_added():
+    cfg = _text2ts_config()
+    cfg["model"].update({"operator_architecture": "structural", "router_mode": "global_operator"})
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=4, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        operator_balance_weight=0.01,
+    )
+    assert torch.isfinite(result["loss_operator_balance"])
+    # KL(usage || uniform) >= 0 always.
+    assert result["loss_operator_balance"].item() >= -1e-6
+    expected = result["loss_cfm"] + 0.01 * result["loss_operator_balance"]
+    assert torch.allclose(result["loss"], expected, atol=1e-6)
+
+
+def test_operator_balance_loss_zero_when_disabled():
+    cfg = _text2ts_config()
+    cfg["model"].update({"operator_architecture": "structural", "router_mode": "global_operator"})
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=4, length=12, channels=4)
+    result = cfm_train_step(model, batch, optimizer=None, text_encoder_mode="hash", task_mode="text2ts")
+    assert result["loss_operator_balance"].item() == 0.0
+
+
+def test_operator_balance_loss_grows_under_collapse():
+    """KL term must be ~0 for a uniform gate and large for a collapsed gate."""
+    import torch.nn.functional as F
+
+    from effectcma_flow.models.global_operator_gate import GlobalOperatorGate
+
+    gate = GlobalOperatorGate(d_model=16, num_channels=4, num_operators=3)
+
+    def balance(g):
+        usage = g.mean(dim=0)
+        uniform = g.new_full((g.shape[-1],), 1.0 / g.shape[-1])
+        return (usage.clamp_min(1e-8) * (usage.clamp_min(1e-8) / uniform).log()).sum()
+
+    uniform_gate = torch.full((8, 3), 1.0 / 3.0)
+    collapsed_gate = F.one_hot(torch.zeros(8, dtype=torch.long), num_classes=3).float()
+    assert balance(uniform_gate).item() == pytest.approx(0.0, abs=1e-6)
+    assert balance(collapsed_gate).item() > 1.0
+
+
+def test_dense_clean_alignment_builds_and_trains():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+            "bridge_state_connector": "patch_merger",
+            "bridge_alignment_mode": "siglip",
+            "bridge_alignment_dense": True,
+            "bridge_alignment_regions": 6,
+            "bridge_alignment_target": "clean",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    connector = model.cross_modal_bridge.patch_merger_connector
+    assert connector.alignment_dense is True
+    assert connector.alignment_target == "clean"
+    assert connector.text_region_pool.num_regions == 6
+    batch = _text_batch(batch_size=4, length=12, channels=4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    result = cfm_train_step(
+        model,
+        batch,
+        opt,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        bridge_alignment_weight=0.01,
+    )
+    assert torch.isfinite(result["loss"])
+    assert result["loss_bridge_alignment"].item() != 0.0
+    assert float(result["aux"]["bridge_alignment_dense"]) == 1.0
+    # Region pools must actually receive gradient (dense path is wired, not dead).
+    for pool in (connector.text_region_pool, connector.state_region_pool):
+        assert pool.queries.grad is not None
+        assert pool.queries.grad.abs().sum().item() > 0.0
+
+
+def test_dense_alignment_falls_back_to_state_without_target():
+    """At sampling time (no target), clean-target dense alignment must not crash."""
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+            "bridge_state_connector": "patch_merger",
+            "bridge_alignment_dense": True,
+            "bridge_alignment_target": "clean",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    x_t = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    # No target kwarg -> dense alignment should pool the fused state instead.
+    pred, aux = model(x_t, t, [["sunny dry day"], ["cold front incoming"]])
+    assert pred.shape == x_t.shape
+    assert torch.isfinite(aux["bridge_alignment_loss"]).all()
+
+
+def test_spectral_loss_gradient_reaches_frequency_expert():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    freq_expert = model.operator_bank.experts[2]  # FrequencyBandExpert
+    assert type(freq_expert).__name__ == "FrequencyBandExpert"
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    result = cfm_train_step(
+        model,
+        batch,
+        opt,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        spectral_loss_weight=1.0,
+    )
+    assert torch.isfinite(result["loss"])
+    grads = [p.grad for p in freq_expert.parameters() if p.grad is not None]
+    assert grads, "frequency expert received no gradient"
+    assert any(g.abs().sum().item() > 0 for g in grads)

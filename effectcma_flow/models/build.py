@@ -15,7 +15,10 @@ _V61_KEYS = frozenset({
 _V62_KEYS = frozenset({
     "use_cross_modal_bridge", "bridge_num_heads", "bridge_dropout", "bridge_patch_size",
     "bridge_num_spectral_tokens", "bridge_alignment_temperature", "bridge_focal_mode",
-    "bridge_num_stage_tokens", "operator_multiview_context",
+    "bridge_num_stage_tokens", "bridge_state_connector", "bridge_temporal_merge",
+    "bridge_channel_merge", "bridge_token_budget", "bridge_alignment_mode",
+    "bridge_alignment_dense", "bridge_alignment_regions", "bridge_alignment_target",
+    "bridge_diagnostics", "operator_multiview_context",
 })
 
 
@@ -91,6 +94,15 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         bridge_alignment_temperature=float(model_cfg.get("bridge_alignment_temperature", 0.07)),
         bridge_focal_mode=str(model_cfg.get("bridge_focal_mode", "legacy")),
         bridge_num_stage_tokens=int(model_cfg.get("bridge_num_stage_tokens", 3)),
+        bridge_state_connector=str(model_cfg.get("bridge_state_connector", "legacy")),
+        bridge_temporal_merge=int(model_cfg.get("bridge_temporal_merge", 4)),
+        bridge_channel_merge=int(model_cfg.get("bridge_channel_merge", 1)),
+        bridge_token_budget=int(model_cfg.get("bridge_token_budget", 96)),
+        bridge_alignment_mode=str(model_cfg.get("bridge_alignment_mode", "auto")),
+        bridge_alignment_dense=bool(model_cfg.get("bridge_alignment_dense", False)),
+        bridge_alignment_regions=int(model_cfg.get("bridge_alignment_regions", 8)),
+        bridge_alignment_target=str(model_cfg.get("bridge_alignment_target", "state")),
+        bridge_diagnostics=bool(model_cfg.get("bridge_diagnostics", False)),
     )
     if task_mode == "edit":
         # EffectCMAFlow does not accept text-to-series regime/gate/bridge params.

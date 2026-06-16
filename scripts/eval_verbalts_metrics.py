@@ -171,6 +171,7 @@ def run(args: argparse.Namespace, cfg: dict) -> dict[str, float]:
         solver=str(cfg.get("sample", {}).get("solver", "euler")),
         task_mode=task_mode,
         noise_scale=float(cfg.get("sample", {}).get("noise_scale", 1.0)),
+        cfg_scale=float(cfg.get("sample", {}).get("cfg_scale", 1.0)),
         n_samples=int(args.n_samples),
         caption_slot_strategy=str(cfg.get("train", {}).get("caption_slot_strategy", "single")),
         max_caption_slots=int(cfg.get("train", {}).get("max_caption_slots", 8)),

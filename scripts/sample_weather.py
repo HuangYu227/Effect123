@@ -150,6 +150,7 @@ def run_sample(
                 solver=str(cfg.get("sample", {}).get("solver", "euler")),
                 steps=int(cfg.get("sample", {}).get("steps", 16)),
                 noise_scale=float(cfg.get("sample", {}).get("noise_scale", 1.0)),
+                cfg_scale=float(cfg.get("sample", {}).get("cfg_scale", 1.0)),
             )
         else:
             pred, aux = euler_sample(model, batch["B"], text_condition_from_batch(batch, text_mode, condition_key="slots"), steps=int(cfg.get("sample", {}).get("steps", 16)))
@@ -199,6 +200,7 @@ def run_prompt_sample(
             solver=str(cfg.get("sample", {}).get("solver", "euler")),
             steps=int(cfg.get("sample", {}).get("steps", 16)),
             noise_scale=float(cfg.get("sample", {}).get("noise_scale", 1.0)),
+            cfg_scale=float(cfg.get("sample", {}).get("cfg_scale", 1.0)),
         )
     pred_raw = _denormalize(pred, stats)[0]
     dump_generated_plot(output, pred_raw, channel=0)

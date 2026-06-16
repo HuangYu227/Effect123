@@ -5,10 +5,17 @@ Training objective:
         + lambda_ortho * L_regime_ortho
         + lambda_bridge * L_bridge_align
         + lambda_rank * L_caption_rank
+        + lambda_spectral * L_spectral
 
 No routing entropy, channel entropy, field mass, trend, frequency, volatility,
 or artificial semantic-slot losses are used. The optional caption ranking loss
 uses real captions only: positive caption versus batch-shuffled caption.
+
+The optional spectral loss supervises the rFFT magnitude of the predicted clean
+target (recovered from the flow state as ``x_t + (1 - t) * pred_v``) against the
+ground-truth target. Pure time-domain velocity MSE under-weights high-frequency
+structure, which is a known cause of poor spectral / distributional fidelity
+(FID, J-FTSD); this term adds direct frequency-domain pressure.
 """
 from __future__ import annotations
 
@@ -39,6 +46,9 @@ def cfm_train_step(
     bridge_alignment_weight: float = 0.0,
     caption_ranking_weight: float = 0.0,
     caption_ranking_margin: float = 0.05,
+    spectral_loss_weight: float = 0.0,
+    spectral_log_magnitude: bool = True,
+    operator_balance_weight: float = 0.0,
     # Backward-compatibility guard: old routing losses must stay disabled.
     routing_loss_weight: float = 0.0,
     **unused: Any,
@@ -80,7 +90,14 @@ def cfm_train_step(
         )
         # Note: prepare_condition is called inside model.forward(), not here.
         # This avoids redundant text-encoding and keeps dtype handling consistent.
-        pred_v, aux = model(x_t, t, text_condition)
+        # Pass the clean target so a dense/clean-target alignment can encode it;
+        # fall back gracefully for models whose forward does not accept it.
+        try:
+            pred_v, aux = model(x_t, t, text_condition, target=target)
+        except TypeError as exc:
+            if "target" not in str(exc):
+                raise
+            pred_v, aux = model(x_t, t, text_condition)
         if float(caption_ranking_weight) > 0.0 and target.shape[0] > 1:
             negative_batch = _caption_negative_batch(batch, device=target.device)
             negative_condition = text_condition_from_batch(
@@ -91,7 +108,12 @@ def cfm_train_step(
                 max_caption_slots=max_caption_slots,
                 include_all_caption_candidates=include_all_caption_candidates,
             )
-            negative_pred_v, _ = model(x_t, t, negative_condition)
+            try:
+                negative_pred_v, _ = model(x_t, t, negative_condition, compute_bridge_alignment=False)
+            except TypeError as exc:
+                if "compute_bridge_alignment" not in str(exc):
+                    raise
+                negative_pred_v, _ = model(x_t, t, negative_condition)
     else:
         raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
 
@@ -105,6 +127,18 @@ def cfm_train_step(
     bridge_alignment = pred_v.new_zeros(())
     if float(bridge_alignment_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("bridge_alignment_loss")):
         bridge_alignment = aux["bridge_alignment_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
+    operator_balance = pred_v.new_zeros(())
+    if float(operator_balance_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("operator_balance_loss")):
+        operator_balance = aux["operator_balance_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
+    spectral_loss = pred_v.new_zeros(())
+    if float(spectral_loss_weight) > 0.0:
+        pred_x0 = x_t + (1.0 - t[:, None, None]) * pred_v
+        spectral_loss = _spectral_magnitude_loss(
+            pred_x0,
+            target,
+            mask=batch.get("mask"),
+            log_magnitude=bool(spectral_log_magnitude),
+        )
     caption_ranking = pred_v.new_zeros(())
     caption_pos_mse = _per_sample_mse(pred_v, target_v, batch.get("mask")).mean()
     caption_neg_mse = pred_v.new_zeros(())
@@ -123,6 +157,8 @@ def cfm_train_step(
         + float(regime_ortho_weight) * regime_ortho
         + float(bridge_alignment_weight) * bridge_alignment
         + float(caption_ranking_weight) * caption_ranking
+        + float(spectral_loss_weight) * spectral_loss
+        + float(operator_balance_weight) * operator_balance
     )
 
     if optimizer is not None:
@@ -141,6 +177,8 @@ def cfm_train_step(
         "loss_regime_ortho": regime_ortho.detach(),
         "loss_bridge_alignment": bridge_alignment.detach(),
         "loss_caption_ranking": caption_ranking.detach(),
+        "loss_spectral": spectral_loss.detach(),
+        "loss_operator_balance": operator_balance.detach(),
         "caption_pos_mse": caption_pos_mse.detach(),
         "caption_neg_mse": caption_neg_mse.detach(),
         "caption_ranking_acc": caption_ranking_acc.detach(),
@@ -258,6 +296,56 @@ def _per_sample_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     return (sq_error * mask).flatten(1).sum(dim=1) / mask.flatten(1).sum(dim=1).clamp_min(1.0)
 
 
+def _spectral_magnitude_loss(
+    pred_x0: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mask: torch.Tensor | None,
+    log_magnitude: bool,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Frequency-domain MSE between predicted and target clean signals.
+
+    Compares per-channel rFFT magnitude spectra along the time axis. This adds
+    direct supervision on periodicity / high-frequency structure that pure
+    time-domain velocity MSE under-weights. Magnitudes are optionally passed
+    through ``log1p`` to compress the dynamic range so that high-frequency bands
+    (typically orders of magnitude smaller than the DC / low-frequency
+    components) still contribute a meaningful gradient.
+
+    When a mask is supplied, masked-out steps are zeroed before the transform so
+    that padded regions do not inject spurious spectral energy. The mask is only
+    used to gate which samples/steps are valid; it is not a band mask.
+    """
+    if pred_x0.shape != target.shape:
+        raise ValueError(f"pred_x0 shape {tuple(pred_x0.shape)} must match target {tuple(target.shape)}")
+    if pred_x0.ndim != 3:
+        raise ValueError(f"spectral loss expects [B, L, C] tensors, got {tuple(pred_x0.shape)}")
+    if pred_x0.shape[1] < 2:
+        return pred_x0.new_zeros(())
+    if mask is not None:
+        mask = mask.to(pred_x0.device, dtype=pred_x0.dtype)
+        if mask.shape == pred_x0.shape[:2]:
+            mask = mask.unsqueeze(-1)
+        if mask.shape == (*pred_x0.shape[:2], 1):
+            mask = mask.expand_as(pred_x0)
+        elif mask.shape != pred_x0.shape:
+            raise ValueError(f"spectral mask must broadcast to {tuple(pred_x0.shape)}, got {tuple(mask.shape)}")
+        pred_x0 = pred_x0 * mask
+        target = target * mask
+    # rFFT along the time axis (dim=1). Cast half precision up for FFT stability.
+    fft_dtype = torch.float32 if pred_x0.dtype in {torch.float16, torch.bfloat16} else pred_x0.dtype
+    pred_freq = torch.fft.rfft(pred_x0.to(fft_dtype), dim=1)
+    target_freq = torch.fft.rfft(target.to(fft_dtype), dim=1)
+    pred_mag = pred_freq.abs()
+    target_mag = target_freq.abs()
+    if log_magnitude:
+        pred_mag = torch.log1p(pred_mag)
+        target_mag = torch.log1p(target_mag)
+    loss = (pred_mag - target_mag).square().mean()
+    return loss.to(dtype=pred_x0.dtype)
+
+
 def _flow_diagnostics(*, target: torch.Tensor, source: torch.Tensor, pred_v: torch.Tensor, target_v: torch.Tensor) -> dict[str, torch.Tensor]:
     pred_v_rms = pred_v.detach().square().mean().sqrt()
     target_v_rms = target_v.detach().square().mean().sqrt()
@@ -284,6 +372,7 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "operator_gate_entropy",
         "operator_gate_entropy_norm",
         "operator_gate_max_prob",
+        "operator_balance_loss",
         "operator_gate_attention_entropy",
         "operator_gate_attention_entropy_norm",
         "operator_gate_attention_text_mass",
@@ -312,6 +401,11 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "bridge_focal_stage_entropy_norm",
         "bridge_alignment_logit_pos",
         "bridge_alignment_logit_std",
+        "bridge_alignment_dense",
+        "bridge_patch_token_count",
+        "bridge_budget_pool_active",
+        "bridge_token_budget",
+        "bridge_connector_patch_merger",
     ]:
         val = aux.get(key)
         if torch.is_tensor(val):

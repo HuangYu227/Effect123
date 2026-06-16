@@ -75,6 +75,7 @@ class VerbalTSMetricComputer:
         solver: str = "euler",
         task_mode: str = "edit",
         noise_scale: float = 1.0,
+        cfg_scale: float = 1.0,
         n_samples: int = 1,
         caption_slot_strategy: str = "single",
         max_caption_slots: int = 8,
@@ -115,6 +116,7 @@ class VerbalTSMetricComputer:
             solver=solver,
             task_mode=task_mode,
             noise_scale=noise_scale,
+            cfg_scale=cfg_scale,
             n_samples=n_samples,
             caption_slot_strategy=caption_slot_strategy,
             max_caption_slots=max_caption_slots,
@@ -167,6 +169,7 @@ class VerbalTSMetricComputer:
         solver: str,
         task_mode: str,
         noise_scale: float,
+        cfg_scale: float,
         n_samples: int,
         caption_slot_strategy: str,
         max_caption_slots: int,
@@ -201,6 +204,7 @@ class VerbalTSMetricComputer:
                         solver=solver,
                         steps=steps,
                         noise_scale=noise_scale,
+                        cfg_scale=cfg_scale,
                     )
                     preds.append(pred_one)
                 pred = torch.stack(preds, dim=0).median(dim=0).values

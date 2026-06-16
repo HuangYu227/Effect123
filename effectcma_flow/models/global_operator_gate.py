@@ -124,12 +124,19 @@ class GlobalOperatorGate(nn.Module):
                 raise ValueError(f"gate shape {tuple(gate.shape)} incompatible with velocity_shape {tuple(velocity_shape)}")
             g = gate[:, None, None, :].expand(b, length, channels, k)
         entropy = _entropy(gate, dim=-1).mean()
+        # Differentiable load-balance loss: KL(batch usage || uniform). Penalizes
+        # the self-reinforcing collapse where one or two experts win every sample
+        # and the rest die. Returned non-detached so the train step can weight it.
+        usage = gate.mean(dim=0)
+        uniform = gate.new_full((self.num_operators,), 1.0 / float(max(self.num_operators, 1)))
+        balance_loss = (usage.clamp_min(1e-8) * (usage.clamp_min(1e-8) / uniform).log()).sum()
         aux = {
             "A_o": gate,
             "operator_gate_logits": logits.detach(),
             "operator_gate_entropy": entropy.detach(),
             "operator_gate_entropy_norm": (entropy / torch.log(torch.tensor(float(max(self.num_operators, 2)), device=device, dtype=dtype))).detach(),
             "operator_gate_max_prob": gate.max(dim=-1).values.mean().detach(),
+            "operator_balance_loss": balance_loss,
             "operator_usage": gate.mean(dim=0).detach(),
             **attn_aux,
         }

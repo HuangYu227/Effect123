@@ -138,6 +138,7 @@ def run_eval(
                     solver=str(cfg.get("sample", {}).get("solver", "euler")),
                     steps=int(cfg.get("sample", {}).get("steps", 16)),
                     noise=noise,
+                    cfg_scale=float(cfg.get("sample", {}).get("cfg_scale", 1.0)),
                 )
                 one = compute_text2ts_metrics(pred, batch["Y"])
                 if "A_o" in aux:

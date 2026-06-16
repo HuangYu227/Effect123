@@ -70,6 +70,490 @@ class TimestepAwareCrossAttention(nn.Module):
         return self.out_proj(out), attn
 
 
+class LatentGridBlock(nn.Module):
+    """Lightweight latent feature block over time and variable order."""
+
+    def __init__(self, d_model: int, num_channels: int, dropout: float) -> None:
+        super().__init__()
+        self.num_channels = int(num_channels)
+        self.time_norm = nn.LayerNorm(d_model)
+        self.time_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model)
+        self.time_mix = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.channel_norm = nn.LayerNorm(d_model)
+        self.channel_mixer = nn.Linear(self.num_channels, self.num_channels, bias=False)
+        self.ffn = _ffn(d_model, dropout)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        if h.ndim != 4:
+            raise ValueError(f"latent grid must be [B,L,C,D], got {tuple(h.shape)}")
+        batch, length, channels, d_model = h.shape
+        if channels != self.num_channels:
+            raise ValueError(f"expected {self.num_channels} channels, got {channels}")
+        x = self.time_norm(h).permute(0, 2, 3, 1).reshape(batch * channels, d_model, length)
+        x = self.time_mix(self.time_conv(x)).reshape(batch, channels, d_model, length).permute(0, 3, 1, 2)
+        h = h + x
+        y = self.channel_norm(h).permute(0, 1, 3, 2)
+        y = self.channel_mixer(y).permute(0, 1, 3, 2)
+        h = h + y
+        return h + self.ffn(h)
+
+
+class TokenBudgetPool(nn.Module):
+    """Perceiver-style fixed-budget pooling used only when tokens exceed the budget."""
+
+    def __init__(self, d_model: int, token_budget: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.token_budget = int(token_budget)
+        if self.token_budget <= 0:
+            raise ValueError("token_budget must be positive")
+        self.queries = nn.Parameter(torch.randn(self.token_budget, d_model) * 0.02)
+        self.query_norm = nn.LayerNorm(d_model)
+        self.memory_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.out_norm = nn.LayerNorm(d_model)
+        self.ffn = _ffn(d_model, dropout)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"tokens must be [B,N,D], got {tuple(tokens.shape)}")
+        if tokens.shape[1] <= self.token_budget:
+            return self.out_norm(tokens)
+        query = self.queries[None].expand(tokens.shape[0], -1, -1).to(dtype=tokens.dtype, device=tokens.device)
+        pooled, _ = self.attn(
+            query=self.query_norm(query),
+            key=self.memory_norm(tokens),
+            value=tokens,
+            need_weights=False,
+        )
+        pooled = self.out_norm(query + pooled)
+        return pooled + self.ffn(pooled)
+
+
+class AttentionPool(nn.Module):
+    """Single-query attention pooling with an optional validity mask."""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, d_model) * 0.02)
+        self.query_norm = nn.LayerNorm(d_model)
+        self.token_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"tokens must be [B,N,D], got {tuple(tokens.shape)}")
+        key_padding_mask = _safe_key_padding_mask(mask) if mask is not None else None
+        query = self.query[None].expand(tokens.shape[0], -1, -1).to(dtype=tokens.dtype, device=tokens.device)
+        pooled, _ = self.attn(
+            query=self.query_norm(query),
+            key=self.token_norm(tokens),
+            value=tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return self.out_norm((query + pooled).squeeze(1))
+
+
+class MultiQueryAttentionPool(nn.Module):
+    """Pool a token set into a fixed number of region tokens via learned queries.
+
+    Unlike :class:`AttentionPool` (a single query / global vector), this keeps
+    ``num_regions`` distinct learned queries so the output is a small set of
+    region embeddings suitable for token/region-level (dense) alignment.
+    """
+
+    def __init__(self, d_model: int, num_regions: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.num_regions = int(num_regions)
+        if self.num_regions <= 0:
+            raise ValueError("num_regions must be positive")
+        self.queries = nn.Parameter(torch.randn(self.num_regions, d_model) * 0.02)
+        self.query_norm = nn.LayerNorm(d_model)
+        self.token_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(f"tokens must be [B,N,D], got {tuple(tokens.shape)}")
+        key_padding_mask = _safe_key_padding_mask(mask) if mask is not None else None
+        query = self.queries[None].expand(tokens.shape[0], -1, -1).to(dtype=tokens.dtype, device=tokens.device)
+        pooled, _ = self.attn(
+            query=self.query_norm(query),
+            key=self.token_norm(tokens),
+            value=tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return self.out_norm(query + pooled)
+
+
+class CrossAttentionPool(nn.Module):
+    """Pool memory with a caller-provided set of query tokens."""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.query_norm = nn.LayerNorm(d_model)
+        self.memory_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.out_norm = nn.LayerNorm(d_model)
+        self.ffn = _ffn(d_model, dropout)
+
+    def forward(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        if query.ndim != 3 or memory.ndim != 3:
+            raise ValueError("query and memory must be [B,N,D]")
+        out, _ = self.attn(
+            query=self.query_norm(query),
+            key=self.memory_norm(memory),
+            value=memory,
+            need_weights=False,
+        )
+        out = self.out_norm(query + out)
+        return out + self.ffn(out)
+
+
+class TSPatchMergerConnector(nn.Module):
+    """Qwen-style patch merger connector for latent time-series state tokens."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        num_channels: int,
+        sequence_length: int,
+        num_experts: int,
+        temporal_merge: int = 4,
+        channel_merge: int = 1,
+        token_budget: int = 96,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        alignment_mode: str = "siglip",
+        alignment_temperature: float = 0.07,
+        alignment_dense: bool = False,
+        alignment_regions: int = 8,
+        alignment_target: str = "state",
+        diagnostics: bool = False,
+    ) -> None:
+        super().__init__()
+        if d_model <= 0 or num_channels <= 0 or sequence_length <= 0 or num_experts <= 0:
+            raise ValueError("d_model, num_channels, sequence_length, and num_experts must be positive")
+        self.d_model = int(d_model)
+        self.num_channels = int(num_channels)
+        self.sequence_length = int(sequence_length)
+        self.num_experts = int(num_experts)
+        self.temporal_merge = max(1, int(temporal_merge))
+        self.channel_merge = max(1, int(channel_merge))
+        self.token_budget = int(token_budget)
+        self.alignment_mode = str(alignment_mode).lower()
+        if self.alignment_mode not in {"siglip", "infonce"}:
+            raise ValueError(f"alignment_mode must be 'siglip' or 'infonce', got {alignment_mode!r}")
+        self.alignment_temperature = float(alignment_temperature)
+        # Dense (token/region-level) alignment instead of pooled-vs-pooled. When
+        # enabled, both text and series sides are pooled to a small set of region
+        # tokens and matched with ColBERT-style MaxSim, which constrains
+        # token<->timestep correspondence rather than a single global direction.
+        self.alignment_dense = bool(alignment_dense)
+        self.alignment_regions = max(1, int(alignment_regions))
+        # Which series representation to align against: "clean" encodes the
+        # ground-truth target through the same patch-merger stack (signal is not
+        # diluted by flow noise); "state" reuses the fused current-state tokens.
+        self.alignment_target = str(alignment_target).lower()
+        if self.alignment_target not in {"state", "clean"}:
+            raise ValueError(f"alignment_target must be 'state' or 'clean', got {alignment_target!r}")
+        self.diagnostics = bool(diagnostics)
+
+        heads = max(1, min(int(num_heads), self.d_model))
+        while self.d_model % heads != 0 and heads > 1:
+            heads -= 1
+        self.num_heads = heads
+
+        self.value_proj = nn.Linear(3, self.d_model)
+        self.channel_embed = nn.Embedding(self.num_channels, self.d_model)
+        self.latent_blocks = nn.Sequential(
+            LatentGridBlock(self.d_model, self.num_channels, dropout),
+            LatentGridBlock(self.d_model, self.num_channels, dropout),
+        )
+        merged_dim = self.d_model * self.temporal_merge * self.channel_merge
+        self.patch_merger_norm = nn.LayerNorm(self.d_model)
+        self.patch_merger_mlp = nn.Sequential(
+            nn.Linear(merged_dim, merged_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(merged_dim, self.d_model),
+        )
+        self.merged_norm = nn.LayerNorm(self.d_model)
+        self.budget_pool = TokenBudgetPool(self.d_model, self.token_budget, heads, dropout)
+
+        self.text_norm = nn.LayerNorm(self.d_model)
+        self.state_norm = nn.LayerNorm(self.d_model)
+        self.text_to_state = nn.MultiheadAttention(self.d_model, heads, dropout=dropout, batch_first=True)
+        self.state_to_text = nn.MultiheadAttention(self.d_model, heads, dropout=dropout, batch_first=True)
+        self.text_gate = nn.Sequential(nn.LayerNorm(2 * self.d_model), nn.Linear(2 * self.d_model, self.d_model), nn.Sigmoid())
+        self.state_gate = nn.Sequential(nn.LayerNorm(2 * self.d_model), nn.Linear(2 * self.d_model, self.d_model), nn.Sigmoid())
+        self.text_ffn = _ffn(self.d_model, dropout)
+        self.state_ffn = _ffn(self.d_model, dropout)
+
+        self.bridge_pool = AttentionPool(self.d_model, heads, dropout)
+        self.text_context_pool = AttentionPool(self.d_model, heads, dropout)
+        self.context_gate = nn.Sequential(
+            nn.LayerNorm(2 * self.d_model),
+            nn.Linear(2 * self.d_model, self.d_model),
+            nn.Sigmoid(),
+        )
+        self.context_norm = nn.LayerNorm(self.d_model)
+        self.text_align_pool = AttentionPool(self.d_model, heads, dropout)
+        self.state_align_pool = AttentionPool(self.d_model, heads, dropout)
+        self.expert_queries = nn.Parameter(torch.randn(self.num_experts, self.d_model) * 0.02)
+        self.channel_queries = nn.Parameter(torch.randn(self.num_channels, self.d_model) * 0.02)
+        self.expert_pool = CrossAttentionPool(self.d_model, heads, dropout)
+        self.channel_pool = CrossAttentionPool(self.d_model, heads, dropout)
+        self.logit_scale = nn.Parameter(torch.tensor(2.6592))
+        self.logit_bias = nn.Parameter(torch.tensor(-10.0))
+        self.text_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
+        self.state_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
+        if self.alignment_dense:
+            # Region pools: learned multi-query attention pooling each modality to
+            # `alignment_regions` tokens, keeping MaxSim a fixed [B,B,R,R] cost
+            # (full-batch friendly) while staying token-level rather than pooled.
+            self.text_region_pool = MultiQueryAttentionPool(self.d_model, self.alignment_regions, heads, dropout)
+            self.state_region_pool = MultiQueryAttentionPool(self.d_model, self.alignment_regions, heads, dropout)
+
+    def forward(
+        self,
+        *,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        slot_tokens: torch.Tensor,
+        slot_mask: torch.Tensor,
+        compute_alignment: bool = True,
+        target: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        self._validate_inputs(x_t=x_t, t=t, slot_tokens=slot_tokens, slot_mask=slot_mask)
+        dtype = slot_tokens.dtype
+        device = slot_tokens.device
+        x_t = x_t.to(device=device, dtype=dtype)
+        t = t.to(device=device, dtype=dtype).view(-1)
+        slot_mask = slot_mask.to(device=device, dtype=dtype)
+        if target is not None:
+            target = target.to(device=device, dtype=dtype)
+
+        latent_grid = self._encode_grid(x_t, t)
+        merged_tokens = self._patch_merge(latent_grid)
+        prebudget_count = merged_tokens.shape[1]
+        state_tokens = self.budget_pool(merged_tokens)
+
+        text_query = self.text_norm(slot_tokens)
+        state_query = self.state_norm(state_tokens)
+        need_attn_weights = self.diagnostics
+        text_delta, text_attn = self.text_to_state(
+            query=text_query,
+            key=state_query,
+            value=state_tokens,
+            need_weights=need_attn_weights,
+            average_attn_weights=False,
+        )
+        text_gate = self.text_gate(torch.cat([slot_tokens, text_delta], dim=-1))
+        bridged_text = slot_tokens + text_gate * text_delta
+        bridged_text = bridged_text + self.text_ffn(bridged_text)
+        bridged_text = bridged_text * slot_mask[:, :, None].clamp(0.0, 1.0)
+
+        text_key_padding_mask = _safe_key_padding_mask(slot_mask)
+        state_delta, state_attn = self.state_to_text(
+            query=state_query,
+            key=self.text_norm(slot_tokens),
+            value=slot_tokens,
+            key_padding_mask=text_key_padding_mask,
+            need_weights=need_attn_weights,
+            average_attn_weights=False,
+        )
+        state_gate = self.state_gate(torch.cat([state_tokens, state_delta], dim=-1))
+        fused_state = state_tokens + state_gate * state_delta
+        fused_state = fused_state + self.state_ffn(fused_state)
+
+        text_context = self.text_context_pool(bridged_text, mask=slot_mask)
+        state_context = self.bridge_pool(fused_state)
+        context_gate = self.context_gate(torch.cat([text_context, state_context], dim=-1))
+        bridge_context = self.context_norm(text_context + context_gate * state_context)
+        expert_query = self.expert_queries[None].expand(x_t.shape[0], -1, -1).to(device=device, dtype=dtype)
+        channel_query = self.channel_queries[None].expand(x_t.shape[0], -1, -1).to(device=device, dtype=dtype)
+        expert_context = self.expert_pool(expert_query, fused_state)
+        channel_context = self.channel_pool(channel_query, fused_state)
+
+        if compute_alignment:
+            # Choose the series tokens to align against. "clean" re-encodes the
+            # ground-truth target through the same patch-merger stack so the
+            # alignment target is not diluted by flow noise; falls back to the
+            # fused current state when no target is supplied (e.g. at sampling).
+            if self.alignment_target == "clean" and target is not None:
+                clean_grid = self._encode_grid(target, torch.ones_like(t))
+                align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
+            else:
+                align_state_tokens = fused_state
+            if self.alignment_dense:
+                alignment_loss, alignment_aux = self._dense_alignment_loss(
+                    bridged_text, align_state_tokens, slot_mask
+                )
+            else:
+                text_repr = self.text_align_pool(bridged_text, mask=slot_mask)
+                state_repr = self.state_align_pool(align_state_tokens)
+                alignment_loss, alignment_aux = self._alignment_loss(text_repr, state_repr)
+        else:
+            alignment_loss, alignment_aux = _zero_alignment_aux(fused_state)
+        valid_slot_count = slot_mask.sum(dim=1)
+        if need_attn_weights:
+            text_entropy, text_max, text_entropy_norm = _attention_summary(text_attn, query_mask=slot_mask)
+            state_entropy, state_max, state_entropy_norm = _attention_summary(state_attn, key_mask=slot_mask)
+        else:
+            text_entropy, text_max, text_entropy_norm = _nan_summary(fused_state)
+            state_entropy, state_max, state_entropy_norm = _nan_summary(fused_state)
+        aux = {
+            "bridge_alignment_loss": alignment_loss,
+            "text_slot_count": valid_slot_count.detach().mean(),
+            "text_slot_count_min": valid_slot_count.detach().min(),
+            "text_slot_count_max": valid_slot_count.detach().max(),
+            "bridge_text_to_state_entropy": text_entropy.detach(),
+            "bridge_text_to_state_entropy_norm": text_entropy_norm.detach(),
+            "bridge_text_to_state_max_prob": text_max.detach(),
+            "bridge_state_to_text_entropy": state_entropy.detach(),
+            "bridge_state_to_text_entropy_norm": state_entropy_norm.detach(),
+            "bridge_state_to_text_max_prob": state_max.detach(),
+            "bridge_context_norm": bridge_context.detach().norm(dim=-1).mean(),
+            "bridge_text_context_norm": text_context.detach().norm(dim=-1).mean(),
+            "bridge_state_context_norm": state_context.detach().norm(dim=-1).mean(),
+            "bridge_expert_context_norm": expert_context.detach().norm(dim=-1).mean(),
+            "bridge_channel_context_norm": channel_context.detach().norm(dim=-1).mean(),
+            "bridge_memory_token_count": torch.tensor(float(fused_state.shape[1]), device=device, dtype=dtype),
+            "bridge_patch_token_count": torch.tensor(float(prebudget_count), device=device, dtype=dtype),
+            # 1.0 iff merged tokens exceeded the budget so the Perceiver pool
+            # actually ran; 0.0 means the budget pool was an identity pass-through
+            # (i.e. the configured token_budget is too large to ever fire).
+            "bridge_budget_pool_active": torch.tensor(
+                1.0 if prebudget_count > self.token_budget else 0.0, device=device, dtype=dtype
+            ),
+            "bridge_token_budget": torch.tensor(float(self.token_budget), device=device, dtype=dtype),
+            "bridge_connector_patch_merger": torch.tensor(1.0, device=device, dtype=dtype),
+            **alignment_aux,
+        }
+        return bridged_text, bridge_context, expert_context, channel_context, aux
+
+    def _encode_grid(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        batch, length, channels = x_t.shape
+        dtype = x_t.dtype
+        device = x_t.device
+        pos = torch.linspace(-1.0, 1.0, length, device=device, dtype=dtype)
+        pos = pos[None, :, None, None].expand(batch, length, channels, 1)
+        flow_time = t[:, None, None, None].expand(batch, length, channels, 1)
+        features = torch.cat([x_t[..., None], pos, flow_time], dim=-1)
+        h = self.value_proj(features)
+        channel_ids = torch.arange(channels, device=device)
+        h = h + self.channel_embed(channel_ids)[None, None, :, :].to(dtype=dtype)
+        return self.latent_blocks(h)
+
+    def _patch_merge(self, h: torch.Tensor) -> torch.Tensor:
+        batch, length, channels, d_model = h.shape
+        pad_l = (self.temporal_merge - length % self.temporal_merge) % self.temporal_merge
+        pad_c = (self.channel_merge - channels % self.channel_merge) % self.channel_merge
+        if pad_l or pad_c:
+            h = F.pad(h, (0, 0, 0, pad_c, 0, pad_l))
+        length_pad, channels_pad = h.shape[1], h.shape[2]
+        h = h.reshape(
+            batch,
+            length_pad // self.temporal_merge,
+            self.temporal_merge,
+            channels_pad // self.channel_merge,
+            self.channel_merge,
+            d_model,
+        )
+        h = h.permute(0, 1, 3, 2, 4, 5).contiguous()
+        h = h.reshape(batch, -1, self.temporal_merge * self.channel_merge, d_model)
+        h = self.patch_merger_norm(h)
+        h = h.reshape(batch, h.shape[1], self.temporal_merge * self.channel_merge * d_model)
+        return self.merged_norm(self.patch_merger_mlp(h))
+
+    def _alignment_loss(self, text_repr: torch.Tensor, state_repr: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        text = F.normalize(self.text_align(text_repr), dim=-1)
+        state = F.normalize(self.state_align(state_repr), dim=-1)
+        logits = text @ state.transpose(0, 1)
+        if self.alignment_mode == "siglip":
+            scale = self.logit_scale.exp().clamp(max=100.0).to(dtype=logits.dtype)
+            logits = logits * scale + self.logit_bias.to(dtype=logits.dtype)
+            loss = _balanced_sigmoid_contrastive_loss(logits)
+        else:
+            logits = logits / max(self.alignment_temperature, 1e-4)
+            labels_idx = torch.arange(logits.shape[0], device=logits.device)
+            loss = 0.5 * (F.cross_entropy(logits, labels_idx) + F.cross_entropy(logits.transpose(0, 1), labels_idx))
+        pos = logits.diag()
+        return loss, {
+            "bridge_alignment_logit_pos": pos.detach().mean(),
+            "bridge_alignment_logit_std": logits.detach().std(unbiased=False),
+        }
+
+    def _dense_alignment_loss(
+        self,
+        bridged_text: torch.Tensor,
+        state_tokens: torch.Tensor,
+        slot_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """ColBERT-style MaxSim alignment between text and series region tokens.
+
+        Both modalities are pooled to ``alignment_regions`` region tokens, then a
+        per-pair score is the mean over text regions of the max similarity to any
+        series region (MaxSim). This produces a ``[B, B]`` score matrix fed to the
+        same SigLIP / InfoNCE contrastive loss, but unlike pooled-vs-pooled it
+        constrains fine-grained region<->region correspondence.
+        """
+        text_regions = self.text_region_pool(bridged_text, mask=slot_mask)  # [B,R,D]
+        state_regions = self.state_region_pool(state_tokens)  # [B,R,D]
+        text = F.normalize(self.text_align(text_regions), dim=-1)
+        state = F.normalize(self.state_align(state_regions), dim=-1)
+        # sim[a,b,i,j] = <text_a_region_i, state_b_region_j>
+        sim = torch.einsum("aid,bjd->abij", text, state)
+        # MaxSim: each text region picks its best-matching series region, average
+        # over text regions -> [B(text), B(series)] pairwise score.
+        maxsim = sim.max(dim=-1).values.mean(dim=-1)
+        if self.alignment_mode == "siglip":
+            scale = self.logit_scale.exp().clamp(max=100.0).to(dtype=maxsim.dtype)
+            logits = maxsim * scale + self.logit_bias.to(dtype=maxsim.dtype)
+            loss = _balanced_sigmoid_contrastive_loss(logits)
+        else:
+            logits = maxsim / max(self.alignment_temperature, 1e-4)
+            labels_idx = torch.arange(logits.shape[0], device=logits.device)
+            loss = 0.5 * (F.cross_entropy(logits, labels_idx) + F.cross_entropy(logits.transpose(0, 1), labels_idx))
+        pos = logits.diag()
+        return loss, {
+            "bridge_alignment_logit_pos": pos.detach().mean(),
+            "bridge_alignment_logit_std": logits.detach().std(unbiased=False),
+            "bridge_alignment_dense": logits.new_tensor(1.0),
+        }
+
+    def _validate_inputs(
+        self,
+        *,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        slot_tokens: torch.Tensor,
+        slot_mask: torch.Tensor,
+    ) -> None:
+        if x_t.ndim != 3:
+            raise ValueError(f"x_t must be [B,L,C], got {tuple(x_t.shape)}")
+        if slot_tokens.ndim != 3:
+            raise ValueError(f"slot_tokens must be [B,J,D], got {tuple(slot_tokens.shape)}")
+        batch, length, channels = x_t.shape
+        if (length, channels) != (self.sequence_length, self.num_channels):
+            raise ValueError(f"Expected x_t shape [B,{self.sequence_length},{self.num_channels}], got {tuple(x_t.shape)}")
+        if t.shape != (batch,):
+            raise ValueError(f"t must have shape [B], got {tuple(t.shape)}")
+        if slot_tokens.shape[0] != batch or slot_tokens.shape[-1] != self.d_model:
+            raise ValueError("slot_tokens batch/dim must match x_t and d_model")
+        if slot_mask.shape != slot_tokens.shape[:2]:
+            raise ValueError(f"slot_mask must have shape {tuple(slot_tokens.shape[:2])}, got {tuple(slot_mask.shape)}")
+
+
 class CrossModalConditionBridge(nn.Module):
     """Bidirectional text-state bridge for text-to-series generation.
 
@@ -92,6 +576,15 @@ class CrossModalConditionBridge(nn.Module):
         alignment_temperature: float = 0.07,
         focal_mode: str = "legacy",
         num_stage_tokens: int = 3,
+        state_connector: str = "legacy",
+        temporal_merge: int = 4,
+        channel_merge: int = 1,
+        token_budget: int = 96,
+        alignment_mode: str = "auto",
+        alignment_dense: bool = False,
+        alignment_regions: int = 8,
+        alignment_target: str = "state",
+        diagnostics: bool = False,
     ) -> None:
         super().__init__()
         if d_model <= 0 or num_channels <= 0 or sequence_length <= 0 or num_experts <= 0:
@@ -109,65 +602,99 @@ class CrossModalConditionBridge(nn.Module):
         self.patch_size = int(patch_size)
         self.num_spectral_tokens = int(num_spectral_tokens)
         self.alignment_temperature = float(alignment_temperature)
+        self.state_connector = str(state_connector).lower()
+        if self.state_connector in {"ts_patch_merger", "patchmerger"}:
+            self.state_connector = "patch_merger"
+        if self.state_connector not in {"legacy", "patch_merger"}:
+            raise ValueError(f"state_connector must be 'legacy' or 'patch_merger', got {state_connector!r}")
+        self.alignment_mode = str(alignment_mode).lower()
+        if self.alignment_mode not in {"auto", "infonce", "siglip"}:
+            raise ValueError(f"alignment_mode must be 'auto', 'infonce', or 'siglip', got {alignment_mode!r}")
         self.focal_mode = str(focal_mode).lower()
         if self.focal_mode not in {"legacy", "latent_query"}:
             raise ValueError(f"focal_mode must be 'legacy' or 'latent_query', got {focal_mode!r}")
         self.num_stage_tokens = int(num_stage_tokens)
         if self.num_stage_tokens <= 0:
             raise ValueError("num_stage_tokens must be positive")
-
-        self.time_patch_proj = nn.Linear(self.patch_size * self.num_channels, self.d_model)
-        self.channel_stat_proj = nn.Linear(3, self.d_model)
-        self.spectral_proj = nn.Linear(1, self.d_model)
-        self.channel_embed = nn.Embedding(self.num_channels, self.d_model)
-        self.spectral_embed = nn.Embedding(self.num_spectral_tokens, self.d_model)
-        # 0=time patch, 1=channel summary, 2=spectral band.
-        self.type_embed = nn.Embedding(3, self.d_model)
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, self.d_model),
-            nn.SiLU(),
-            nn.Linear(self.d_model, self.d_model),
+        self.patch_merger_connector = (
+            TSPatchMergerConnector(
+                d_model=self.d_model,
+                num_channels=self.num_channels,
+                sequence_length=self.sequence_length,
+                num_experts=self.num_experts,
+                temporal_merge=temporal_merge,
+                channel_merge=channel_merge,
+                token_budget=token_budget,
+                num_heads=heads,
+                dropout=dropout,
+                alignment_mode="siglip" if self.alignment_mode == "auto" else self.alignment_mode,
+                alignment_temperature=self.alignment_temperature,
+                alignment_dense=alignment_dense,
+                alignment_regions=alignment_regions,
+                alignment_target=alignment_target,
+                diagnostics=diagnostics,
+            )
+            if self.state_connector == "patch_merger"
+            else None
         )
 
-        self.text_norm = nn.LayerNorm(self.d_model)
-        self.state_norm = nn.LayerNorm(self.d_model)
-        self.text_to_state = nn.MultiheadAttention(self.d_model, heads, dropout=dropout, batch_first=True)
-        self.state_to_text = nn.MultiheadAttention(self.d_model, heads, dropout=dropout, batch_first=True)
-        self.text_ffn = _ffn(self.d_model, dropout)
-        self.state_ffn = _ffn(self.d_model, dropout)
-        self.dropout = nn.Dropout(dropout)
-
-        self.state_to_context = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
-        self.context_gate = nn.Sequential(
-            nn.LayerNorm(2 * self.d_model),
-            nn.Linear(2 * self.d_model, self.d_model),
-            nn.Sigmoid(),
-        )
-        self.context_norm = nn.LayerNorm(self.d_model)
-        self.expert_context = nn.Sequential(
-            nn.LayerNorm(2 * self.d_model),
-            nn.Linear(2 * self.d_model, self.num_experts * self.d_model),
-        )
-        self.text_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
-        self.state_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
-        if self.focal_mode == "latent_query":
-            init = 0.02
-            self.channel_queries = nn.Parameter(torch.randn(self.num_channels, self.d_model) * init)
-            self.expert_queries = nn.Parameter(torch.randn(self.num_experts, self.d_model) * init)
-            self.scale_queries = nn.Parameter(torch.randn(self.num_spectral_tokens, self.d_model) * init)
-            self.stage_queries = nn.Parameter(torch.randn(self.num_stage_tokens, self.d_model) * init)
-            self.stage_selector = nn.Sequential(
+        # Legacy state-token bridge body. When the patch-merger connector owns
+        # the forward pass these modules are never executed, so we skip building
+        # them entirely instead of leaving inert "built but bypassed" parameters.
+        self._has_legacy_body = self.state_connector != "patch_merger"
+        if self._has_legacy_body:
+            self.time_patch_proj = nn.Linear(self.patch_size * self.num_channels, self.d_model)
+            self.channel_stat_proj = nn.Linear(3, self.d_model)
+            self.spectral_proj = nn.Linear(1, self.d_model)
+            self.channel_embed = nn.Embedding(self.num_channels, self.d_model)
+            self.spectral_embed = nn.Embedding(self.num_spectral_tokens, self.d_model)
+            # 0=time patch, 1=channel summary, 2=spectral band.
+            self.type_embed = nn.Embedding(3, self.d_model)
+            self.time_embed = nn.Sequential(
                 nn.Linear(1, self.d_model),
                 nn.SiLU(),
-                nn.Linear(self.d_model, self.num_stage_tokens),
+                nn.Linear(self.d_model, self.d_model),
             )
-            self.focal_memory_norm = nn.LayerNorm(self.d_model)
-            self.focal_query_norm = nn.LayerNorm(self.d_model)
-            self.focal_attn = TimestepAwareCrossAttention(self.d_model, heads, dropout)
-            self.channel_context_norm = nn.LayerNorm(self.d_model)
-            self.expert_context_norm = nn.LayerNorm(self.d_model)
-            self.scale_context_norm = nn.LayerNorm(self.d_model)
-            self.stage_context_norm = nn.LayerNorm(self.d_model)
+
+            self.text_norm = nn.LayerNorm(self.d_model)
+            self.state_norm = nn.LayerNorm(self.d_model)
+            self.text_to_state = nn.MultiheadAttention(self.d_model, heads, dropout=dropout, batch_first=True)
+            self.state_to_text = nn.MultiheadAttention(self.d_model, heads, dropout=dropout, batch_first=True)
+            self.text_ffn = _ffn(self.d_model, dropout)
+            self.state_ffn = _ffn(self.d_model, dropout)
+            self.dropout = nn.Dropout(dropout)
+
+            self.state_to_context = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
+            self.context_gate = nn.Sequential(
+                nn.LayerNorm(2 * self.d_model),
+                nn.Linear(2 * self.d_model, self.d_model),
+                nn.Sigmoid(),
+            )
+            self.context_norm = nn.LayerNorm(self.d_model)
+            self.expert_context = nn.Sequential(
+                nn.LayerNorm(2 * self.d_model),
+                nn.Linear(2 * self.d_model, self.num_experts * self.d_model),
+            )
+            self.text_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
+            self.state_align = nn.Sequential(nn.LayerNorm(self.d_model), nn.Linear(self.d_model, self.d_model))
+            if self.focal_mode == "latent_query":
+                init = 0.02
+                self.channel_queries = nn.Parameter(torch.randn(self.num_channels, self.d_model) * init)
+                self.expert_queries = nn.Parameter(torch.randn(self.num_experts, self.d_model) * init)
+                self.scale_queries = nn.Parameter(torch.randn(self.num_spectral_tokens, self.d_model) * init)
+                self.stage_queries = nn.Parameter(torch.randn(self.num_stage_tokens, self.d_model) * init)
+                self.stage_selector = nn.Sequential(
+                    nn.Linear(1, self.d_model),
+                    nn.SiLU(),
+                    nn.Linear(self.d_model, self.num_stage_tokens),
+                )
+                self.focal_memory_norm = nn.LayerNorm(self.d_model)
+                self.focal_query_norm = nn.LayerNorm(self.d_model)
+                self.focal_attn = TimestepAwareCrossAttention(self.d_model, heads, dropout)
+                self.channel_context_norm = nn.LayerNorm(self.d_model)
+                self.expert_context_norm = nn.LayerNorm(self.d_model)
+                self.scale_context_norm = nn.LayerNorm(self.d_model)
+                self.stage_context_norm = nn.LayerNorm(self.d_model)
 
     def forward(
         self,
@@ -176,6 +703,8 @@ class CrossModalConditionBridge(nn.Module):
         slot_mask: torch.Tensor,
         x_t: torch.Tensor,
         t: torch.Tensor,
+        compute_alignment: bool = True,
+        target: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if slot_tokens.ndim != 3:
             raise ValueError(f"slot_tokens must be [B,J,D], got {tuple(slot_tokens.shape)}")
@@ -198,6 +727,19 @@ class CrossModalConditionBridge(nn.Module):
         x_t = x_t.to(device=device, dtype=dtype)
         t = t.to(device=device, dtype=dtype)
         slot_mask = slot_mask.to(device=device, dtype=dtype)
+        if target is not None:
+            target = target.to(device=device, dtype=dtype)
+        if self.patch_merger_connector is not None:
+            return self.patch_merger_connector(
+                x_t=x_t,
+                t=t,
+                slot_tokens=slot_tokens,
+                slot_mask=slot_mask,
+                compute_alignment=compute_alignment,
+                target=target,
+            )
+        if not self._has_legacy_body:
+            raise RuntimeError("legacy bridge body was not built; expected patch_merger_connector to handle forward")
         state_tokens = self._build_state_tokens(x_t, t)
 
         text_query = self.text_norm(slot_tokens)
@@ -251,7 +793,10 @@ class CrossModalConditionBridge(nn.Module):
             expert_context = self.expert_context(torch.cat([bridge_context, state_context], dim=-1))
             expert_context = expert_context.view(batch, self.num_experts, self.d_model)
 
-        alignment_loss, alignment_aux = self._alignment_loss(text_context, state_context)
+        if compute_alignment:
+            alignment_loss, alignment_aux = self._alignment_loss(text_context, state_context)
+        else:
+            alignment_loss, alignment_aux = _zero_alignment_aux(state_context)
         valid_slot_count = slot_mask.sum(dim=1)
         text_entropy, text_max, text_entropy_norm = _attention_summary(text_attn, query_mask=slot_mask)
         state_entropy, state_max, state_entropy_norm = _attention_summary(state_attn, key_mask=slot_mask)
@@ -428,6 +973,29 @@ def _safe_key_padding_mask(mask: torch.Tensor) -> torch.Tensor:
 def _num_patch_tokens(length: int, patch_size: int) -> int:
     effective = min(int(patch_size), int(length))
     return int(math.ceil(float(length) / float(max(effective, 1))))
+
+
+def _nan_summary(reference: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    value = reference.new_tensor(float("nan"))
+    return value, value, value
+
+
+def _zero_alignment_aux(reference: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    return reference.new_zeros(()), {
+        "bridge_alignment_logit_pos": reference.new_tensor(float("nan")),
+        "bridge_alignment_logit_std": reference.new_tensor(float("nan")),
+    }
+
+
+def _balanced_sigmoid_contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim != 2 or logits.shape[0] != logits.shape[1]:
+        raise ValueError(f"contrastive logits must be square [B,B], got {tuple(logits.shape)}")
+    pos_loss = -F.logsigmoid(torch.diagonal(logits)).mean()
+    if logits.shape[0] <= 1:
+        return pos_loss
+    eye = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+    neg_loss = -F.logsigmoid(-logits.masked_select(~eye)).mean()
+    return 0.5 * (pos_loss + neg_loss)
 
 
 def _attention_summary(

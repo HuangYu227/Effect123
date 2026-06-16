@@ -1,0 +1,148 @@
+task:
+  mode: text2ts
+
+data:
+  root: null
+  window_length: null
+  normalize: true
+  caption_policy: random
+  include_precomputed_embeddings: false
+  seed: 20260609
+
+model:
+  d_model: 256
+  patch_len: 6
+  num_operators: 3
+  transformer_layers: 2
+  transformer_heads: 4
+  channel_patch_len: 6
+  channel_stride: 3
+  channel_temporal_layers: 1
+  channel_layers: 1
+  channel_heads: 4
+  channel_dropout: 0.0
+
+  mapper_field_rank: 4
+  mapper_slot_layers: 1
+  mapper_slot_heads: 4
+  mapper_dropout: 0.0
+  mapper_normalizer: softmax
+  mapper_bounded_field_gate: true
+  mapper_gate_rescale: auto
+  mapper_operator_router: text
+  mapper_time_segment_scales: [1]
+  mapper_router_epsilon: 0.0001
+  mapper_flow_time_condition: true
+
+  operator_architecture: structural
+  operator_hidden: 128
+  operator_t_dim: 32
+  operator_max_velocity: 5.0
+  operator_depth: 2
+  operator_kernel_size: 3
+  operator_dropout: 0.0
+  operator_context_mode: global
+  operator_context_film: true
+  operator_multiview_context: true
+  operator_norm: group
+  operator_channel_heads: 4
+
+  use_cross_modal_bridge: true
+  bridge_focal_mode: legacy
+  bridge_num_heads: 4
+  bridge_dropout: 0.0
+  bridge_patch_size: 6
+  bridge_num_spectral_tokens: 3
+  bridge_num_stage_tokens: 3
+  bridge_alignment_temperature: 0.07
+  bridge_state_connector: patch_merger
+  bridge_temporal_merge: 4
+  bridge_channel_merge: 1
+  bridge_token_budget: 96
+  bridge_alignment_mode: siglip
+  # P1: dense (ColBERT MaxSim) alignment over region tokens, against the clean
+  # target encoding instead of pooled-vs-pooled on the noisy flow state. This
+  # turns the alignment from a single-direction cosine into token<->timestep
+  # correspondence.
+  bridge_alignment_dense: true
+  bridge_alignment_regions: 8
+  bridge_alignment_target: clean
+  bridge_diagnostics: false
+
+  use_latent_regime_adapter: false
+  num_regimes: 4
+  regime_dim: 256
+  regime_hidden_dim: 256
+  regime_temperature: 0.7
+  regime_posterior_mode: learned
+  regime_append_token: false
+  regime_state_weight_mode: linear_t
+
+  router_mode: global_operator
+  operator_gate_router: attention
+  operator_gate_heads: 4
+
+text_encoder:
+  mode: longclip
+  output_type: tokens
+  max_output_tokens: 96
+  hash_dim: 256
+  precomputed_dim: 128
+  hf_model_name: "BAAI/bge-small-en-v1.5"
+  longclip_model_name: "save/Longclip"
+  longclip_local_files_only: true
+  local_files_only: false
+  fallback_mode: error
+  fallback_hash_dim: 256
+
+train:
+  batch_size: 1024
+  eval_batch_size: 512
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_steps: 10000
+  cfm_loss_mode: global
+  noise_scale: 1.0
+
+  caption_slot_strategy: single
+  max_caption_slots: 1
+  include_all_caption_candidates: false
+  routing_loss_weight: 0.0
+  regime_ortho_weight: 0.0
+  # P1: dense alignment carries a real learning signal, so raise its weight from
+  # the cosmetic 3e-4 toward the same order as the auxiliary losses.
+  bridge_alignment_weight: 0.01
+  caption_ranking_weight: 0.001
+  caption_ranking_margin: 0.05
+  # P1: load-balance KL on the operator gate to prevent expert collapse and let
+  # the structural time/channel/frequency experts actually specialize.
+  operator_balance_weight: 0.01
+  # P0: classifier-free guidance requires null-caption dropout during training.
+  condition_dropout_prob: 0.1
+  # P0: frequency-domain supervision on the predicted clean signal. Directly
+  # targets the spectral/distributional fidelity gap (FID / J-FTSD) and gives
+  # the structural FrequencyBandExpert a reason to specialize.
+  spectral_loss_weight: 0.1
+  spectral_log_magnitude: true
+  warmup_steps: 200
+  min_lr: 1.0e-6
+
+  grad_clip: 1.0
+  num_workers: 0
+  device: auto
+  checkpoint_dir: checkpoints/v65_patch_merger_rank001
+  log_every: 20
+  eval_every: 300
+  eval_batches: 4
+  eval_seed_offset: 50000
+  best_metric: mse
+  best_metric_mode: min
+  save_every: 1000
+
+sample:
+  solver: rk4
+  steps: 32
+  noise_scale: 1.0
+  # P0: classifier-free guidance scale. 1.0 disables guidance; >1.0 sharpens how
+  # strongly the generated series follows the caption. Sweep {1.0, 2.0, 4.0}.
+  cfg_scale: 2.0

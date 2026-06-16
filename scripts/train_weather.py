@@ -176,6 +176,9 @@ def run_train(cfg: dict) -> None:
                 bridge_alignment_weight=float(cfg["train"].get("bridge_alignment_weight", 0.0)),
                 caption_ranking_weight=float(cfg["train"].get("caption_ranking_weight", 0.0)),
                 caption_ranking_margin=float(cfg["train"].get("caption_ranking_margin", 0.05)),
+                spectral_loss_weight=float(cfg["train"].get("spectral_loss_weight", 0.0)),
+                spectral_log_magnitude=bool(cfg["train"].get("spectral_log_magnitude", True)),
+                operator_balance_weight=float(cfg["train"].get("operator_balance_weight", 0.0)),
             )
             step += 1
             scheduler.step()
@@ -218,6 +221,12 @@ def run_train(cfg: dict) -> None:
                     postfix["cRank"] = f"{caption_rank:.4f}"
                     postfix["cNeg"] = f"{_scalar(out, 'caption_neg_mse'):.3f}"
                     postfix["cAcc"] = f"{_scalar(out, 'caption_ranking_acc'):.2f}"
+                spectral = _scalar(out, "loss_spectral")
+                if spectral > 0.0:
+                    postfix["spec"] = f"{spectral:.4f}"
+                op_balance = _scalar(out, "loss_operator_balance")
+                if op_balance > 0.0:
+                    postfix["opBal"] = f"{op_balance:.4f}"
                 text_slot_count = _scalar(out, "text_slot_count")
                 if text_slot_count == text_slot_count:
                     postfix["txtJ"] = f"{text_slot_count:.1f}"
@@ -356,6 +365,7 @@ def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int
                 solver=str(cfg.get("sample", {}).get("solver", "euler")),
                 steps=int(cfg.get("sample", {}).get("steps", 16)),
                 noise=noise,
+                cfg_scale=float(cfg.get("sample", {}).get("cfg_scale", 1.0)),
             )
             one = compute_text2ts_metrics(pred, batch["Y"])
             one.update(_field_summary(aux))
@@ -418,6 +428,10 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "bridge_focal_stage_entropy_norm",
         "bridge_alignment_logit_pos",
         "bridge_alignment_logit_std",
+        "bridge_patch_token_count",
+        "bridge_budget_pool_active",
+        "bridge_token_budget",
+        "bridge_connector_patch_merger",
     ):
         if torch.is_tensor(aux.get(key)) and aux[key].numel() == 1:
             out[key] = float(aux[key].detach().cpu())

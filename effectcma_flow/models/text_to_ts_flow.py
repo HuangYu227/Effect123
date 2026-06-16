@@ -92,6 +92,15 @@ class TextToTSFlow(nn.Module):
         bridge_alignment_temperature: float = 0.07,
         bridge_focal_mode: str = "legacy",
         bridge_num_stage_tokens: int = 3,
+        bridge_state_connector: str = "legacy",
+        bridge_temporal_merge: int = 4,
+        bridge_channel_merge: int = 1,
+        bridge_token_budget: int = 96,
+        bridge_alignment_mode: str = "auto",
+        bridge_alignment_dense: bool = False,
+        bridge_alignment_regions: int = 8,
+        bridge_alignment_target: str = "state",
+        bridge_diagnostics: bool = False,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -119,6 +128,15 @@ class TextToTSFlow(nn.Module):
                 alignment_temperature=bridge_alignment_temperature,
                 focal_mode=bridge_focal_mode,
                 num_stage_tokens=bridge_num_stage_tokens,
+                state_connector=bridge_state_connector,
+                temporal_merge=bridge_temporal_merge,
+                channel_merge=bridge_channel_merge,
+                token_budget=bridge_token_budget,
+                alignment_mode=bridge_alignment_mode,
+                alignment_dense=bridge_alignment_dense,
+                alignment_regions=bridge_alignment_regions,
+                alignment_target=bridge_alignment_target,
+                diagnostics=bridge_diagnostics,
             )
             if self.use_cross_modal_bridge
             else None
@@ -245,6 +263,9 @@ class TextToTSFlow(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         text_condition,
+        *,
+        compute_bridge_alignment: bool = True,
+        target: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if x_t.ndim != 3:
             raise ValueError(f"x_t must be [B, L, C], got {tuple(x_t.shape)}")
@@ -273,6 +294,8 @@ class TextToTSFlow(nn.Module):
                 slot_mask=slot_mask,
                 x_t=x_t,
                 t=t,
+                compute_alignment=compute_bridge_alignment,
+                target=target,
             )
 
         # V6.1: optional regime adapter (works with both routing modes)

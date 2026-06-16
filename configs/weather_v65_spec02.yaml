@@ -122,7 +122,7 @@ train:
   # P0: frequency-domain supervision on the predicted clean signal. Directly
   # targets the spectral/distributional fidelity gap (FID / J-FTSD) and gives
   # the structural FrequencyBandExpert a reason to specialize.
-  spectral_loss_weight: 0.1
+  spectral_loss_weight: 0.2
   spectral_log_magnitude: true
   warmup_steps: 200
   min_lr: 1.0e-6

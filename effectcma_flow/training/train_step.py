@@ -77,7 +77,7 @@ def cfm_train_step(
         _require_keys(batch, ("Y",), mode="text2ts")
         target = _expect_series(batch["Y"], name="batch['Y']")
         source = torch.randn_like(target) * float(noise_scale)
-        t = torch.rand(target.shape[0], device=target.device, dtype=target.dtype)
+        t = _sample_flow_time(target.shape[0], device=target.device, dtype=target.dtype)
         x_t = (1.0 - t[:, None, None]) * source + t[:, None, None] * target
         target_v = target - source
         text_condition = text_condition_from_batch(
@@ -240,6 +240,27 @@ def _caption_negative_batch(batch: dict[str, Any], *, device: torch.device) -> d
         if torch.is_tensor(value) and value.shape[0] == batch_size:
             out[key] = value.index_select(0, perm.to(value.device))
     return out
+
+
+def _sample_flow_time(
+    batch_size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    mode: str = "logit_normal",
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    """Sample flow-matching time steps t ∈ (0, 1).
+
+    ``logit_normal`` (default) draws from logit-N(mean, std²) following SD3/Flux,
+    concentrating mass on the mid-range where the velocity field is hardest to
+    learn. ``uniform`` falls back to the original torch.rand behaviour.
+    """
+    if mode == "uniform":
+        return torch.rand(batch_size, device=device, dtype=dtype)
+    z = torch.randn(batch_size, device=device, dtype=dtype) * std + mean
+    return torch.sigmoid(z).clamp(1e-5, 1.0 - 1e-5)
 
 
 def _expect_series(x: torch.Tensor, *, name: str) -> torch.Tensor:

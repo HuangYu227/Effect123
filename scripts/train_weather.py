@@ -97,24 +97,47 @@ def run_train(cfg: dict) -> None:
     root = cfg["data"]["root"]
     stats = compute_train_stats(root)
     train_ds, valid_ds, collate_fn = build_datasets(cfg, stats, include_embeddings=include_embeddings, task_mode=task_mode)
+    _num_workers = int(cfg["train"].get("num_workers", 4))
+    _pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg["train"].get("batch_size", 32)),
         shuffle=True,
-        num_workers=int(cfg["train"].get("num_workers", 0)),
+        num_workers=_num_workers,
+        pin_memory=_pin_memory,
+        persistent_workers=_num_workers > 0,
         collate_fn=collate_fn,
     )
     valid_loader = DataLoader(
         valid_ds,
         batch_size=int(cfg["train"].get("eval_batch_size") or cfg["train"].get("batch_size", 32)),
         shuffle=False,
-        num_workers=int(cfg["train"].get("num_workers", 0)),
+        num_workers=_num_workers,
+        pin_memory=_pin_memory,
+        persistent_workers=_num_workers > 0,
         collate_fn=collate_fn,
     )
     model = build_model(cfg, sequence_length=train_ds.sequence_length, num_channels=train_ds.num_channels).to(device)
     lr = float(cfg["train"].get("lr", 1e-4))
     weight_decay = float(cfg["train"].get("weight_decay", 1e-4))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Exclude bias, LayerNorm, GroupNorm, and Embedding weights from weight decay.
+    # Applying decay to these parameters actively hurts convergence.
+    _no_decay = {"bias", "norm.weight", "norm.bias", "norm1.weight", "norm1.bias",
+                 "norm2.weight", "norm2.bias", "layer_norm.weight", "layer_norm.bias",
+                 "group_norm.weight", "group_norm.bias"}
+    decay_params, no_decay_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(nd in name for nd in _no_decay) or param.ndim <= 1:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    optimizer = torch.optim.AdamW(
+        [{"params": decay_params, "weight_decay": weight_decay},
+         {"params": no_decay_params, "weight_decay": 0.0}],
+        lr=lr,
+    )
     # Learning rate scheduler: linear warmup + cosine decay
     warmup_steps = int(cfg["train"].get("warmup_steps", 200))
     min_lr = float(cfg["train"].get("min_lr", 1e-6))

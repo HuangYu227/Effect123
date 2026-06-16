@@ -1,10 +1,14 @@
 """CFM training step for V6.1/V6.2.
 
 Training objective:
-    L = L_CFM + lambda_ortho * L_regime_ortho + lambda_bridge * L_bridge_align
+    L = L_CFM
+        + lambda_ortho * L_regime_ortho
+        + lambda_bridge * L_bridge_align
+        + lambda_rank * L_caption_rank
 
 No routing entropy, channel entropy, field mass, trend, frequency, volatility,
-or artificial semantic-slot losses are used.
+or artificial semantic-slot losses are used. The optional caption ranking loss
+uses real captions only: positive caption versus batch-shuffled caption.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ def cfm_train_step(
     condition_dropout_prob: float = 0.0,
     regime_ortho_weight: float = 0.0,
     bridge_alignment_weight: float = 0.0,
+    caption_ranking_weight: float = 0.0,
+    caption_ranking_margin: float = 0.05,
     # Backward-compatibility guard: old routing losses must stay disabled.
     routing_loss_weight: float = 0.0,
     **unused: Any,
@@ -45,6 +51,7 @@ def cfm_train_step(
         batch = batch_to_device(batch, device)
     task_mode = str(task_mode).lower()
 
+    negative_pred_v: torch.Tensor | None = None
     if task_mode == "edit":
         _require_keys(batch, ("B", "Y"), mode="edit")
         base = _expect_series(batch["B"], name="batch['B']")
@@ -74,6 +81,17 @@ def cfm_train_step(
         # Note: prepare_condition is called inside model.forward(), not here.
         # This avoids redundant text-encoding and keeps dtype handling consistent.
         pred_v, aux = model(x_t, t, text_condition)
+        if float(caption_ranking_weight) > 0.0 and target.shape[0] > 1:
+            negative_batch = _caption_negative_batch(batch, device=target.device)
+            negative_condition = text_condition_from_batch(
+                _maybe_blank_caption_batch(negative_batch, p=float(condition_dropout_prob)),
+                text_encoder_mode,
+                condition_key="caption",
+                caption_slot_strategy=caption_slot_strategy,
+                max_caption_slots=max_caption_slots,
+                include_all_caption_candidates=include_all_caption_candidates,
+            )
+            negative_pred_v, _ = model(x_t, t, negative_condition)
     else:
         raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
 
@@ -87,7 +105,25 @@ def cfm_train_step(
     bridge_alignment = pred_v.new_zeros(())
     if float(bridge_alignment_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("bridge_alignment_loss")):
         bridge_alignment = aux["bridge_alignment_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
-    loss = cfm_loss + float(regime_ortho_weight) * regime_ortho + float(bridge_alignment_weight) * bridge_alignment
+    caption_ranking = pred_v.new_zeros(())
+    caption_pos_mse = _per_sample_mse(pred_v, target_v, batch.get("mask")).mean()
+    caption_neg_mse = pred_v.new_zeros(())
+    caption_ranking_acc = pred_v.new_zeros(())
+    if negative_pred_v is not None:
+        if negative_pred_v.shape != target_v.shape:
+            raise ValueError(f"negative pred_v shape {tuple(negative_pred_v.shape)} must match target_v {tuple(target_v.shape)}")
+        pos_sample = _per_sample_mse(pred_v, target_v, batch.get("mask"))
+        neg_sample = _per_sample_mse(negative_pred_v, target_v, batch.get("mask"))
+        caption_ranking = torch.relu(float(caption_ranking_margin) + pos_sample - neg_sample).mean()
+        caption_pos_mse = pos_sample.mean()
+        caption_neg_mse = neg_sample.mean()
+        caption_ranking_acc = (neg_sample > pos_sample).to(dtype=pred_v.dtype).mean()
+    loss = (
+        cfm_loss
+        + float(regime_ortho_weight) * regime_ortho
+        + float(bridge_alignment_weight) * bridge_alignment
+        + float(caption_ranking_weight) * caption_ranking
+    )
 
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
@@ -104,6 +140,10 @@ def cfm_train_step(
         "loss_cfm": cfm_loss.detach(),
         "loss_regime_ortho": regime_ortho.detach(),
         "loss_bridge_alignment": bridge_alignment.detach(),
+        "loss_caption_ranking": caption_ranking.detach(),
+        "caption_pos_mse": caption_pos_mse.detach(),
+        "caption_neg_mse": caption_neg_mse.detach(),
+        "caption_ranking_acc": caption_ranking_acc.detach(),
         **loss_parts,
         "pred_v": pred_v.detach(),
         "target_v": target_v.detach(),
@@ -140,6 +180,28 @@ def _maybe_blank_caption_batch(batch: dict[str, Any], *, p: float) -> dict[str, 
     if "caption_candidates" in batch and batch["caption_candidates"] is not None:
         new_batch["caption_candidates"] = [[] if m else c for m, c in zip(mask, batch["caption_candidates"])]
     return new_batch
+
+
+def _caption_negative_batch(batch: dict[str, Any], *, device: torch.device) -> dict[str, Any]:
+    if "caption" not in batch:
+        raise ValueError("caption_ranking_weight requires batch['caption']")
+    batch_size = len(batch["caption"])
+    if batch_size <= 1:
+        return batch
+    perm = torch.randperm(batch_size, device=device)
+    if torch.equal(perm.cpu(), torch.arange(batch_size)):
+        perm = torch.roll(perm, shifts=1)
+    indices = [int(i) for i in perm.cpu().tolist()]
+    out = dict(batch)
+    for key in ("caption", "caption_candidates", "captions"):
+        value = batch.get(key)
+        if value is not None:
+            out[key] = [value[i] for i in indices]
+    for key in ("caption_embeddings",):
+        value = batch.get(key)
+        if torch.is_tensor(value) and value.shape[0] == batch_size:
+            out[key] = value.index_select(0, perm.to(value.device))
+    return out
 
 
 def _expect_series(x: torch.Tensor, *, name: str) -> torch.Tensor:
@@ -180,6 +242,20 @@ def _cfm_loss(sq_error: torch.Tensor, mask: torch.Tensor | None, *, mode: str) -
     outside = (sq_error * inv_mask).sum() / inv_mask.sum().clamp_min(1.0)
     parts.update({"loss_inside": inside.detach(), "loss_outside": outside.detach()})
     return 0.5 * (inside + outside), parts
+
+
+def _per_sample_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    sq_error = (pred - target) ** 2
+    if mask is None:
+        return sq_error.flatten(1).mean(dim=1)
+    mask = mask.to(sq_error.device, dtype=sq_error.dtype)
+    if mask.shape == sq_error.shape[:2]:
+        mask = mask.unsqueeze(-1).expand_as(sq_error)
+    elif mask.shape == (*sq_error.shape[:2], 1):
+        mask = mask.expand_as(sq_error)
+    elif mask.shape != sq_error.shape:
+        raise ValueError(f"caption ranking mask must be broadcastable to {tuple(sq_error.shape)}, got {tuple(mask.shape)}")
+    return (sq_error * mask).flatten(1).sum(dim=1) / mask.flatten(1).sum(dim=1).clamp_min(1.0)
 
 
 def _flow_diagnostics(*, target: torch.Tensor, source: torch.Tensor, pred_v: torch.Tensor, target_v: torch.Tensor) -> dict[str, torch.Tensor]:

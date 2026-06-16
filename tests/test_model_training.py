@@ -884,6 +884,49 @@ def test_v62_train_step_includes_bridge_alignment_loss():
     assert torch.allclose(result["loss"], expected, atol=1e-6)
 
 
+def test_text2ts_caption_negative_ranking_loss_is_optional_and_finite():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "use_cross_modal_bridge": True,
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=3, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        caption_ranking_weight=1e-3,
+        caption_ranking_margin=0.05,
+    )
+    assert torch.isfinite(result["loss"])
+    assert torch.isfinite(result["loss_caption_ranking"])
+    assert torch.isfinite(result["caption_neg_mse"])
+    assert 0.0 <= result["caption_ranking_acc"].item() <= 1.0
+    expected = result["loss_cfm"] + 1e-3 * result["loss_caption_ranking"]
+    assert torch.allclose(result["loss"], expected, atol=1e-6)
+
+
+def test_text2ts_caption_negative_ranking_batch_one_is_zero():
+    model = build_model(_text2ts_config(), sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=1, length=12, channels=4)
+    result = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        caption_ranking_weight=1e-3,
+    )
+    assert result["loss_caption_ranking"].item() == 0.0
+    assert torch.allclose(result["loss"], result["loss_cfm"])
+
+
 def test_v62_candidates_slots_reach_bridge_diagnostics():
     cfg = _text2ts_config()
     cfg["model"].update(

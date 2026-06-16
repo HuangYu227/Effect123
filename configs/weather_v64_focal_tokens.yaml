@@ -97,6 +97,8 @@ train:
   routing_loss_weight: 0.0
   regime_ortho_weight: 0.0
   bridge_alignment_weight: 0.0
+  caption_ranking_weight: 0.0
+  caption_ranking_margin: 0.05
   condition_dropout_prob: 0.0
   warmup_steps: 200
   min_lr: 1.0e-6

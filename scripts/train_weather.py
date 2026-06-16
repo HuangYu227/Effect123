@@ -44,6 +44,8 @@ def main() -> None:
     parser.add_argument("--operator-norm", default=None, choices=["group", "batch"], help="Ablation: operator expert normalization")
     parser.add_argument("--caption-shuffle", action="store_true", help="Ablation: shuffle captions within each batch to break text-ts pairing")
     parser.add_argument("--blank-captions", action="store_true", help="Ablation: replace all captions with empty strings")
+    parser.add_argument("--caption-ranking-weight", type=float, default=None, help="Weight for caption-negative velocity ranking loss")
+    parser.add_argument("--caption-ranking-margin", type=float, default=None, help="Margin for caption-negative velocity ranking loss")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--checkpoint-dir", default=None)
     args = parser.parse_args()
@@ -76,6 +78,10 @@ def main() -> None:
         cfg["train"]["caption_shuffle"] = True
     if args.blank_captions:
         cfg["train"]["blank_captions"] = True
+    if args.caption_ranking_weight is not None:
+        cfg["train"]["caption_ranking_weight"] = float(args.caption_ranking_weight)
+    if args.caption_ranking_margin is not None:
+        cfg["train"]["caption_ranking_margin"] = float(args.caption_ranking_margin)
     resolve_data_root(cfg, args.data_root)
     run_train(cfg)
 
@@ -168,6 +174,8 @@ def run_train(cfg: dict) -> None:
                 condition_dropout_prob=float(cfg["train"].get("condition_dropout_prob", 0.0)),
                 regime_ortho_weight=float(cfg["train"].get("regime_ortho_weight", 0.0)),
                 bridge_alignment_weight=float(cfg["train"].get("bridge_alignment_weight", 0.0)),
+                caption_ranking_weight=float(cfg["train"].get("caption_ranking_weight", 0.0)),
+                caption_ranking_margin=float(cfg["train"].get("caption_ranking_margin", 0.05)),
             )
             step += 1
             scheduler.step()
@@ -205,6 +213,11 @@ def run_train(cfg: dict) -> None:
                 bridge_align = _scalar(out, "loss_bridge_alignment")
                 if bridge_align > 0.0:
                     postfix["bAlign"] = f"{bridge_align:.4f}"
+                caption_rank = _scalar(out, "loss_caption_ranking")
+                if caption_rank > 0.0:
+                    postfix["cRank"] = f"{caption_rank:.4f}"
+                    postfix["cNeg"] = f"{_scalar(out, 'caption_neg_mse'):.3f}"
+                    postfix["cAcc"] = f"{_scalar(out, 'caption_ranking_acc'):.2f}"
                 text_slot_count = _scalar(out, "text_slot_count")
                 if text_slot_count == text_slot_count:
                     postfix["txtJ"] = f"{text_slot_count:.1f}"

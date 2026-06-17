@@ -136,9 +136,14 @@ train:
   device: auto
   checkpoint_dir: checkpoints/v65_patch_merger_rank001
   log_every: 20
-  eval_every: 300
+  eval_every: 200
   eval_batches: 20
   eval_seed_offset: 50000
+  # ConTSG statistical metrics (MDD/ACD/SD/KD) during periodic validation. These
+  # are encoder-free (raw-series histograms/moments), so the overhead is tiny.
+  # The 7 embedding metrics (FID/J-FTSD/Precision/Recall/...) only run in the
+  # final eval_verbalts_metrics.py pass, which reports all 11.
+  eval_statistical_metrics: true
   best_metric: mse
   best_metric_mode: min
   save_every: 1000

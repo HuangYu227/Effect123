@@ -11,6 +11,7 @@ import yaml
 from scipy import linalg
 from tqdm import tqdm
 
+from effectcma_flow.evaluation import contsg_metrics
 from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.training.utils import batch_to_device, text_condition_from_batch
 
@@ -94,23 +95,28 @@ class VerbalTSMetricComputer:
         reference_cache_dir = cache_dir if reference_max_batches is None else None
         ref_stats = self._load_reference_stats(reference_cache_dir, cache_metadata)
         if ref_stats is None:
-            ref_ts, ref_joint = self._collect_reference_embeddings(
+            ref_ts, ref_joint, ref_raw = self._collect_reference_embeddings(
                 reference_loader,
                 reference_max_batches,
                 series_key=reference_series_key,
                 text_key=reference_text_key,
                 denormalize=reference_denormalize,
             )
+            ts_mean, ts_cov = _mean_cov(ref_ts)
+            joint_mean, joint_cov = _mean_cov(ref_joint)
             ref_stats = {
-                "ts_mean": _mean_cov(ref_ts)[0],
-                "ts_cov": _mean_cov(ref_ts)[1],
-                "joint_mean": _mean_cov(ref_joint)[0],
-                "joint_cov": _mean_cov(ref_joint)[1],
+                "ts_mean": ts_mean,
+                "ts_cov": ts_cov,
+                "joint_mean": joint_mean,
+                "joint_cov": joint_cov,
+                "ts_feat": ref_ts,
+                "joint_feat": ref_joint,
+                "raw_ts": ref_raw,
                 "reference_count": float(ref_ts.shape[0]),
             }
             self._save_reference_stats(reference_cache_dir, ref_stats, cache_metadata)
 
-        gen_ts, gen_joint, cttp = self._collect_generated_embeddings(
+        gen_ts, gen_joint, cttp, gen_raw = self._collect_generated_embeddings(
             model=model,
             loader=generated_loader,
             text_encoder_mode=text_encoder_mode,
@@ -130,13 +136,60 @@ class VerbalTSMetricComputer:
         )
         gen_ts_mean, gen_ts_cov = _mean_cov(gen_ts)
         gen_joint_mean, gen_joint_cov = _mean_cov(gen_joint)
-        return {
+        out = {
             "verbalts_fid": calculate_frechet_distance(ref_stats["ts_mean"], ref_stats["ts_cov"], gen_ts_mean, gen_ts_cov),
             "verbalts_jftsd": calculate_frechet_distance(ref_stats["joint_mean"], ref_stats["joint_cov"], gen_joint_mean, gen_joint_cov),
             "verbalts_cttp": float(cttp),
             "verbalts_reference_count": float(ref_stats["reference_count"]),
             "verbalts_generated_count": float(gen_ts.shape[0]),
+            "CTTPScore": float(cttp),
         }
+        out.update(
+            self._compute_contsg_metrics(
+                ref_ts_feat=ref_stats["ts_feat"],
+                ref_joint_feat=ref_stats["joint_feat"],
+                ref_raw_ts=ref_stats["raw_ts"],
+                gen_ts_feat=gen_ts,
+                gen_joint_feat=gen_joint,
+                gen_raw_ts=gen_raw,
+            )
+        )
+        return out
+
+    def _compute_contsg_metrics(
+        self,
+        *,
+        ref_ts_feat: np.ndarray,
+        ref_joint_feat: np.ndarray,
+        ref_raw_ts: np.ndarray,
+        gen_ts_feat: np.ndarray,
+        gen_joint_feat: np.ndarray,
+        gen_raw_ts: np.ndarray,
+    ) -> dict[str, float]:
+        """Compute the full 11-metric ConTSG-Bench panel.
+
+        Statistical metrics use raw time series. Embedding metrics reuse the
+        already-collected CTTP feature point clouds: the time-series cloud feeds
+        FID / Precision / Recall, and the joint (ts|text) cloud feeds J-FTSD /
+        JointPrecision / JointRecall. kNN manifold metrics run on ``self.device``.
+        """
+        out: dict[str, float] = {}
+        out.update(
+            contsg_metrics.compute_statistical_metrics(
+                ref_raw_ts,
+                gen_raw_ts,
+                train_reference=ref_raw_ts,
+            )
+        )
+        out["FID"] = contsg_metrics.frechet_distance(ref_ts_feat, gen_ts_feat)
+        precision, recall = contsg_metrics.precision_recall(ref_ts_feat, gen_ts_feat, device=self.device)
+        out["Precision"] = precision
+        out["Recall"] = recall
+        out["J-FTSD"] = contsg_metrics.frechet_distance(ref_joint_feat, gen_joint_feat)
+        jprecision, jrecall = contsg_metrics.precision_recall(ref_joint_feat, gen_joint_feat, device=self.device)
+        out["JointPrecision"] = jprecision
+        out["JointRecall"] = jrecall
+        return out
 
     @torch.no_grad()
     def _collect_reference_embeddings(
@@ -147,9 +200,10 @@ class VerbalTSMetricComputer:
         series_key: str,
         text_key: str,
         denormalize: bool,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         ts_embeddings = []
         joint_embeddings = []
+        raw_series = []
         for batch_no, batch in enumerate(tqdm(loader, desc="verbalts-ref", dynamic_ncols=True)):
             if max_batches is not None and batch_no >= max_batches:
                 break
@@ -160,7 +214,12 @@ class VerbalTSMetricComputer:
             ts_emb, text_emb = self._embed(target, text)
             ts_embeddings.append(ts_emb.cpu())
             joint_embeddings.append(torch.cat([ts_emb, text_emb], dim=-1).cpu())
-        return _cat_numpy(ts_embeddings, "reference time-series embeddings"), _cat_numpy(joint_embeddings, "reference joint embeddings")
+            raw_series.append(target.detach().cpu())
+        return (
+            _cat_numpy(ts_embeddings, "reference time-series embeddings"),
+            _cat_numpy(joint_embeddings, "reference joint embeddings"),
+            _cat_numpy(raw_series, "reference raw series"),
+        )
 
     @torch.no_grad()
     def _collect_generated_embeddings(
@@ -182,10 +241,11 @@ class VerbalTSMetricComputer:
         include_all_caption_candidates: bool,
         text_key: str,
         max_batches: int | None,
-    ) -> tuple[np.ndarray, np.ndarray, float]:
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
         model.eval()
         ts_embeddings = []
         joint_embeddings = []
+        raw_series = []
         cttp_sum = 0.0
         count = 0
         for batch_no, batch in enumerate(tqdm(loader, desc="verbalts-gen", dynamic_ncols=True)):
@@ -235,11 +295,17 @@ class VerbalTSMetricComputer:
             ts_emb, text_emb = self._embed(pred, text)
             ts_embeddings.append(ts_emb.cpu())
             joint_embeddings.append(torch.cat([ts_emb, text_emb], dim=-1).cpu())
+            raw_series.append(pred.detach().cpu())
             cttp_sum += (ts_emb * text_emb).sum(dim=-1).sum().item()
             count += int(ts_emb.shape[0])
         if count == 0:
             raise ValueError("No generated batches were evaluated for VerbalTS metrics")
-        return _cat_numpy(ts_embeddings, "generated time-series embeddings"), _cat_numpy(joint_embeddings, "generated joint embeddings"), cttp_sum / count
+        return (
+            _cat_numpy(ts_embeddings, "generated time-series embeddings"),
+            _cat_numpy(joint_embeddings, "generated joint embeddings"),
+            cttp_sum / count,
+            _cat_numpy(raw_series, "generated raw series"),
+        )
 
     def _embed(self, ts: torch.Tensor, text: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         ts_len = torch.full((ts.shape[0],), ts.shape[1], device=self.device, dtype=torch.int32)
@@ -254,6 +320,9 @@ class VerbalTSMetricComputer:
         std = self.stats["std"].to(ts.device, dtype=ts.dtype)
         return ts * std + mean
 
+    # Bump when the cached payload layout changes so stale caches are ignored.
+    _CACHE_VERSION = 2
+
     def _load_reference_stats(self, cache_dir: str | Path | None, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         if cache_dir is None:
             return None
@@ -263,17 +332,21 @@ class VerbalTSMetricComputer:
             "ts_cov": cache / "verbalts_ref_ts_cov.npy",
             "joint_mean": cache / "verbalts_ref_joint_mean.npy",
             "joint_cov": cache / "verbalts_ref_joint_cov.npy",
+            "ts_feat": cache / "verbalts_ref_ts_feat.npy",
+            "joint_feat": cache / "verbalts_ref_joint_feat.npy",
+            "raw_ts": cache / "verbalts_ref_raw_ts.npy",
         }
         count_path = cache / "verbalts_ref_count.npy"
         meta_path = cache / "verbalts_ref_meta.json"
         if not all(path.exists() for path in files.values()) or not count_path.exists():
             return None
-        if metadata is not None:
-            if not meta_path.exists():
-                return None
-            cached = json.loads(meta_path.read_text(encoding="utf-8"))
-            if cached != _jsonable(metadata):
-                return None
+        if not meta_path.exists():
+            return None
+        cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if cached_meta.get("_cache_version") != self._CACHE_VERSION:
+            return None
+        if metadata is not None and cached_meta.get("payload") != _jsonable(metadata):
+            return None
         out = {key: np.load(path, allow_pickle=False) for key, path in files.items()}
         out["reference_count"] = float(np.load(count_path, allow_pickle=False).reshape(-1)[0])
         return out
@@ -287,9 +360,12 @@ class VerbalTSMetricComputer:
         np.save(cache / "verbalts_ref_ts_cov.npy", stats["ts_cov"])
         np.save(cache / "verbalts_ref_joint_mean.npy", stats["joint_mean"])
         np.save(cache / "verbalts_ref_joint_cov.npy", stats["joint_cov"])
+        np.save(cache / "verbalts_ref_ts_feat.npy", stats["ts_feat"])
+        np.save(cache / "verbalts_ref_joint_feat.npy", stats["joint_feat"])
+        np.save(cache / "verbalts_ref_raw_ts.npy", stats["raw_ts"])
         np.save(cache / "verbalts_ref_count.npy", np.array([stats["reference_count"]], dtype=np.float64))
-        if metadata is not None:
-            (cache / "verbalts_ref_meta.json").write_text(json.dumps(_jsonable(metadata), sort_keys=True, indent=2), encoding="utf-8")
+        wrapped = {"_cache_version": self._CACHE_VERSION, "payload": _jsonable(metadata) if metadata is not None else None}
+        (cache / "verbalts_ref_meta.json").write_text(json.dumps(wrapped, sort_keys=True, indent=2), encoding="utf-8")
 
 
 def _load_verbalts_cttp(

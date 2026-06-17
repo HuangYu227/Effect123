@@ -22,6 +22,7 @@ from effectcma_flow.data import (
     compute_train_stats,
 )
 from effectcma_flow.evaluation.metrics import average_metric_dicts, compute_field_metrics, compute_metrics, compute_text2ts_metrics
+from effectcma_flow.evaluation import contsg_metrics
 from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.models import build_model
 from effectcma_flow.training import cfm_train_step, resolve_device, set_seed
@@ -359,6 +360,18 @@ def build_datasets(cfg: dict, stats: dict, *, include_embeddings: bool, task_mod
     raise ValueError(f"Unknown task.mode {task_mode!r}; expected 'text2ts' or 'edit'")
 
 
+def _statistical_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    """Encoder-free ConTSG statistical metrics (MDD/ACD/SD/KD) for one batch.
+
+    Cheap enough to run every validation pass: no CLIP encoder, just raw-series
+    histograms / moments. The batch's own targets serve as the histogram range
+    reference, which is adequate for the relative MDD signal during training.
+    """
+    real = target.detach().float().cpu().numpy()
+    gen = pred.detach().float().cpu().numpy()
+    return contsg_metrics.compute_statistical_metrics(real, gen, train_reference=real)
+
+
 @torch.no_grad()
 def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int) -> dict[str, float]:
     model.eval()
@@ -393,6 +406,8 @@ def evaluate(model, loader, cfg: dict, device: torch.device, *, max_batches: int
             )
             one = compute_text2ts_metrics(pred, batch["Y"])
             one.update(_field_summary(aux))
+            if bool(cfg.get("train", {}).get("eval_statistical_metrics", True)):
+                one.update(_statistical_metrics(pred, batch["Y"]))
         else:
             text_condition = text_condition_from_batch(batch, text_mode, condition_key="slots")
             pred, aux = euler_sample(model, batch["B"], text_condition, steps=int(cfg.get("sample", {}).get("steps", 16)))

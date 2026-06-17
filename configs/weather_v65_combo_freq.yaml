@@ -46,6 +46,14 @@ model:
   operator_multiview_context: true
   operator_norm: group
   operator_channel_heads: 4
+  # U3: soft top-K spectral mask for the FrequencyBandExpert (anneal aligned to
+  # the 15k schedule). Pairs with U2 below: U3 selects which bands, U2 controls
+  # when the spectral gradient is strongest over the flow time t.
+  operator_frequency_band_mode: soft_topk
+  operator_frequency_topk_frac: 0.15
+  operator_frequency_temp_start: 1.0
+  operator_frequency_temp_end: 0.1
+  operator_frequency_anneal_steps: 15000
 
   use_cross_modal_bridge: true
   bridge_focal_mode: legacy
@@ -60,10 +68,6 @@ model:
   bridge_channel_merge: 1
   bridge_token_budget: 96
   bridge_alignment_mode: siglip
-  # P1: dense (ColBERT MaxSim) alignment over region tokens, against the clean
-  # target encoding instead of pooled-vs-pooled on the noisy flow state. This
-  # turns the alignment from a single-direction cosine into token<->timestep
-  # correspondence.
   bridge_alignment_dense: true
   bridge_alignment_regions: 8
   bridge_alignment_target: clean
@@ -100,7 +104,7 @@ train:
   eval_batch_size: 512
   lr: 0.0001
   weight_decay: 0.0001
-  max_steps: 10000
+  max_steps: 15000
   cfm_loss_mode: global
   noise_scale: 1.0
 
@@ -109,40 +113,27 @@ train:
   include_all_caption_candidates: false
   routing_loss_weight: 0.0
   regime_ortho_weight: 0.0
-  # P1: dense alignment carries a real learning signal, so raise its weight from
-  # the cosmetic 3e-4 toward the same order as the auxiliary losses.
   bridge_alignment_weight: 0.01
   caption_ranking_weight: 0.001
   caption_ranking_margin: 0.05
-  # P1: load-balance KL on the operator gate to prevent expert collapse and let
-  # the structural time/channel/frequency experts actually specialize.
   operator_balance_weight: 0.01
-  # P0: classifier-free guidance requires null-caption dropout during training.
   condition_dropout_prob: 0.1
-  # P0: frequency-domain supervision on the predicted clean signal. Directly
-  # targets the spectral/distributional fidelity gap (FID / J-FTSD) and gives
-  # the structural FrequencyBandExpert a reason to specialize.
-  spectral_loss_weight: 0.2
+  # Baseline-anchored at the empirically stronger spec=0.1.
+  spectral_loss_weight: 0.1
   spectral_log_magnitude: true
-  # (1 - t)^power time weighting on the spectral magnitude loss. 0.0 == uniform
-  # over t (exact no-op); power > 0 downweights high-t samples (recovered x0 is
-  # already well constrained by x_t there) and shrinks the effective magnitude.
-  spectral_time_weight_power: 0.0
+  # U2: (1 - t)^power time weighting on the spectral magnitude loss.
+  spectral_time_weight_power: 1.0
   warmup_steps: 200
   min_lr: 1.0e-6
 
   grad_clip: 1.0
   num_workers: 0
   device: auto
-  checkpoint_dir: checkpoints/v65_patch_merger_rank001
+  checkpoint_dir: checkpoints/v65_combo_freq
   log_every: 20
-  eval_every: 300
+  eval_every: 200
   eval_batches: 20
   eval_seed_offset: 50000
-  # ConTSG statistical metrics (MDD/ACD/SD/KD) during periodic validation. These
-  # are encoder-free (raw-series histograms/moments), so the overhead is tiny.
-  # The 7 embedding metrics (FID/J-FTSD/Precision/Recall/...) only run in the
-  # final eval_verbalts_metrics.py pass, which reports all 11.
   eval_statistical_metrics: true
   best_metric: mse
   best_metric_mode: min
@@ -152,6 +143,6 @@ sample:
   solver: rk4
   steps: 32
   noise_scale: 1.0
-  # P0: classifier-free guidance scale. 1.0 disables guidance; >1.0 sharpens how
-  # strongly the generated series follows the caption. Sweep {1.0, 2.0, 4.0}.
   cfg_scale: 2.0
+  guidance_t_lo: 0.0
+  guidance_t_hi: 1.0

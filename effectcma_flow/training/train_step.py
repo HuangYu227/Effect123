@@ -48,6 +48,7 @@ def cfm_train_step(
     caption_ranking_margin: float = 0.05,
     spectral_loss_weight: float = 0.0,
     spectral_log_magnitude: bool = True,
+    spectral_time_weight_power: float = 0.0,
     operator_balance_weight: float = 0.0,
     # Backward-compatibility guard: old routing losses must stay disabled.
     routing_loss_weight: float = 0.0,
@@ -133,12 +134,29 @@ def cfm_train_step(
     spectral_loss = pred_v.new_zeros(())
     if float(spectral_loss_weight) > 0.0:
         pred_x0 = x_t + (1.0 - t[:, None, None]) * pred_v
-        spectral_loss = _spectral_magnitude_loss(
-            pred_x0,
-            target,
-            mask=batch.get("mask"),
-            log_magnitude=bool(spectral_log_magnitude),
-        )
+        if float(spectral_time_weight_power) > 0.0:
+            # Opt-in (1 - t)^power time weighting: emphasize samples nearer the
+            # source (small t) where the recovered x0 is least constrained by x_t.
+            # Note: power > 0 shrinks the effective spectral magnitude (the mean
+            # of a sub-unit weight is < 1); to compensate the user may raise
+            # spectral_loss_weight in the config. We deliberately do NOT rescale
+            # the weight here so the knob stays a pure, isolated time reweighting.
+            per_sample = _spectral_magnitude_loss(
+                pred_x0,
+                target,
+                mask=batch.get("mask"),
+                log_magnitude=bool(spectral_log_magnitude),
+                reduction="none",
+            )
+            time_weight = (1.0 - t).clamp_min(0.0) ** float(spectral_time_weight_power)
+            spectral_loss = (per_sample * time_weight.to(per_sample.dtype)).mean()
+        else:
+            spectral_loss = _spectral_magnitude_loss(
+                pred_x0,
+                target,
+                mask=batch.get("mask"),
+                log_magnitude=bool(spectral_log_magnitude),
+            )
     caption_ranking = pred_v.new_zeros(())
     caption_pos_mse = _per_sample_mse(pred_v, target_v, batch.get("mask")).mean()
     caption_neg_mse = pred_v.new_zeros(())
@@ -323,6 +341,7 @@ def _spectral_magnitude_loss(
     *,
     mask: torch.Tensor | None,
     log_magnitude: bool,
+    reduction: str = "mean",
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Frequency-domain MSE between predicted and target clean signals.
@@ -337,13 +356,20 @@ def _spectral_magnitude_loss(
     When a mask is supplied, masked-out steps are zeroed before the transform so
     that padded regions do not inject spurious spectral energy. The mask is only
     used to gate which samples/steps are valid; it is not a band mask.
+
+    ``reduction="mean"`` (default) returns a scalar mean over all elements,
+    preserving the original behaviour exactly. ``reduction="none"`` returns a
+    per-sample ``[B]`` tensor (mean over the freq/channel axes), which lets the
+    caller apply a per-sample time weight before averaging.
     """
+    if reduction not in {"mean", "none"}:
+        raise ValueError(f"Unknown reduction {reduction!r}; expected 'mean' or 'none'")
     if pred_x0.shape != target.shape:
         raise ValueError(f"pred_x0 shape {tuple(pred_x0.shape)} must match target {tuple(target.shape)}")
     if pred_x0.ndim != 3:
         raise ValueError(f"spectral loss expects [B, L, C] tensors, got {tuple(pred_x0.shape)}")
     if pred_x0.shape[1] < 2:
-        return pred_x0.new_zeros(())
+        return pred_x0.new_zeros(pred_x0.shape[0]) if reduction == "none" else pred_x0.new_zeros(())
     if mask is not None:
         mask = mask.to(pred_x0.device, dtype=pred_x0.dtype)
         if mask.shape == pred_x0.shape[:2]:
@@ -363,7 +389,8 @@ def _spectral_magnitude_loss(
     if log_magnitude:
         pred_mag = torch.log1p(pred_mag)
         target_mag = torch.log1p(target_mag)
-    loss = (pred_mag - target_mag).square().mean()
+    sq = (pred_mag - target_mag).square()
+    loss = sq.mean(dim=(1, 2)) if reduction == "none" else sq.mean()
     return loss.to(dtype=pred_x0.dtype)
 
 

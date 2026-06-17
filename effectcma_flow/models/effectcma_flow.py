@@ -49,6 +49,11 @@ class EffectCMAFlow(nn.Module):
         operator_norm: str = "group",
         operator_architecture: str = "homogeneous",
         operator_channel_heads: int = 4,
+        operator_frequency_band_mode: str = "gaussian",
+        operator_frequency_topk_frac: float = 0.15,
+        operator_frequency_temp_start: float = 1.0,
+        operator_frequency_temp_end: float = 0.1,
+        operator_frequency_anneal_steps: int = 10000,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -113,6 +118,11 @@ class EffectCMAFlow(nn.Module):
             norm_type=operator_norm,
             architecture=operator_architecture,
             channel_heads=operator_channel_heads,
+            frequency_band_mode=operator_frequency_band_mode,
+            frequency_topk_frac=operator_frequency_topk_frac,
+            frequency_temp_start=operator_frequency_temp_start,
+            frequency_temp_end=operator_frequency_temp_end,
+            frequency_anneal_steps=operator_frequency_anneal_steps,
         )
 
     def forward(

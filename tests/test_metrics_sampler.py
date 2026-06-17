@@ -194,6 +194,74 @@ def test_cfg_explicit_uncond_condition_is_used():
     assert torch.allclose(guided[0], torch.full((8, 3), float(expected)), atol=1e-5)
 
 
+def test_lig_default_interval_is_exact_noop():
+    """guidance_t_lo=0.0, guidance_t_hi=1.0 must be bit-identical to omitting them."""
+    model = _DeterministicCFGModel()
+    shape = torch.zeros(2, 8, 3)
+    noise = torch.zeros(2, 8, 3)
+    captions = [["sunny"], ["rainy day ahead"]]
+    s = 3.0
+    baseline, _ = sample_text2ts(model, shape, captions, solver="euler", steps=4, noise=noise.clone(), cfg_scale=s)
+    with_interval, _ = sample_text2ts(
+        model,
+        shape,
+        captions,
+        solver="euler",
+        steps=4,
+        noise=noise.clone(),
+        cfg_scale=s,
+        guidance_t_lo=0.0,
+        guidance_t_hi=1.0,
+    )
+    assert torch.equal(baseline, with_interval)
+
+
+def test_lig_narrow_interval_gates_per_step():
+    """A narrow interval extrapolates only at t inside [lo, hi]; outside falls back to v_cond.
+
+    Euler with steps=4 gives per-step times t0 in {0, 0.25, 0.5, 0.75}. With the
+    interval [0.5, 1.0]: t in {0, 0.25} fall back to the plain conditional velocity
+    and t in {0.5, 0.75} are extrapolated to v_uncond + s*(v_cond - v_uncond). The
+    velocity field is a per-condition constant, so the Euler integral is
+    dt * sum over steps of the (gated) velocity.
+    """
+    model = _DeterministicCFGModel()
+    shape = torch.zeros(1, 8, 3)
+    noise = torch.zeros(1, 8, 3)
+    s = 3.0
+    dt = 0.25
+    guided, _ = sample_text2ts(
+        model,
+        shape,
+        [["sunny"]],
+        solver="euler",
+        steps=4,
+        noise=noise,
+        cfg_scale=s,
+        guidance_t_lo=0.5,
+        guidance_t_hi=1.0,
+    )
+    v_cond = model._value("sunny")  # blank null → v_uncond = 0
+    v_guided = 0.0 + s * (v_cond - 0.0)
+    # t0 in {0, 0.25} → fallback v_cond; t0 in {0.5, 0.75} → extrapolated v_guided.
+    expected = dt * (v_cond + v_cond + v_guided + v_guided)
+    assert torch.allclose(guided[0], torch.full((8, 3), float(expected)), atol=1e-5)
+
+    # Sanity: guiding all t (the no-op interval) integrates purely to s * v_cond.
+    guided_all, _ = sample_text2ts(
+        model,
+        shape,
+        [["sunny"]],
+        solver="euler",
+        steps=4,
+        noise=noise,
+        cfg_scale=s,
+        guidance_t_lo=0.0,
+        guidance_t_hi=1.0,
+    )
+    assert torch.allclose(guided_all[0], torch.full((8, 3), float(s * v_cond)), atol=1e-5)
+
+
 def test_cfg_real_model_runs_for_all_solvers():
     """Smoke: CFG path is wired through every solver on the real model."""
     model = _text2ts_smoke_model()

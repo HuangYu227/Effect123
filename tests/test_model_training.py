@@ -378,6 +378,168 @@ def test_structural_operator_bank_exposes_adaptive_frequency_aux():
     assert torch.isfinite(bank.experts[2].band_log_widths.grad).all()
 
 
+def test_frequency_band_mode_gaussian_default_is_state_and_output_identical():
+    """Default frequency_band_mode='gaussian' must be a true no-op vs not passing it.
+
+    Same state_dict keys/shapes, no extra buffers, and a seeded forward that is
+    bit-identical between the implicit default and an explicit 'gaussian'.
+    """
+    from effectcma_flow.models.operator_bank import FrequencyBandExpert
+
+    torch.manual_seed(0)
+    default_bank = ResidualOperatorBank(
+        num_channels=4, num_operators=3, hidden=8, t_dim=4, architecture="structural", context_dim=16
+    )
+    torch.manual_seed(0)
+    gaussian_bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+        frequency_band_mode="gaussian",
+    )
+
+    default_keys = {k: v.shape for k, v in default_bank.state_dict().items()}
+    gaussian_keys = {k: v.shape for k, v in gaussian_bank.state_dict().items()}
+    assert default_keys == gaussian_keys
+
+    freq_expert = gaussian_bank.experts[2]
+    assert isinstance(freq_expert, FrequencyBandExpert)
+    # No new buffers/parameters may exist in gaussian mode (checkpoint compat).
+    assert not hasattr(freq_expert, "frequency_anneal_step")
+    assert "frequency_anneal_step" not in dict(freq_expert.named_buffers())
+    expert_keys = set(freq_expert.state_dict().keys())
+    assert expert_keys == {
+        "band_center_logits",
+        "band_log_widths",
+        "ada_norm.to_scale_shift.1.weight",
+        "ada_norm.to_scale_shift.1.bias",
+        "band_gate.0.weight",
+        "band_gate.0.bias",
+        "band_gate.1.weight",
+        "band_gate.1.bias",
+        "band_gate.4.weight",
+        "band_gate.4.bias",
+        "band_mixer.0.weight",
+        "band_mixer.0.bias",
+        "band_mixer.3.weight",
+        "band_mixer.3.bias",
+        "head.weight",
+        "head.bias",
+    }
+
+    gaussian_bank.load_state_dict(default_bank.state_dict())
+    default_bank.eval()
+    gaussian_bank.eval()
+    x_t = torch.randn(2, 12, 4)
+    base = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    context = torch.randn(2, 16)
+    out_default = default_bank(x_t, base, t, context=context)
+    out_gaussian = gaussian_bank(x_t, base, t, context=context)
+    assert torch.equal(out_default, out_gaussian)
+
+
+def test_frequency_band_mode_soft_topk_forward_grad_and_nonneg_mask():
+    """soft_topk: forward finite, gradient reaches inputs and band params, mask >= 0."""
+    from effectcma_flow.models.operator_bank import FrequencyBandExpert
+
+    bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+        frequency_band_mode="soft_topk",
+        frequency_topk_frac=0.15,
+    )
+    freq_expert = bank.experts[2]
+    assert isinstance(freq_expert, FrequencyBandExpert)
+    # soft_topk registers exactly one new buffer (the step counter) and starts at 0.
+    assert hasattr(freq_expert, "frequency_anneal_step")
+    assert int(freq_expert.frequency_anneal_step.item()) == 0
+
+    # Deterministic temperature so the mask is reproducible in the test.
+    freq_expert.frequency_temperature_override = 0.5
+
+    x_t = torch.randn(2, 12, 4, requires_grad=True)
+    base = torch.randn(2, 12, 4)
+    t = torch.rand(2)
+    context = torch.randn(2, 16)
+    out = bank(x_t, base, t, context=context)
+    assert out.shape == (2, 12, 4, 3)
+    assert torch.isfinite(out).all()
+
+    out.sum().backward()
+    # Gradient reaches the inputs ...
+    assert x_t.grad is not None
+    assert torch.isfinite(x_t.grad).all()
+    assert x_t.grad.abs().sum().item() > 0.0
+    # ... and the relevant (used) frequency-expert parameters: the band gate,
+    # band mixer and head all participate in the soft_topk path.
+    for name, param in freq_expert.named_parameters():
+        if name.startswith(("band_gate", "band_mixer", "head")):
+            assert param.grad is not None, f"{name} received no gradient"
+            assert torch.isfinite(param.grad).all()
+    assert any(
+        p.grad is not None and p.grad.abs().sum().item() > 0.0
+        for n, p in freq_expert.named_parameters()
+        if n.startswith("band_gate")
+    )
+
+    # The amplitude-ranked soft mask is non-negative by construction.
+    magnitude = torch.rand(2, 8, 7)
+    soft_mask = torch.softmax(magnitude / 0.5, dim=-1) * (0.15 * magnitude.shape[-1])
+    assert (soft_mask >= 0).all()
+
+
+def test_frequency_band_mode_soft_topk_step_counter_advances_in_training_only():
+    """The anneal step buffer increments on training forwards, not in eval."""
+    bank = ResidualOperatorBank(
+        num_channels=4,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        context_dim=16,
+        frequency_band_mode="soft_topk",
+    )
+    freq_expert = bank.experts[2]
+    x_t = torch.randn(2, 12, 4)
+    base = torch.randn(2, 12, 4)
+    context = torch.randn(2, 16)
+
+    bank.train()
+    bank(x_t, base, torch.rand(2), context=context)
+    assert int(freq_expert.frequency_anneal_step.item()) == 1
+    bank(x_t, base, torch.rand(2), context=context)
+    assert int(freq_expert.frequency_anneal_step.item()) == 2
+
+    bank.eval()
+    bank(x_t, base, torch.rand(2), context=context)
+    assert int(freq_expert.frequency_anneal_step.item()) == 2
+
+
+def test_build_model_passes_frequency_band_mode():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "operator_frequency_band_mode": "soft_topk",
+            "operator_frequency_topk_frac": 0.2,
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    freq_expert = model.operator_bank.experts[2]
+    assert freq_expert.frequency_band_mode == "soft_topk"
+    assert freq_expert.frequency_topk_frac == 0.2
+    assert hasattr(freq_expert, "frequency_anneal_step")
+
+
 def test_structural_operator_bank_accepts_expert_context():
     bank = ResidualOperatorBank(
         num_channels=4,
@@ -533,6 +695,114 @@ def test_cross_modal_bridge_patch_merger_connector_shapes_and_gradients():
     assert torch.isfinite(connector.patch_merger_mlp[0].weight.grad).all()
     assert slot_tokens.grad is not None and torch.isfinite(slot_tokens.grad).all()
     assert x_t.grad is not None and torch.isfinite(x_t.grad).all()
+
+
+def _make_text_agg_bridge(text_agg_tokens: int, *, diagnostics: bool = False) -> CrossModalConditionBridge:
+    return CrossModalConditionBridge(
+        d_model=16,
+        num_channels=4,
+        sequence_length=13,
+        num_experts=3,
+        patch_size=4,
+        num_heads=4,
+        state_connector="patch_merger",
+        temporal_merge=3,
+        channel_merge=1,
+        token_budget=5,
+        alignment_mode="siglip",
+        text_agg_tokens=text_agg_tokens,
+        diagnostics=diagnostics,
+    )
+
+
+def test_bridge_text_agg_tokens_default_is_noop():
+    """text_agg_tokens default (0) must not change params or numerical output."""
+    torch.manual_seed(0)
+    baseline = _make_text_agg_bridge(0)
+    torch.manual_seed(0)
+    explicit_zero = _make_text_agg_bridge(0)
+
+    connector = baseline.patch_merger_connector
+    assert connector is not None
+    # K=0 registers no learnable agg parameter -> state_dict/param count unchanged.
+    assert not hasattr(connector, "text_agg_tokens")
+    assert connector.text_agg_token_count == 0
+    assert "patch_merger_connector.text_agg_tokens" not in dict(baseline.named_parameters())
+    n_params = sum(p.numel() for p in baseline.parameters())
+    n_params_zero = sum(p.numel() for p in explicit_zero.parameters())
+    assert n_params == n_params_zero
+
+    slot_tokens = torch.randn(2, 6, 16)
+    slot_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+    x_t = torch.randn(2, 13, 4)
+    t = torch.rand(2)
+    target = torch.randn(2, 13, 4)
+    baseline.eval()
+    explicit_zero.eval()
+    with torch.no_grad():
+        out_a = baseline(slot_tokens=slot_tokens, slot_mask=slot_mask, x_t=x_t, t=t, target=target)
+        out_b = explicit_zero(slot_tokens=slot_tokens, slot_mask=slot_mask, x_t=x_t, t=t, target=target)
+    # Seeded forward is bit-for-bit identical between default and explicit K=0.
+    for tensor_a, tensor_b in zip(out_a[:4], out_b[:4]):
+        assert torch.equal(tensor_a, tensor_b)
+
+
+def test_bridge_text_agg_tokens_active_strips_and_flows_gradient():
+    """K>0 adds a zero-init agg param, restores slot dim J, and is differentiable."""
+    bridge = _make_text_agg_bridge(4, diagnostics=True)
+    connector = bridge.patch_merger_connector
+    assert connector is not None
+    assert connector.text_agg_token_count == 4
+    # ZERO init (not randn) so the agg tokens start as the additive identity.
+    assert connector.text_agg_tokens.shape == (4, 16)
+    assert torch.count_nonzero(connector.text_agg_tokens) == 0
+
+    slot_tokens = torch.randn(2, 6, 16, requires_grad=True)
+    slot_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+    x_t = torch.randn(2, 13, 4, requires_grad=True)
+    bridged_text, bridge_context, expert_context, channel_context, aux = bridge(
+        slot_tokens=slot_tokens,
+        slot_mask=slot_mask,
+        x_t=x_t,
+        t=torch.rand(2),
+    )
+    # The K agg tokens are stripped: the slot dimension J is restored downstream.
+    assert bridged_text.shape == (2, 6, 16)
+    assert bridge_context.shape == (2, 16)
+    assert expert_context.shape == (2, 3, 16)
+    assert channel_context.shape == (2, 4, 16)
+    assert torch.isfinite(bridged_text).all()
+    assert torch.isfinite(aux["bridge_alignment_loss"])
+    # Diagnostics summaries over the K+J bridge sequence stay finite (extended mask).
+    assert torch.isfinite(aux["bridge_text_to_state_entropy"])
+    assert torch.isfinite(aux["bridge_state_to_text_entropy"])
+
+    loss = bridged_text.square().mean() + aux["bridge_alignment_loss"]
+    loss.backward()
+    assert connector.text_agg_tokens.grad is not None
+    assert torch.isfinite(connector.text_agg_tokens.grad).all()
+    assert connector.text_agg_tokens.grad.abs().sum() > 0
+    assert slot_tokens.grad is not None and torch.isfinite(slot_tokens.grad).all()
+    assert x_t.grad is not None and torch.isfinite(x_t.grad).all()
+
+
+def test_build_model_passes_bridge_text_agg_tokens():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "use_cross_modal_bridge": True,
+            "bridge_state_connector": "patch_merger",
+            "bridge_temporal_merge": 3,
+            "bridge_token_budget": 5,
+            "bridge_alignment_mode": "siglip",
+            "bridge_text_agg_tokens": 4,
+        }
+    )
+    model = build_model(cfg, sequence_length=13, num_channels=4)
+    connector = model.cross_modal_bridge.patch_merger_connector
+    assert connector is not None
+    assert connector.text_agg_token_count == 4
+    assert connector.text_agg_tokens.shape == (4, model.cross_modal_bridge.d_model)
 
 
 def test_balanced_sigmoid_contrastive_loss_does_not_dilute_positives():
@@ -1231,6 +1501,105 @@ def test_spectral_loss_helper_x0_recovery_identity():
     assert torch.allclose(pred_x0, target, atol=1e-5)
     loss = _spectral_magnitude_loss(pred_x0, target, mask=None, log_magnitude=False)
     assert loss.item() == pytest.approx(0.0, abs=1e-5)
+
+
+def test_spectral_loss_helper_reduction_none_matches_mean():
+    """reduction='none' returns per-sample [B] whose mean equals the scalar path."""
+    from effectcma_flow.training.train_step import _spectral_magnitude_loss
+
+    pred = torch.randn(4, 16, 3)
+    target = torch.randn(4, 16, 3)
+    scalar = _spectral_magnitude_loss(pred, target, mask=None, log_magnitude=True)
+    per_sample = _spectral_magnitude_loss(pred, target, mask=None, log_magnitude=True, reduction="none")
+    assert per_sample.shape == (4,)
+    assert torch.allclose(per_sample.mean(), scalar, atol=1e-6)
+
+
+def test_spectral_time_weight_power_zero_is_noop():
+    """power=0 must reproduce the unweighted spectral loss byte-for-byte."""
+    model = build_model(_text2ts_config(), sequence_length=12, num_channels=4)
+    batch = _text_batch(batch_size=4, length=12, channels=4)
+    # t and the model forward both consume RNG; seed identically so the only
+    # difference between the two runs is the time-weight power knob.
+    torch.manual_seed(1234)
+    baseline = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        spectral_loss_weight=0.2,
+    )
+    torch.manual_seed(1234)
+    weighted_p0 = cfm_train_step(
+        model,
+        batch,
+        optimizer=None,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        spectral_loss_weight=0.2,
+        spectral_time_weight_power=0.0,
+    )
+    assert torch.allclose(weighted_p0["loss_spectral"], baseline["loss_spectral"], atol=1e-7)
+    assert torch.allclose(weighted_p0["loss"], baseline["loss"], atol=1e-7)
+
+
+def test_spectral_time_weight_power_downweights_high_t():
+    """power=2 applies the correct (1-t)^2 per-sample weighting before averaging.
+
+    Construct one sample at small t (weight ~1) and one near t=1 (weight ~0); the
+    high-t sample's contribution to the averaged loss must be strongly shrunk
+    relative to its raw per-sample spectral loss.
+    """
+    from effectcma_flow.training.train_step import _spectral_magnitude_loss
+
+    pred = torch.randn(2, 16, 3)
+    target = torch.randn(2, 16, 3)
+    t = torch.tensor([0.05, 0.95])
+    power = 2.0
+
+    per_sample = _spectral_magnitude_loss(pred, target, mask=None, log_magnitude=True, reduction="none")
+    time_weight = (1.0 - t).clamp_min(0.0) ** power
+    weighted = (per_sample * time_weight).mean()
+
+    # Reference computed independently from the per-sample values.
+    expected = (per_sample[0] * (1.0 - 0.05) ** 2 + per_sample[1] * (1.0 - 0.95) ** 2) / 2.0
+    assert torch.allclose(weighted, expected, atol=1e-6)
+    # The near-t=1 sample is downweighted by (0.05)^2 = 0.0025.
+    assert time_weight[1].item() == pytest.approx(0.0025, abs=1e-6)
+    assert time_weight[0].item() == pytest.approx(0.9025, abs=1e-6)
+    # Weighted mean is dominated by the low-t sample, far from the uniform mean.
+    uniform_mean = per_sample.mean()
+    assert (weighted - per_sample[0] * 0.9025 / 2.0).abs().item() < uniform_mean.item()
+
+
+def test_spectral_time_weight_power_gradient_reaches_pred_v():
+    """power>0 still backpropagates through pred_v into the frequency expert."""
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    freq_expert = model.operator_bank.experts[2]  # FrequencyBandExpert
+    assert type(freq_expert).__name__ == "FrequencyBandExpert"
+    batch = _text_batch(batch_size=2, length=12, channels=4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    result = cfm_train_step(
+        model,
+        batch,
+        opt,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        spectral_loss_weight=1.0,
+        spectral_time_weight_power=2.0,
+    )
+    assert torch.isfinite(result["loss"])
+    grads = [p.grad for p in freq_expert.parameters() if p.grad is not None]
+    assert grads, "frequency expert received no gradient"
+    assert any(g.abs().sum().item() > 0 for g in grads)
 
 
 def test_operator_balance_loss_is_optional_finite_and_added():

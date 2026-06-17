@@ -67,6 +67,11 @@ class TextToTSFlow(nn.Module):
         operator_norm: str = "group",
         operator_architecture: str = "homogeneous",
         operator_channel_heads: int = 4,
+        operator_frequency_band_mode: str = "gaussian",
+        operator_frequency_topk_frac: float = 0.15,
+        operator_frequency_temp_start: float = 1.0,
+        operator_frequency_temp_end: float = 0.1,
+        operator_frequency_anneal_steps: int = 10000,
         # V6.1 latent regime adapter
         use_latent_regime_adapter: bool = False,
         num_regimes: int = 4,
@@ -100,6 +105,7 @@ class TextToTSFlow(nn.Module):
         bridge_alignment_dense: bool = False,
         bridge_alignment_regions: int = 8,
         bridge_alignment_target: str = "state",
+        bridge_text_agg_tokens: int = 0,
         bridge_diagnostics: bool = False,
     ) -> None:
         super().__init__()
@@ -136,6 +142,7 @@ class TextToTSFlow(nn.Module):
                 alignment_dense=bridge_alignment_dense,
                 alignment_regions=bridge_alignment_regions,
                 alignment_target=bridge_alignment_target,
+                text_agg_tokens=bridge_text_agg_tokens,
                 diagnostics=bridge_diagnostics,
             )
             if self.use_cross_modal_bridge
@@ -207,6 +214,11 @@ class TextToTSFlow(nn.Module):
             norm_type=operator_norm,
             architecture=operator_architecture,
             channel_heads=operator_channel_heads,
+            frequency_band_mode=operator_frequency_band_mode,
+            frequency_topk_frac=operator_frequency_topk_frac,
+            frequency_temp_start=operator_frequency_temp_start,
+            frequency_temp_end=operator_frequency_temp_end,
+            frequency_anneal_steps=operator_frequency_anneal_steps,
         )
 
         # V6.1: Latent regime condition adapter (optional)

@@ -89,6 +89,8 @@ def sample_text2ts(
     return_trajectory: bool = False,
     cfg_scale: float = 1.0,
     uncond_condition=None,
+    guidance_t_lo: float = 0.0,
+    guidance_t_hi: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """Unified text2ts sampling with configurable ODE solver.
 
@@ -111,6 +113,13 @@ def sample_text2ts(
             Defaults to blank captions (one empty string per sample), the
             standard CFG null condition matched to training-time caption
             dropout.
+        guidance_t_lo: Lower bound (inclusive) of the flow-time interval on
+            which CFG extrapolation is applied. Limited-Interval Guidance:
+            outside ``[guidance_t_lo, guidance_t_hi]`` the plain conditional
+            velocity is used and the unconditional forward is skipped. The
+            default ``0.0`` keeps guidance active for all ``t`` (no-op).
+        guidance_t_hi: Upper bound (inclusive) of the guidance interval. The
+            default ``1.0`` keeps guidance active for all ``t`` (no-op).
 
     Returns:
         (x_final, aux) tuple.
@@ -129,6 +138,8 @@ def sample_text2ts(
     dtype = shape_like.dtype
     dt = 1.0 / float(steps)
     cfg_scale = float(cfg_scale)
+    guidance_t_lo = float(guidance_t_lo)
+    guidance_t_hi = float(guidance_t_hi)
     use_cfg = cfg_scale > 1.0
     if hasattr(model, "prepare_condition"):
         text_condition = model.prepare_condition(text_condition, device=device, dtype=dtype)
@@ -141,7 +152,8 @@ def sample_text2ts(
     def velocity(x_cur: torch.Tensor, t_val: float) -> tuple[torch.Tensor, dict]:
         t = torch.full((batch_size,), t_val, device=device, dtype=dtype)
         v_cond, aux_cond = model(x_cur, t, text_condition)
-        if not use_cfg:
+        apply_cfg = use_cfg and (guidance_t_lo <= t_val <= guidance_t_hi)
+        if not apply_cfg:
             return v_cond, aux_cond
         v_uncond, _ = model(x_cur, t, uncond_condition)
         v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)

@@ -124,6 +124,10 @@ train:
   # the structural FrequencyBandExpert a reason to specialize.
   spectral_loss_weight: 0.2
   spectral_log_magnitude: true
+  # (1 - t)^power time weighting on the spectral magnitude loss. 0.0 == uniform
+  # over t (exact no-op); power > 0 downweights high-t samples (recovered x0 is
+  # already well constrained by x_t there) and shrinks the effective magnitude.
+  spectral_time_weight_power: 0.0
   warmup_steps: 200
   min_lr: 1.0e-6
 

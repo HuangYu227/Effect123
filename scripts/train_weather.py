@@ -201,6 +201,7 @@ def run_train(cfg: dict) -> None:
                 caption_ranking_margin=float(cfg["train"].get("caption_ranking_margin", 0.05)),
                 spectral_loss_weight=float(cfg["train"].get("spectral_loss_weight", 0.0)),
                 spectral_log_magnitude=bool(cfg["train"].get("spectral_log_magnitude", True)),
+                spectral_time_weight_power=float(cfg["train"].get("spectral_time_weight_power", 0.0)),
                 operator_balance_weight=float(cfg["train"].get("operator_balance_weight", 0.0)),
             )
             step += 1

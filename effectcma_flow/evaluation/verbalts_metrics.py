@@ -76,6 +76,8 @@ class VerbalTSMetricComputer:
         task_mode: str = "edit",
         noise_scale: float = 1.0,
         cfg_scale: float = 1.0,
+        guidance_t_lo: float = 0.0,
+        guidance_t_hi: float = 1.0,
         n_samples: int = 1,
         caption_slot_strategy: str = "single",
         max_caption_slots: int = 8,
@@ -117,6 +119,8 @@ class VerbalTSMetricComputer:
             task_mode=task_mode,
             noise_scale=noise_scale,
             cfg_scale=cfg_scale,
+            guidance_t_lo=guidance_t_lo,
+            guidance_t_hi=guidance_t_hi,
             n_samples=n_samples,
             caption_slot_strategy=caption_slot_strategy,
             max_caption_slots=max_caption_slots,
@@ -170,6 +174,8 @@ class VerbalTSMetricComputer:
         task_mode: str,
         noise_scale: float,
         cfg_scale: float,
+        guidance_t_lo: float,
+        guidance_t_hi: float,
         n_samples: int,
         caption_slot_strategy: str,
         max_caption_slots: int,
@@ -205,6 +211,8 @@ class VerbalTSMetricComputer:
                         steps=steps,
                         noise_scale=noise_scale,
                         cfg_scale=cfg_scale,
+                        guidance_t_lo=guidance_t_lo,
+                        guidance_t_hi=guidance_t_hi,
                     )
                     preds.append(pred_one)
                 pred = torch.stack(preds, dim=0).median(dim=0).values

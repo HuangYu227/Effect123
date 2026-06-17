@@ -237,6 +237,7 @@ class TSPatchMergerConnector(nn.Module):
         alignment_dense: bool = False,
         alignment_regions: int = 8,
         alignment_target: str = "state",
+        text_agg_tokens: int = 0,
         diagnostics: bool = False,
     ) -> None:
         super().__init__()
@@ -265,6 +266,11 @@ class TSPatchMergerConnector(nn.Module):
         self.alignment_target = str(alignment_target).lower()
         if self.alignment_target not in {"state", "clean"}:
             raise ValueError(f"alignment_target must be 'state' or 'clean', got {alignment_target!r}")
+        # Optional learnable text aggregation tokens prepended to the slot
+        # sequence before the bidirectional cross-attn so the bridge can read a
+        # few sequence-level summaries; they are stripped before any downstream
+        # consumer. Default 0 builds no parameter and is a numerical no-op.
+        self.text_agg_token_count = max(0, int(text_agg_tokens))
         self.diagnostics = bool(diagnostics)
 
         heads = max(1, min(int(num_heads), self.d_model))
@@ -323,6 +329,13 @@ class TSPatchMergerConnector(nn.Module):
             self.text_region_pool = MultiQueryAttentionPool(self.d_model, self.alignment_regions, heads, dropout)
             self.state_region_pool = MultiQueryAttentionPool(self.d_model, self.alignment_regions, heads, dropout)
 
+        # ZERO init so the agg tokens start as the additive identity inside the
+        # cross-attn residual; randn agg tokens stall in cold-start. Only created
+        # when K>0, so the default (K=0) registers no parameter and keeps the
+        # state_dict and parameter count identical to before.
+        if self.text_agg_token_count > 0:
+            self.text_agg_tokens = nn.Parameter(torch.zeros(self.text_agg_token_count, self.d_model))
+
     def forward(
         self,
         *,
@@ -347,7 +360,22 @@ class TSPatchMergerConnector(nn.Module):
         prebudget_count = merged_tokens.shape[1]
         state_tokens = self.budget_pool(merged_tokens)
 
-        text_query = self.text_norm(slot_tokens)
+        # Optionally prepend K learnable text aggregation tokens to the slot
+        # sequence ONLY for the bidirectional cross-attn, then strip them before
+        # any downstream consumer. Their mask entries are all-valid so they are
+        # never padding-masked by state_to_text. K=0 reuses the original tensors,
+        # so the forward is bit-for-bit identical to before.
+        k_agg = self.text_agg_token_count
+        if k_agg > 0:
+            agg = self.text_agg_tokens[None].expand(slot_tokens.shape[0], -1, -1).to(device=device, dtype=dtype)
+            bridge_slot_tokens = torch.cat([agg, slot_tokens], dim=1)
+            agg_mask = slot_mask.new_ones(slot_mask.shape[0], k_agg)
+            bridge_slot_mask = torch.cat([agg_mask, slot_mask], dim=1)
+        else:
+            bridge_slot_tokens = slot_tokens
+            bridge_slot_mask = slot_mask
+
+        text_query = self.text_norm(bridge_slot_tokens)
         state_query = self.state_norm(state_tokens)
         need_attn_weights = self.diagnostics
         text_delta, text_attn = self.text_to_state(
@@ -357,16 +385,20 @@ class TSPatchMergerConnector(nn.Module):
             need_weights=need_attn_weights,
             average_attn_weights=False,
         )
-        text_gate = self.text_gate(torch.cat([slot_tokens, text_delta], dim=-1))
-        bridged_text = slot_tokens + text_gate * text_delta
+        text_gate = self.text_gate(torch.cat([bridge_slot_tokens, text_delta], dim=-1))
+        bridged_text = bridge_slot_tokens + text_gate * text_delta
         bridged_text = bridged_text + self.text_ffn(bridged_text)
+        if k_agg > 0:
+            # Drop the K agg tokens to restore the original slot dim [B, J, D]
+            # before masking and every downstream consumer.
+            bridged_text = bridged_text[:, k_agg:]
         bridged_text = bridged_text * slot_mask[:, :, None].clamp(0.0, 1.0)
 
-        text_key_padding_mask = _safe_key_padding_mask(slot_mask)
+        text_key_padding_mask = _safe_key_padding_mask(bridge_slot_mask)
         state_delta, state_attn = self.state_to_text(
             query=state_query,
-            key=self.text_norm(slot_tokens),
-            value=slot_tokens,
+            key=self.text_norm(bridge_slot_tokens),
+            value=bridge_slot_tokens,
             key_padding_mask=text_key_padding_mask,
             need_weights=need_attn_weights,
             average_attn_weights=False,
@@ -406,8 +438,10 @@ class TSPatchMergerConnector(nn.Module):
             alignment_loss, alignment_aux = _zero_alignment_aux(fused_state)
         valid_slot_count = slot_mask.sum(dim=1)
         if need_attn_weights:
-            text_entropy, text_max, text_entropy_norm = _attention_summary(text_attn, query_mask=slot_mask)
-            state_entropy, state_max, state_entropy_norm = _attention_summary(state_attn, key_mask=slot_mask)
+            # text_attn/state_attn span the K+J bridge sequence, so summarise
+            # them with the matching extended mask (== slot_mask when K=0).
+            text_entropy, text_max, text_entropy_norm = _attention_summary(text_attn, query_mask=bridge_slot_mask)
+            state_entropy, state_max, state_entropy_norm = _attention_summary(state_attn, key_mask=bridge_slot_mask)
         else:
             text_entropy, text_max, text_entropy_norm = _nan_summary(fused_state)
             state_entropy, state_max, state_entropy_norm = _nan_summary(fused_state)
@@ -584,6 +618,7 @@ class CrossModalConditionBridge(nn.Module):
         alignment_dense: bool = False,
         alignment_regions: int = 8,
         alignment_target: str = "state",
+        text_agg_tokens: int = 0,
         diagnostics: bool = False,
     ) -> None:
         super().__init__()
@@ -632,6 +667,7 @@ class CrossModalConditionBridge(nn.Module):
                 alignment_dense=alignment_dense,
                 alignment_regions=alignment_regions,
                 alignment_target=alignment_target,
+                text_agg_tokens=text_agg_tokens,
                 diagnostics=diagnostics,
             )
             if self.state_connector == "patch_merger"

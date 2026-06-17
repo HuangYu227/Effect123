@@ -124,6 +124,10 @@ train:
   # the structural FrequencyBandExpert a reason to specialize.
   spectral_loss_weight: 0.1
   spectral_log_magnitude: true
+  # (1 - t)^power time weighting on the spectral magnitude loss. 0.0 == uniform
+  # over t (exact no-op); power > 0 downweights high-t samples (recovered x0 is
+  # already well constrained by x_t there) and shrinks the effective magnitude.
+  spectral_time_weight_power: 0.0
   warmup_steps: 200
   min_lr: 1.0e-6
 
@@ -146,3 +150,6 @@ sample:
   # P0: classifier-free guidance scale. 1.0 disables guidance; >1.0 sharpens how
   # strongly the generated series follows the caption. Sweep {1.0, 2.0, 4.0}.
   cfg_scale: 2.0
+  # Limited-Interval Guidance interval; [0.0,1.0] = guide all t / no-op.
+  guidance_t_lo: 0.0
+  guidance_t_hi: 1.0

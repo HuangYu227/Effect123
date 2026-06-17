@@ -18,7 +18,7 @@ _V62_KEYS = frozenset({
     "bridge_num_stage_tokens", "bridge_state_connector", "bridge_temporal_merge",
     "bridge_channel_merge", "bridge_token_budget", "bridge_alignment_mode",
     "bridge_alignment_dense", "bridge_alignment_regions", "bridge_alignment_target",
-    "bridge_diagnostics", "operator_multiview_context",
+    "bridge_text_agg_tokens", "bridge_diagnostics", "operator_multiview_context",
 })
 
 
@@ -69,6 +69,11 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         operator_norm=str(model_cfg.get("operator_norm", "group")),
         operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
         operator_channel_heads=int(model_cfg.get("operator_channel_heads", 4)),
+        operator_frequency_band_mode=str(model_cfg.get("operator_frequency_band_mode", "gaussian")),
+        operator_frequency_topk_frac=float(model_cfg.get("operator_frequency_topk_frac", 0.15)),
+        operator_frequency_temp_start=float(model_cfg.get("operator_frequency_temp_start", 1.0)),
+        operator_frequency_temp_end=float(model_cfg.get("operator_frequency_temp_end", 0.1)),
+        operator_frequency_anneal_steps=int(model_cfg.get("operator_frequency_anneal_steps", 10000)),
         # V6.1 latent regime adapter
         use_latent_regime_adapter=bool(model_cfg.get("use_latent_regime_adapter", False)),
         num_regimes=int(model_cfg.get("num_regimes", 4)),
@@ -102,6 +107,7 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         bridge_alignment_dense=bool(model_cfg.get("bridge_alignment_dense", False)),
         bridge_alignment_regions=int(model_cfg.get("bridge_alignment_regions", 8)),
         bridge_alignment_target=str(model_cfg.get("bridge_alignment_target", "state")),
+        bridge_text_agg_tokens=int(model_cfg.get("bridge_text_agg_tokens", 0)),
         bridge_diagnostics=bool(model_cfg.get("bridge_diagnostics", False)),
     )
     if task_mode == "edit":

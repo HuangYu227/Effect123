@@ -267,6 +267,12 @@ def run_train(cfg: dict) -> None:
                         f"{_scalar(out, 'spectral_prompt_gate_mid'):.2f}/"
                         f"{_scalar(out, 'spectral_prompt_gate_high'):.2f}"
                     )
+                    sp_delta = _scalar(out, "spectral_prompt_delta_norm")
+                    if sp_delta == sp_delta:
+                        postfix["spD"] = f"{sp_delta:.3f}"
+                    sp_raw = _scalar(out, "spectral_prompt_raw_delta_norm")
+                    if sp_raw == sp_raw:
+                        postfix["spRaw"] = f"{sp_raw:.3f}"
                 op_balance = _scalar(out, "loss_operator_balance")
                 if op_balance > 0.0:
                     postfix["opBal"] = f"{op_balance:.4f}"
@@ -502,6 +508,7 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "bridge_budget_pool_active",
         "bridge_token_budget",
         "bridge_connector_patch_merger",
+        "bridge_connector_temporal_pyramid_v2",
         "bridge_alignment_used_clean",
         "bridge_alignment_tsp_clean_encoded",
         "bridge_alignment_tsp_clean_detached",

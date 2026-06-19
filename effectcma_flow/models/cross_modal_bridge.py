@@ -556,6 +556,9 @@ class TSPatchMergerConnector(nn.Module):
             ),
             "bridge_token_budget": torch.tensor(float(self.token_budget), device=device, dtype=dtype),
             "bridge_connector_patch_merger": torch.tensor(1.0, device=device, dtype=dtype),
+            "bridge_connector_temporal_pyramid_v2": torch.tensor(
+                1.0 if self.tsp_encoder is not None else 0.0, device=device, dtype=dtype
+            ),
             "bridge_alignment_used_clean": torch.tensor(1.0 if compute_alignment and use_clean else 0.0, device=device, dtype=dtype),
             "bridge_alignment_tsp_clean_encoded": torch.tensor(1.0 if tsp_alignment_clean_encoded else 0.0, device=device, dtype=dtype),
             "bridge_alignment_tsp_clean_detached": torch.tensor(1.0 if tsp_alignment_clean_detached else 0.0, device=device, dtype=dtype),

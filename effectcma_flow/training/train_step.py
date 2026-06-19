@@ -519,6 +519,7 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "bridge_budget_pool_active",
         "bridge_token_budget",
         "bridge_connector_patch_merger",
+        "bridge_connector_temporal_pyramid_v2",
         "spectral_prompt_entropy",
         "spectral_prompt_entropy_norm",
         "spectral_prompt_gate_low",

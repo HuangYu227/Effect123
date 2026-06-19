@@ -138,6 +138,7 @@ def test_tsp_bridge_clean_alignment_and_diagnostics():
     assert torch.isfinite(pred_v).all()
     assert int(aux["tsp_connector_active"].item()) == 1
     assert int(aux["tsp_budget_token_count"].item()) == 16
+    assert int(aux["bridge_connector_temporal_pyramid_v2"].item()) == 1
     assert int(aux["bridge_alignment_tsp_clean_encoded"].item()) == 1
     assert int(aux["bridge_alignment_tsp_clean_detached"].item()) == 1
     assert torch.isfinite(aux["tsp_scale_entropy_gap"])
@@ -156,6 +157,7 @@ def test_tsp_bridge_clean_alignment_and_diagnostics():
     assert torch.isfinite(result["loss"])
     assert "loss_tsp_scale_entropy" not in result
     assert "loss_tsp_scale_balance" not in result
+    assert int(result["bridge_connector_temporal_pyramid_v2"].item()) == 1
     assert int(result["bridge_alignment_tsp_clean_encoded"].item()) == 1
     assert int(result["bridge_alignment_tsp_clean_detached"].item()) == 1
 

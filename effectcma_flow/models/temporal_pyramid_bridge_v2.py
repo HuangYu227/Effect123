@@ -519,9 +519,18 @@ class TextGuidedTokenScaleRouter(nn.Module):
             weight = local * global_gate[:, s].view(b, 1, 1).to(dtype=dtype)
             weighted_tokens.append(tokens * weight)
         entropy = -(global_gate.float().clamp_min(1e-8) * global_gate.float().clamp_min(1e-8).log()).sum(dim=-1)
+        entropy_norm = entropy / math.log(max(self.num_scales, 2))
+        mean_usage = global_gate.float().mean(dim=0)
+        uniform = torch.full_like(mean_usage, 1.0 / float(self.num_scales))
         aux: dict[str, torch.Tensor] = {
-            "tsp_scale_gate_entropy_norm": (entropy / math.log(max(self.num_scales, 2))).detach().mean().to(dtype=dtype),
+            "tsp_scale_gate_entropy_norm": entropy_norm.detach().mean().to(dtype=dtype),
             "tsp_scale_context_norm": scale_ctx_t.detach().norm(dim=-1).mean(),
+            # Optional regularizers consumed only when the training config gives
+            # them non-zero weights. They are intentionally light and generic:
+            # entropy discourages hard scale collapse, while batch balance keeps
+            # all temporal granularities reachable without supervising labels.
+            "tsp_scale_entropy_loss": (1.0 - entropy_norm.mean()).clamp_min(0.0).to(dtype=dtype),
+            "tsp_scale_balance_loss": (mean_usage - uniform).square().mean().to(dtype=dtype),
         }
         for s in range(self.num_scales):
             aux[f"tsp_global_gate_s{s}"] = global_gate[:, s].detach().mean().to(dtype=dtype)

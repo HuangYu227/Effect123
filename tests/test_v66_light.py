@@ -111,6 +111,46 @@ def test_v66_light_text2ts_path_trains_with_spectral_prompt():
     assert torch.isfinite(result["spectral_prompt_gate_low"])
 
 
+def test_tsp_bridge_clean_alignment_and_optional_regularizers():
+    torch.manual_seed(3)
+    cfg = _tsp_v2_test_config()
+    model = build_model(cfg, sequence_length=16, num_channels=3)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    batch = {
+        "Y": torch.randn(2, 16, 3),
+        "caption": [
+            "daily periodic weather with a local abrupt change",
+            "slow seasonal drift mixed with high frequency fluctuation",
+        ],
+    }
+
+    t = torch.rand(2)
+    x_t = torch.randn(2, 16, 3)
+    pred_v, aux = model(x_t, t, [[text] for text in batch["caption"]], target=batch["Y"])
+    assert pred_v.shape == (2, 16, 3)
+    assert torch.isfinite(pred_v).all()
+    assert int(aux["tsp_connector_active"].item()) == 1
+    assert int(aux["tsp_budget_token_count"].item()) == 16
+    assert int(aux["bridge_alignment_tsp_clean_encoded"].item()) == 1
+    assert torch.isfinite(aux["tsp_scale_entropy_loss"])
+    assert torch.isfinite(aux["tsp_scale_balance_loss"])
+
+    result = cfm_train_step(
+        model,
+        batch,
+        opt,
+        text_encoder_mode="hash",
+        task_mode="text2ts",
+        bridge_alignment_weight=0.01,
+        tsp_scale_entropy_weight=0.001,
+        tsp_scale_balance_weight=0.001,
+    )
+    assert torch.isfinite(result["loss"])
+    assert torch.isfinite(result["loss_tsp_scale_entropy"])
+    assert torch.isfinite(result["loss_tsp_scale_balance"])
+    assert int(result["bridge_alignment_tsp_clean_encoded"].item()) == 1
+
+
 def _v66_light_test_config() -> dict:
     return {
         "task": {"mode": "text2ts"},
@@ -154,3 +194,24 @@ def _v66_light_test_config() -> dict:
             "hash_dim": 32,
         },
     }
+
+
+def _tsp_v2_test_config() -> dict:
+    cfg = _v66_light_test_config()
+    cfg["model"].update(
+        {
+            "bridge_state_connector": "temporal_pyramid_v2",
+            "bridge_token_budget": 16,
+            "temporal_pyramid_patch_lens": [4, 8],
+            "temporal_pyramid_token_budget": 16,
+            "temporal_pyramid_anchor_tokens": 2,
+            "temporal_pyramid_cross_scale_layers": 1,
+            "temporal_pyramid_dropout": 0.0,
+            "temporal_pyramid_use_topdown": True,
+            "temporal_pyramid_use_bottomup": True,
+            "temporal_pyramid_use_text_routing": True,
+            "temporal_pyramid_temporal_bias_tau": 0.25,
+            "temporal_pyramid_gate_temperature": 0.7,
+        }
+    )
+    return cfg

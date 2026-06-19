@@ -482,6 +482,7 @@ class TSPatchMergerConnector(nn.Module):
         channel_context = self.channel_pool(channel_query, fused_state)
 
         use_clean = False
+        tsp_alignment_clean_encoded = False
         if compute_alignment:
             # Choose the series tokens to align against. "clean" re-encodes the
             # ground-truth target through the same patch-merger stack so the
@@ -489,9 +490,15 @@ class TSPatchMergerConnector(nn.Module):
             # fused current state when no target is supplied (e.g. at sampling).
             use_clean = self._use_clean_alignment_target(target)
             if use_clean and self.tsp_encoder is not None:
-                # TSP encoder does not have _encode_grid/_patch_merge; fall back
-                # to fused_state for alignment target
-                align_state_tokens = fused_state
+                clean_text_context = _masked_mean(slot_tokens, slot_mask) if slot_mask is not None else slot_tokens.mean(dim=1)
+                align_state_tokens, _clean_tsp_aux = self.tsp_encoder(
+                    x_t=target,
+                    t=torch.ones_like(t),
+                    slot_tokens=slot_tokens,
+                    slot_mask=slot_mask,
+                    text_context=clean_text_context,
+                )
+                tsp_alignment_clean_encoded = True
             elif use_clean:
                 clean_grid = self._encode_grid(target, torch.ones_like(t))
                 align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
@@ -543,6 +550,7 @@ class TSPatchMergerConnector(nn.Module):
             "bridge_token_budget": torch.tensor(float(self.token_budget), device=device, dtype=dtype),
             "bridge_connector_patch_merger": torch.tensor(1.0, device=device, dtype=dtype),
             "bridge_alignment_used_clean": torch.tensor(1.0 if compute_alignment and use_clean else 0.0, device=device, dtype=dtype),
+            "bridge_alignment_tsp_clean_encoded": torch.tensor(1.0 if tsp_alignment_clean_encoded else 0.0, device=device, dtype=dtype),
             **alignment_aux,
         }
         # Add TSP-Bridge V2 diagnostics if available

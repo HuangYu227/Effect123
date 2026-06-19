@@ -24,6 +24,7 @@ import warnings
 
 import torch
 
+from effectcma_flow.training.normalized_spectral_loss import normalized_multi_resolution_fft_loss
 from effectcma_flow.training.utils import batch_to_device, text_condition_from_batch
 
 
@@ -47,6 +48,9 @@ def cfm_train_step(
     caption_ranking_weight: float = 0.0,
     caption_ranking_margin: float = 0.05,
     spectral_loss_weight: float = 0.0,
+    spectral_loss_type: str = "magnitude",
+    spectral_fft_sizes: Any = (16, 32, 64, 128),
+    spectral_distance: str = "l1",
     spectral_log_magnitude: bool = True,
     spectral_time_weight_power: float = 0.0,
     operator_balance_weight: float = 0.0,
@@ -141,20 +145,26 @@ def cfm_train_step(
             # of a sub-unit weight is < 1); to compensate the user may raise
             # spectral_loss_weight in the config. We deliberately do NOT rescale
             # the weight here so the knob stays a pure, isolated time reweighting.
-            per_sample = _spectral_magnitude_loss(
+            per_sample = _clean_spectral_loss(
                 pred_x0,
                 target,
                 mask=batch.get("mask"),
+                loss_type=spectral_loss_type,
+                fft_sizes=spectral_fft_sizes,
+                distance=spectral_distance,
                 log_magnitude=bool(spectral_log_magnitude),
                 reduction="none",
             )
             time_weight = (1.0 - t).clamp_min(0.0) ** float(spectral_time_weight_power)
             spectral_loss = (per_sample * time_weight.to(per_sample.dtype)).mean()
         else:
-            spectral_loss = _spectral_magnitude_loss(
+            spectral_loss = _clean_spectral_loss(
                 pred_x0,
                 target,
                 mask=batch.get("mask"),
+                loss_type=spectral_loss_type,
+                fft_sizes=spectral_fft_sizes,
+                distance=spectral_distance,
                 log_magnitude=bool(spectral_log_magnitude),
             )
     caption_ranking = pred_v.new_zeros(())
@@ -394,6 +404,54 @@ def _spectral_magnitude_loss(
     return loss.to(dtype=pred_x0.dtype)
 
 
+def _clean_spectral_loss(
+    pred_x0: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mask: torch.Tensor | None,
+    loss_type: str,
+    fft_sizes: Any,
+    distance: str,
+    log_magnitude: bool,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    mode = str(loss_type).lower()
+    if mode in {"magnitude", "rfft_magnitude", "fft_magnitude"}:
+        return _spectral_magnitude_loss(
+            pred_x0,
+            target,
+            mask=mask,
+            log_magnitude=log_magnitude,
+            reduction=reduction,
+        )
+    if mode in {"normalized_mrfft", "normalized_multi_resolution_fft", "normalised_mrfft"}:
+        return normalized_multi_resolution_fft_loss(
+            pred_x0,
+            target,
+            mask=mask,
+            fft_sizes=_parse_spectral_fft_sizes(fft_sizes),
+            log_magnitude=log_magnitude,
+            distance=distance,
+            reduction=reduction,
+        )
+    raise ValueError(
+        "spectral_loss_type must be one of: 'magnitude', 'rfft_magnitude', "
+        "'normalized_mrfft'"
+    )
+
+
+def _parse_spectral_fft_sizes(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return (16, 32, 64, 128)
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.replace(";", ",").split(",")]
+        return tuple(int(part) for part in parts if part)
+    try:
+        return tuple(int(v) for v in value)
+    except TypeError as exc:
+        raise TypeError(f"spectral_fft_sizes must be a sequence of ints or comma string, got {value!r}") from exc
+
+
 def _flow_diagnostics(*, target: torch.Tensor, source: torch.Tensor, pred_v: torch.Tensor, target_v: torch.Tensor) -> dict[str, torch.Tensor]:
     pred_v_rms = pred_v.detach().square().mean().sqrt()
     target_v_rms = target_v.detach().square().mean().sqrt()
@@ -454,6 +512,13 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "bridge_budget_pool_active",
         "bridge_token_budget",
         "bridge_connector_patch_merger",
+        "spectral_prompt_entropy",
+        "spectral_prompt_entropy_norm",
+        "spectral_prompt_gate_low",
+        "spectral_prompt_gate_mid",
+        "spectral_prompt_gate_high",
+        "spectral_prompt_delta_norm",
+        "spectral_prompt_attn_entropy_norm",
     ]:
         val = aux.get(key)
         if torch.is_tensor(val):

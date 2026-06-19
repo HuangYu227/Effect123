@@ -8,6 +8,7 @@ from effectcma_flow.models.effect_mapper import EffectMapper
 from effectcma_flow.models.global_operator_gate import GlobalOperatorGate
 from effectcma_flow.models.latent_regime_adapter import LatentRegimeConditionAdapter
 from effectcma_flow.models.operator_bank import ResidualOperatorBank
+from effectcma_flow.models.spectral_prompt import SpectralPromptGenerator, merge_spectral_expert_context
 from effectcma_flow.models.ts_encoder import ChannelEncoder, TimePatchEncoder
 
 
@@ -72,6 +73,8 @@ class TextToTSFlow(nn.Module):
         operator_frequency_temp_start: float = 1.0,
         operator_frequency_temp_end: float = 0.1,
         operator_frequency_anneal_steps: int = 10000,
+        operator_temporal_long_range_mode: str = "none",
+        operator_temporal_long_range_scales: tuple[int, ...] | list[int] | None = None,
         # V6.1 latent regime adapter
         use_latent_regime_adapter: bool = False,
         num_regimes: int = 4,
@@ -105,8 +108,16 @@ class TextToTSFlow(nn.Module):
         bridge_alignment_dense: bool = False,
         bridge_alignment_regions: int = 8,
         bridge_alignment_target: str = "state",
+        bridge_alignment_clean_prob: float = 1.0,
         bridge_text_agg_tokens: int = 0,
         bridge_diagnostics: bool = False,
+        # V6.6-light text-conditioned spectral prompt
+        use_spectral_prompt: bool = False,
+        spectral_prompt_bands: int = 3,
+        spectral_prompt_heads: int = 4,
+        spectral_prompt_dropout: float = 0.0,
+        spectral_prompt_gate_temperature: float = 1.0,
+        spectral_prompt_residual_gate: bool = True,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -142,10 +153,25 @@ class TextToTSFlow(nn.Module):
                 alignment_dense=bridge_alignment_dense,
                 alignment_regions=bridge_alignment_regions,
                 alignment_target=bridge_alignment_target,
+                alignment_clean_prob=bridge_alignment_clean_prob,
                 text_agg_tokens=bridge_text_agg_tokens,
                 diagnostics=bridge_diagnostics,
             )
             if self.use_cross_modal_bridge
+            else None
+        )
+        self.use_spectral_prompt = bool(use_spectral_prompt)
+        self.spectral_prompt = (
+            SpectralPromptGenerator(
+                d_model=d_model,
+                num_bands=spectral_prompt_bands,
+                num_experts=num_operators,
+                num_heads=spectral_prompt_heads,
+                dropout=spectral_prompt_dropout,
+                gate_temperature=spectral_prompt_gate_temperature,
+                use_residual_gate=spectral_prompt_residual_gate,
+            )
+            if self.use_spectral_prompt
             else None
         )
 
@@ -219,6 +245,8 @@ class TextToTSFlow(nn.Module):
             frequency_temp_start=operator_frequency_temp_start,
             frequency_temp_end=operator_frequency_temp_end,
             frequency_anneal_steps=operator_frequency_anneal_steps,
+            temporal_long_range_mode=operator_temporal_long_range_mode,
+            temporal_long_range_scales=operator_temporal_long_range_scales,
         )
 
         # V6.1: Latent regime condition adapter (optional)
@@ -321,6 +349,12 @@ class TextToTSFlow(nn.Module):
                 text_context=text_context,
             )
 
+        spectral_aux: dict[str, torch.Tensor] = {}
+        if self.spectral_prompt is not None:
+            spectral_out = self.spectral_prompt(slot_tokens, slot_mask, text_context=text_context)
+            expert_context = merge_spectral_expert_context(expert_context, spectral_out.expert_delta)
+            spectral_aux = spectral_out.aux
+
         bank_channel_context = channel_context if getattr(self.operator_bank, "multiview_context", False) else None
         if self._use_global_gate:
             # --- V6.1 global operator gate path ---
@@ -341,9 +375,12 @@ class TextToTSFlow(nn.Module):
                 velocity_shape=velocities.shape,
             )
             v_hat = (g * velocities).sum(dim=-1)
+            bank_aux = getattr(self.operator_bank, "last_aux", {})
             aux = {
                 **bridge_aux,
                 **regime_aux,
+                **spectral_aux,
+                **bank_aux,
                 **gate_aux,
                 "G": g,
                 "V": velocities,
@@ -371,10 +408,13 @@ class TextToTSFlow(nn.Module):
                 channel_context=bank_channel_context,
             )
             v_hat = (g * velocities).sum(dim=-1)
+            bank_aux = getattr(self.operator_bank, "last_aux", {})
             aux = {
                 **aux,
                 **bridge_aux,
                 **regime_aux,
+                **spectral_aux,
+                **bank_aux,
                 "G_patch": g_patch,
                 "G": g,
                 "V": velocities,

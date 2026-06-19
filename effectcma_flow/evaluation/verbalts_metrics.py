@@ -116,7 +116,7 @@ class VerbalTSMetricComputer:
             }
             self._save_reference_stats(reference_cache_dir, ref_stats, cache_metadata)
 
-        gen_ts, gen_joint, cttp, gen_raw = self._collect_generated_embeddings(
+        gen_ts, gen_joint, cttp, gen_raw, eval_real_ts, eval_text, eval_real_raw = self._collect_generated_embeddings(
             model=model,
             loader=generated_loader,
             text_encoder_mode=text_encoder_mode,
@@ -132,6 +132,7 @@ class VerbalTSMetricComputer:
             max_caption_slots=max_caption_slots,
             include_all_caption_candidates=include_all_caption_candidates,
             text_key=generated_text_key,
+            series_key=reference_series_key,
             max_batches=generated_max_batches,
         )
         gen_ts_mean, gen_ts_cov = _mean_cov(gen_ts)
@@ -152,6 +153,9 @@ class VerbalTSMetricComputer:
                 gen_ts_feat=gen_ts,
                 gen_joint_feat=gen_joint,
                 gen_raw_ts=gen_raw,
+                eval_real_ts_feat=eval_real_ts,
+                eval_text_feat=eval_text,
+                eval_real_raw_ts=eval_real_raw,
             )
         )
         return out
@@ -165,28 +169,50 @@ class VerbalTSMetricComputer:
         gen_ts_feat: np.ndarray,
         gen_joint_feat: np.ndarray,
         gen_raw_ts: np.ndarray,
+        eval_real_ts_feat: np.ndarray | None = None,
+        eval_text_feat: np.ndarray | None = None,
+        eval_real_raw_ts: np.ndarray | None = None,
     ) -> dict[str, float]:
         """Compute the full 11-metric ConTSG-Bench panel.
 
-        Statistical metrics use raw time series. Embedding metrics reuse the
-        already-collected CTTP feature point clouds: the time-series cloud feeds
-        FID / Precision / Recall, and the joint (ts|text) cloud feeds J-FTSD /
-        JointPrecision / JointRecall. kNN manifold metrics run on ``self.device``.
+        Frechet and train-reference statistical metrics keep using the reference
+        cache. ACD and PRDC-style metrics follow ConTSG-Bench evaluation
+        semantics: compare generated samples against the matching eval-set
+        ground truth and use the same caption embeddings for real/gen joint PR.
         """
         out: dict[str, float] = {}
-        out.update(
-            contsg_metrics.compute_statistical_metrics(
-                ref_raw_ts,
-                gen_raw_ts,
-                train_reference=ref_raw_ts,
-            )
+        stat = contsg_metrics.compute_statistical_metrics(
+            ref_raw_ts,
+            gen_raw_ts,
+            train_reference=ref_raw_ts,
         )
+        if eval_real_raw_ts is not None:
+            stat["ACD"] = contsg_metrics.acd(eval_real_raw_ts, gen_raw_ts, max_lag=50)
+        out.update(stat)
         out["FID"] = contsg_metrics.frechet_distance(ref_ts_feat, gen_ts_feat)
-        precision, recall = contsg_metrics.precision_recall(ref_ts_feat, gen_ts_feat, device=self.device)
+        pr_real_ts_feat = eval_real_ts_feat if eval_real_ts_feat is not None else ref_ts_feat
+        precision, recall = contsg_metrics.precision_recall(pr_real_ts_feat, gen_ts_feat, device=self.device)
         out["Precision"] = precision
         out["Recall"] = recall
         out["J-FTSD"] = contsg_metrics.frechet_distance(ref_joint_feat, gen_joint_feat)
-        jprecision, jrecall = contsg_metrics.precision_recall(ref_joint_feat, gen_joint_feat, device=self.device)
+        if eval_real_ts_feat is not None and eval_text_feat is not None:
+            jprecision, jrecall = contsg_metrics.joint_precision_recall(
+                eval_real_ts_feat,
+                eval_text_feat,
+                gen_ts_feat,
+                eval_text_feat,
+                device=self.device,
+            )
+        else:
+            ref_text_feat = _split_joint_text(ref_joint_feat, ref_ts_feat.shape[1], "ref_joint_feat")
+            gen_text_feat = _split_joint_text(gen_joint_feat, gen_ts_feat.shape[1], "gen_joint_feat")
+            jprecision, jrecall = contsg_metrics.joint_precision_recall(
+                ref_ts_feat,
+                ref_text_feat,
+                gen_ts_feat,
+                gen_text_feat,
+                device=self.device,
+            )
         out["JointPrecision"] = jprecision
         out["JointRecall"] = jrecall
         return out
@@ -240,12 +266,16 @@ class VerbalTSMetricComputer:
         max_caption_slots: int,
         include_all_caption_candidates: bool,
         text_key: str,
+        series_key: str,
         max_batches: int | None,
-    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         model.eval()
         ts_embeddings = []
         joint_embeddings = []
         raw_series = []
+        real_ts_embeddings = []
+        text_embeddings = []
+        real_raw_series = []
         cttp_sum = 0.0
         count = 0
         for batch_no, batch in enumerate(tqdm(loader, desc="verbalts-gen", dynamic_ncols=True)):
@@ -291,11 +321,16 @@ class VerbalTSMetricComputer:
             else:
                 raise ValueError(f"Unknown task_mode {task_mode!r}; expected 'text2ts' or 'edit'")
             pred = self._denormalize(pred.float())
+            target = self._denormalize(batch[series_key].float())
             text = [str(x) for x in batch[text_key]]
             ts_emb, text_emb = self._embed(pred, text)
+            real_ts_emb = self._embed_ts(target)
             ts_embeddings.append(ts_emb.cpu())
             joint_embeddings.append(torch.cat([ts_emb, text_emb], dim=-1).cpu())
             raw_series.append(pred.detach().cpu())
+            real_ts_embeddings.append(real_ts_emb.cpu())
+            text_embeddings.append(text_emb.cpu())
+            real_raw_series.append(target.detach().cpu())
             cttp_sum += (ts_emb * text_emb).sum(dim=-1).sum().item()
             count += int(ts_emb.shape[0])
         if count == 0:
@@ -305,6 +340,9 @@ class VerbalTSMetricComputer:
             _cat_numpy(joint_embeddings, "generated joint embeddings"),
             cttp_sum / count,
             _cat_numpy(raw_series, "generated raw series"),
+            _cat_numpy(real_ts_embeddings, "eval real time-series embeddings"),
+            _cat_numpy(text_embeddings, "eval text embeddings"),
+            _cat_numpy(real_raw_series, "eval real raw series"),
         )
 
     def _embed(self, ts: torch.Tensor, text: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -312,6 +350,10 @@ class VerbalTSMetricComputer:
         ts_emb = self.clip.get_ts_coemb(ts, ts_len)
         text_emb = self.clip.get_text_coemb(text, None)
         return ts_emb, text_emb
+
+    def _embed_ts(self, ts: torch.Tensor) -> torch.Tensor:
+        ts_len = torch.full((ts.shape[0],), ts.shape[1], device=self.device, dtype=torch.int32)
+        return self.clip.get_ts_coemb(ts, ts_len)
 
     def _denormalize(self, ts: torch.Tensor) -> torch.Tensor:
         if self.stats is None:
@@ -409,6 +451,15 @@ def _cat_numpy(items: list[torch.Tensor], name: str) -> np.ndarray:
     if not items:
         raise ValueError(f"No {name} collected")
     return torch.cat(items, dim=0).numpy()
+
+
+def _split_joint_text(joint_feat: np.ndarray, ts_dim: int, name: str) -> np.ndarray:
+    joint_feat = np.asarray(joint_feat, dtype=np.float64)
+    if joint_feat.ndim != 2:
+        raise ValueError(f"{name} must be 2-D, got {joint_feat.shape}")
+    if joint_feat.shape[1] <= ts_dim:
+        raise ValueError(f"{name} dim {joint_feat.shape[1]} must be larger than ts_dim={ts_dim}")
+    return joint_feat[:, ts_dim:]
 
 
 def _jsonable(value: Any) -> Any:

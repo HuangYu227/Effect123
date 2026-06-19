@@ -92,16 +92,35 @@ class AdaFeatureNorm(nn.Module):
 class TemporalSegmentExpert(nn.Module):
     """Velocity expert constrained to the time dimension with multi-scale dilated convolutions."""
 
-    def __init__(self, *, num_channels: int, hidden: int, t_dim: int, dropout: float, norm_type: str) -> None:
+    def __init__(
+        self,
+        *,
+        num_channels: int,
+        hidden: int,
+        t_dim: int,
+        dropout: float,
+        norm_type: str,
+        long_range_mode: str = "none",
+        long_range_scales: tuple[int, ...] | list[int] | None = None,
+    ) -> None:
         super().__init__()
         self.num_channels = int(num_channels)
         self.hidden = int(hidden)
+        self.long_range_mode = str(long_range_mode).lower()
+        if self.long_range_mode not in {"none", "multiscale"}:
+            raise ValueError(f"long_range_mode must be 'none' or 'multiscale', got {long_range_mode!r}")
         self.ada_norm = AdaFeatureNorm(hidden, t_dim)
         self.local = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1, groups=hidden)
         self.mid = nn.Conv1d(hidden, hidden, kernel_size=5, padding=4, dilation=2, groups=hidden)
         self.long = nn.Conv1d(hidden, hidden, kernel_size=7, padding=9, dilation=3, groups=hidden)
+        self.long_range = (
+            MultiScaleTemporalMixer(hidden=hidden, scales=long_range_scales or (2, 4, 8), dropout=dropout)
+            if self.long_range_mode == "multiscale"
+            else None
+        )
+        mix_inputs = 4 * hidden if self.long_range is not None else 3 * hidden
         self.mix = nn.Sequential(
-            nn.Conv1d(3 * hidden, hidden, kernel_size=1),
+            nn.Conv1d(mix_inputs, hidden, kernel_size=1),
             nn.SiLU(),
             nn.Dropout(dropout),
         )
@@ -112,13 +131,69 @@ class TemporalSegmentExpert(nn.Module):
         batch, length, channels, hidden = h.shape
         h_n, scale, shift = self.ada_norm(h, t_code)
         x = h_n.permute(0, 2, 3, 1).reshape(batch * channels, hidden, length)
-        y = self.mix(torch.cat([self.local(x), self.mid(x), self.long(x)], dim=1))
+        branches = [self.local(x), self.mid(x), self.long(x)]
+        if self.long_range is not None:
+            branches.append(self.long_range(x))
+        y = self.mix(torch.cat(branches, dim=1))
         out = self.head(y).reshape(batch, channels, length).transpose(1, 2)
         aux = {
             "time_film_scale_rms": scale.detach().square().mean().sqrt(),
             "time_film_shift_rms": shift.detach().square().mean().sqrt(),
         }
+        if self.long_range is not None:
+            aux["long_range_rms"] = branches[-1].detach().square().mean().sqrt()
         return out, aux
+
+
+class MultiScaleTemporalMixer(nn.Module):
+    """Dependency-free TimeMixer-style coarse-to-fine temporal context branch.
+
+    The branch downsamples each variable's hidden trajectory to several coarse
+    scales, applies lightweight temporal mixing there, and interpolates the
+    result back to the original length. It gives the temporal expert an explicit
+    long-range path without adding S4/Mamba custom kernels or changing the
+    operator count.
+    """
+
+    def __init__(self, *, hidden: int, scales: tuple[int, ...] | list[int], dropout: float) -> None:
+        super().__init__()
+        clean_scales = []
+        for value in scales:
+            scale = int(value)
+            if scale > 1 and scale not in clean_scales:
+                clean_scales.append(scale)
+        if not clean_scales:
+            raise ValueError("MultiScaleTemporalMixer requires at least one scale > 1")
+        self.scales = tuple(clean_scales)
+        self.blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(hidden, hidden, kernel_size=3, padding=1, groups=hidden),
+                    nn.GELU(),
+                    nn.Conv1d(hidden, hidden, kernel_size=1),
+                    nn.Dropout(dropout),
+                )
+                for _ in self.scales
+            ]
+        )
+        self.mix = nn.Sequential(
+            nn.Conv1d(len(self.scales) * hidden, hidden, kernel_size=1),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"expected [B*C,H,L] temporal features, got {tuple(x.shape)}")
+        length = int(x.shape[-1])
+        branches = []
+        for scale, block in zip(self.scales, self.blocks):
+            kernel = min(int(scale), length)
+            pooled = torch.nn.functional.avg_pool1d(x, kernel_size=kernel, stride=kernel, ceil_mode=True)
+            mixed = block(pooled)
+            up = torch.nn.functional.interpolate(mixed, size=length, mode="linear", align_corners=False)
+            branches.append(up)
+        return self.mix(torch.cat(branches, dim=1))
 
 
 class ChannelInteractionExpert(nn.Module):
@@ -315,6 +390,8 @@ class ResidualOperatorBank(nn.Module):
         frequency_temp_start: float = 1.0,
         frequency_temp_end: float = 0.1,
         frequency_anneal_steps: int = 10000,
+        temporal_long_range_mode: str = "none",
+        temporal_long_range_scales: tuple[int, ...] | list[int] | None = None,
     ) -> None:
         super().__init__()
         self.num_channels = int(num_channels)
@@ -396,6 +473,8 @@ class ResidualOperatorBank(nn.Module):
                         t_dim=t_dim,
                         dropout=dropout,
                         norm_type=norm_type,
+                        long_range_mode=temporal_long_range_mode,
+                        long_range_scales=temporal_long_range_scales,
                     ),
                     ChannelInteractionExpert(
                         num_channels=self.num_channels,

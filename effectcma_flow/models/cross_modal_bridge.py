@@ -237,6 +237,7 @@ class TSPatchMergerConnector(nn.Module):
         alignment_dense: bool = False,
         alignment_regions: int = 8,
         alignment_target: str = "state",
+        alignment_clean_prob: float = 1.0,
         text_agg_tokens: int = 0,
         diagnostics: bool = False,
     ) -> None:
@@ -263,9 +264,14 @@ class TSPatchMergerConnector(nn.Module):
         # Which series representation to align against: "clean" encodes the
         # ground-truth target through the same patch-merger stack (signal is not
         # diluted by flow noise); "state" reuses the fused current-state tokens.
+        # "mixed" samples between them during training, matching the scheduled-
+        # sampling idea of exposing the bridge loss to inference-like states.
         self.alignment_target = str(alignment_target).lower()
-        if self.alignment_target not in {"state", "clean"}:
-            raise ValueError(f"alignment_target must be 'state' or 'clean', got {alignment_target!r}")
+        if self.alignment_target not in {"state", "clean", "mixed"}:
+            raise ValueError(f"alignment_target must be 'state', 'clean', or 'mixed', got {alignment_target!r}")
+        self.alignment_clean_prob = float(alignment_clean_prob)
+        if not 0.0 <= self.alignment_clean_prob <= 1.0:
+            raise ValueError(f"alignment_clean_prob must be in [0, 1], got {alignment_clean_prob!r}")
         # Optional learnable text aggregation tokens prepended to the slot
         # sequence before the bidirectional cross-attn so the bridge can read a
         # few sequence-level summaries; they are stripped before any downstream
@@ -416,12 +422,14 @@ class TSPatchMergerConnector(nn.Module):
         expert_context = self.expert_pool(expert_query, fused_state)
         channel_context = self.channel_pool(channel_query, fused_state)
 
+        use_clean = False
         if compute_alignment:
             # Choose the series tokens to align against. "clean" re-encodes the
             # ground-truth target through the same patch-merger stack so the
             # alignment target is not diluted by flow noise; falls back to the
             # fused current state when no target is supplied (e.g. at sampling).
-            if self.alignment_target == "clean" and target is not None:
+            use_clean = self._use_clean_alignment_target(target)
+            if use_clean:
                 clean_grid = self._encode_grid(target, torch.ones_like(t))
                 align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
             else:
@@ -471,9 +479,26 @@ class TSPatchMergerConnector(nn.Module):
             ),
             "bridge_token_budget": torch.tensor(float(self.token_budget), device=device, dtype=dtype),
             "bridge_connector_patch_merger": torch.tensor(1.0, device=device, dtype=dtype),
+            "bridge_alignment_used_clean": torch.tensor(1.0 if compute_alignment and use_clean else 0.0, device=device, dtype=dtype),
             **alignment_aux,
         }
         return bridged_text, bridge_context, expert_context, channel_context, aux
+
+    def _use_clean_alignment_target(self, target: torch.Tensor | None) -> bool:
+        if target is None:
+            return False
+        if self.alignment_target == "clean":
+            return True
+        if self.alignment_target == "state":
+            return False
+        if self.alignment_clean_prob <= 0.0:
+            return False
+        if self.alignment_clean_prob >= 1.0:
+            return True
+        if not self.training:
+            return self.alignment_clean_prob >= 0.5
+        draw = torch.rand((), device=target.device)
+        return bool(draw.item() < self.alignment_clean_prob)
 
     def _encode_grid(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         batch, length, channels = x_t.shape
@@ -618,6 +643,7 @@ class CrossModalConditionBridge(nn.Module):
         alignment_dense: bool = False,
         alignment_regions: int = 8,
         alignment_target: str = "state",
+        alignment_clean_prob: float = 1.0,
         text_agg_tokens: int = 0,
         diagnostics: bool = False,
     ) -> None:
@@ -667,6 +693,7 @@ class CrossModalConditionBridge(nn.Module):
                 alignment_dense=alignment_dense,
                 alignment_regions=alignment_regions,
                 alignment_target=alignment_target,
+                alignment_clean_prob=alignment_clean_prob,
                 text_agg_tokens=text_agg_tokens,
                 diagnostics=diagnostics,
             )

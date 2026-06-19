@@ -74,16 +74,30 @@ def test_precision_recall_matches_bruteforce():
     gen = rng.normal(size=(90, 6)) + 0.3
 
     def brute(ref, query, k=3):
-        # k-th NN radius within ref (excluding self), then fraction of query inside.
-        dref = np.linalg.norm(ref[:, None] - ref[None, :], axis=-1)
+        # ConTSG-Bench uses squared kNN radii and compares each query to its nearest ref point.
+        dref = np.sum((ref[:, None] - ref[None, :]) ** 2, axis=-1)
         np.fill_diagonal(dref, np.inf)
         radius = np.sort(dref, axis=1)[:, k - 1]
-        dq = np.linalg.norm(query[:, None] - ref[None, :], axis=-1)
-        return float((dq <= radius[None, :]).any(axis=1).mean())
+        dq = np.sum((query[:, None] - ref[None, :]) ** 2, axis=-1)
+        nn = np.argmin(dq, axis=1)
+        return float((dq[np.arange(query.shape[0]), nn] <= radius[nn]).mean())
 
-    p, r = cm.precision_recall(real, gen, k=3)
-    assert p == pytest.approx(brute(real, gen), abs=1e-9)
-    assert r == pytest.approx(brute(gen, real), abs=1e-9)
+    rng_sample = np.random.RandomState(0)
+    real_idx = rng_sample.choice(real.shape[0], size=90, replace=False)
+    real_sampled = real[real_idx]
+
+    p, r = cm.precision_recall(real, gen, k=3, seed=0)
+    assert p == pytest.approx(brute(real_sampled, gen), abs=1e-9)
+    assert r == pytest.approx(brute(gen, real_sampled), abs=1e-9)
+
+
+def test_precision_recall_can_disable_conbench_sampling():
+    rng = _rng()
+    real = rng.normal(size=(120, 6))
+    gen = rng.normal(size=(90, 6)) + 0.3
+    sampled = cm.precision_recall(real, gen, k=3, seed=0)
+    full = cm.precision_recall(real, gen, k=3, sample_equal=False)
+    assert sampled != full
 
 
 def test_cttp_score_bounds():

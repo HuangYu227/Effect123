@@ -19,8 +19,8 @@ work can optionally run on GPU.
 from __future__ import annotations
 
 import numpy as np
-import torch
 from scipy import linalg
+import torch
 
 EPS = 1e-8
 
@@ -48,7 +48,7 @@ def _as_feat(x: np.ndarray, name: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def mdd(real: np.ndarray, generated: np.ndarray, *, train_reference: np.ndarray | None = None, bins: int = 50, eps: float = EPS) -> float:
+def mdd(real: np.ndarray, generated: np.ndarray, *, train_reference: np.ndarray | None = None, bins: int = 32, eps: float = EPS) -> float:
     """Marginal Distribution Difference. Lower is better.
 
     Histogram range is taken from ``train_reference`` (the training set when
@@ -87,22 +87,25 @@ def mdd(real: np.ndarray, generated: np.ndarray, *, train_reference: np.ndarray 
 
 def _autocorr_profile(x: np.ndarray, max_lag: int | None, eps: float = EPS) -> np.ndarray:
     x = _as_ntc(x)
-    _, T, _ = x.shape
+    _, T, C = x.shape
     if max_lag is None:
-        max_lag = min(T // 2, 50)
-    max_lag = int(max(1, min(max_lag, T - 1)))
+        max_lag = 50
+    max_lag = int(max(0, min(max_lag, T - 1)))
     centered = x - x.mean(axis=1, keepdims=True)
     denom = np.sum(centered ** 2, axis=1) + eps  # (N, C)
-    prof = []
-    for lag in range(1, max_lag + 1):
-        num = np.sum(centered[:, :-lag, :] * centered[:, lag:, :], axis=1)  # (N, C)
-        prof.append(float(np.mean(num / denom)))
-    return np.asarray(prof, dtype=np.float64)
+    prof = np.zeros((C, max_lag + 1), dtype=np.float64)
+    for lag in range(0, max_lag + 1):
+        if lag == 0:
+            num = np.sum(centered ** 2, axis=1)  # (N, C)
+        else:
+            num = np.sum(centered[:, :-lag, :] * centered[:, lag:, :], axis=1)  # (N, C)
+        prof[:, lag] = np.mean(num / denom, axis=0)
+    return prof
 
 
 def acd(real: np.ndarray, generated: np.ndarray, *, max_lag: int | None = None) -> float:
     """Auto-Correlation Difference. Lower is better."""
-    return float(np.linalg.norm(_autocorr_profile(real, max_lag) - _autocorr_profile(generated, max_lag), ord=2))
+    return float(np.mean(np.abs(_autocorr_profile(real, max_lag) - _autocorr_profile(generated, max_lag))))
 
 
 def _flatten_channels(x: np.ndarray) -> np.ndarray:
@@ -132,7 +135,30 @@ def kd(real: np.ndarray, generated: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 
-def frechet_distance(real_feat: np.ndarray, gen_feat: np.ndarray, *, eps: float = 1e-6) -> float:
+def _covariance(feat: np.ndarray) -> np.ndarray:
+    feat = _as_feat(feat, "feat")
+    centered = feat - feat.mean(axis=0, keepdims=True)
+    cov = np.zeros((feat.shape[1], feat.shape[1]), dtype=np.float64)
+    for start in range(0, feat.shape[0], 4096):
+        block = centered[start : start + 4096]
+        cov += np.einsum("ni,nj->ij", block, block, optimize=False)
+    return cov / float(feat.shape[0] - 1)
+
+
+def _matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.einsum("ik,kj->ij", a, b, optimize=False)
+
+
+def _sqrtm_psd(matrix: np.ndarray) -> np.ndarray:
+    sym = 0.5 * (matrix + matrix.T)
+    tensor = torch.as_tensor(sym, dtype=torch.float64, device="cpu")
+    eigvals, eigvecs = torch.linalg.eigh(tensor)
+    eigvals = torch.clamp(eigvals, min=0.0)
+    sqrt_tensor = (eigvecs * torch.sqrt(eigvals).unsqueeze(0)) @ eigvecs.T
+    return sqrt_tensor.numpy()
+
+
+def frechet_distance(real_feat: np.ndarray, gen_feat: np.ndarray, *, eps: float = 1e-6, reg: float = 1e-4) -> float:
     """Frechet distance between two feature distributions. Lower is better."""
     real_feat = _as_feat(real_feat, "real_feat")
     gen_feat = _as_feat(gen_feat, "gen_feat")
@@ -143,8 +169,11 @@ def frechet_distance(real_feat: np.ndarray, gen_feat: np.ndarray, *, eps: float 
 
     mu_r = real_feat.mean(axis=0)
     mu_g = gen_feat.mean(axis=0)
-    cov_r = np.cov(real_feat, rowvar=False)
-    cov_g = np.cov(gen_feat, rowvar=False)
+    cov_r = _covariance(real_feat)
+    cov_g = _covariance(gen_feat)
+    if reg > 0:
+        cov_r = cov_r + np.eye(cov_r.shape[0]) * reg
+        cov_g = cov_g + np.eye(cov_g.shape[0]) * reg
     diff = mu_r - mu_g
     covmean, _ = linalg.sqrtm(cov_r.dot(cov_g), disp=False)
     if not np.isfinite(covmean).all():
@@ -152,7 +181,7 @@ def frechet_distance(real_feat: np.ndarray, gen_feat: np.ndarray, *, eps: float 
         covmean = linalg.sqrtm((cov_r + offset).dot(cov_g + offset))
     if np.iscomplexobj(covmean):
         covmean = covmean.real
-    value = float(diff.dot(diff) + np.trace(cov_r) + np.trace(cov_g) - 2.0 * np.trace(covmean))
+    value = float(np.sum(diff * diff) + np.trace(cov_r) + np.trace(cov_g) - 2.0 * np.trace(covmean))
     return float(max(value, 0.0))
 
 
@@ -161,39 +190,66 @@ def _to_tensor(x: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def _knn_kth_distance(feats: torch.Tensor, k: int, chunk: int = 1024) -> torch.Tensor:
-    """Distance from each point to its k-th nearest neighbour, excluding itself."""
+    """Squared distance to each point's k-th nearest neighbour, excluding itself."""
     n = feats.shape[0]
     if n <= k:
         raise ValueError(f"need more than k samples, got n={n}, k={k}")
     out = torch.empty(n, dtype=feats.dtype, device=feats.device)
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
-        d = torch.cdist(feats[start:end], feats)  # (b, n)
-        # k-th neighbour excluding self: take k+1 smallest, drop the zero self-distance.
-        vals, _ = torch.topk(d, k + 1, dim=1, largest=False)
-        out[start:end] = vals[:, k]
+        d = torch.cdist(feats[start:end], feats).pow(2)  # (b, n)
+        rows = torch.arange(end - start, device=feats.device)
+        cols = torch.arange(start, end, device=feats.device)
+        d[rows, cols] = float("inf")
+        vals, _ = torch.topk(d, k, dim=1, largest=False)
+        out[start:end] = vals[:, -1]
     return out
 
 
-def _fraction_in_manifold(query: torch.Tensor, reference: torch.Tensor, radius: torch.Tensor, chunk: int = 1024) -> float:
+def _cross_1nn(query: torch.Tensor, reference: torch.Tensor, chunk: int = 1024) -> tuple[torch.Tensor, torch.Tensor]:
     n = query.shape[0]
-    inside = torch.zeros(n, dtype=torch.bool, device=query.device)
+    min_dist = torch.empty(n, dtype=query.dtype, device=query.device)
+    min_idx = torch.empty(n, dtype=torch.long, device=query.device)
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
-        d = torch.cdist(query[start:end], reference)  # (b, m)
-        inside[start:end] = (d <= radius[None, :]).any(dim=1)
-    return float(inside.double().mean().item())
+        d = torch.cdist(query[start:end], reference).pow(2)  # (b, m)
+        vals, idx = torch.min(d, dim=1)
+        min_dist[start:end] = vals
+        min_idx[start:end] = idx
+    return min_dist, min_idx
 
 
-def precision_recall(real_feat: np.ndarray, gen_feat: np.ndarray, *, k: int = 3, device: torch.device | str = "cpu", chunk: int = 1024) -> tuple[float, float]:
-    """Improved Precision and Recall in feature space. Higher is better."""
+def precision_recall(
+    real_feat: np.ndarray,
+    gen_feat: np.ndarray,
+    *,
+    k: int = 5,
+    max_samples: int | None = None,
+    seed: int = 0,
+    sample_equal: bool = True,
+    device: torch.device | str = "cpu",
+    chunk: int = 1024,
+) -> tuple[float, float]:
+    """ConTSG-Bench kNN Precision and Recall in feature space. Higher is better."""
+    real_feat, gen_feat = _prepare_prdc_features(
+        real_feat,
+        gen_feat,
+        max_samples=max_samples,
+        seed=seed,
+        sample_equal=sample_equal,
+    )
     dev = torch.device(device)
-    real_t = _to_tensor(_as_feat(real_feat, "real_feat"), dev)
-    gen_t = _to_tensor(_as_feat(gen_feat, "gen_feat"), dev)
-    r_radius = _knn_kth_distance(real_t, k, chunk)
-    g_radius = _knn_kth_distance(gen_t, k, chunk)
-    precision = _fraction_in_manifold(gen_t, real_t, r_radius, chunk)
-    recall = _fraction_in_manifold(real_t, gen_t, g_radius, chunk)
+    real_t = _to_tensor(real_feat, dev)
+    gen_t = _to_tensor(gen_feat, dev)
+    k_eff = min(int(k), real_t.shape[0] - 1, gen_t.shape[0] - 1)
+    if k_eff < 1:
+        raise ValueError(f"need at least two samples per set, got real={real_t.shape[0]}, gen={gen_t.shape[0]}")
+    r_radius = _knn_kth_distance(real_t, k_eff, chunk)
+    g_radius = _knn_kth_distance(gen_t, k_eff, chunk)
+    d_g2r, nn_g2r = _cross_1nn(gen_t, real_t, chunk)
+    d_r2g, nn_r2g = _cross_1nn(real_t, gen_t, chunk)
+    precision = float((d_g2r <= r_radius[nn_g2r]).double().mean().item())
+    recall = float((d_r2g <= g_radius[nn_r2g]).double().mean().item())
     return precision, recall
 
 
@@ -219,7 +275,7 @@ def cttp_score(gen_ts_feat: np.ndarray, cond_text_feat: np.ndarray, *, normalize
     return float(np.mean(np.sum(gen_ts_feat * cond_text_feat, axis=1)))
 
 
-def make_joint_features(ts_feat: np.ndarray, cond_feat: np.ndarray, *, normalize_parts: bool = True) -> np.ndarray:
+def make_joint_features(ts_feat: np.ndarray, cond_feat: np.ndarray, *, normalize_parts: bool = False) -> np.ndarray:
     """Concatenate TS and condition embeddings for J-FTSD / Joint P&R."""
     ts_feat = _as_feat(ts_feat, "ts_feat")
     cond_feat = _as_feat(cond_feat, "cond_feat")
@@ -231,18 +287,111 @@ def make_joint_features(ts_feat: np.ndarray, cond_feat: np.ndarray, *, normalize
     return np.concatenate([ts_feat, cond_feat], axis=1)
 
 
-def j_ftsd(real_ts_feat: np.ndarray, real_cond_feat: np.ndarray, gen_ts_feat: np.ndarray, gen_cond_feat: np.ndarray, *, normalize_parts: bool = True) -> float:
+def make_conbench_joint_features(
+    real_ts_feat: np.ndarray,
+    real_cond_feat: np.ndarray,
+    gen_ts_feat: np.ndarray,
+    gen_cond_feat: np.ndarray,
+    *,
+    ts_weight: float = 1.0,
+    text_weight: float = 1.0,
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build ConTSG-Bench joint features for JointPrecision/JointRecall."""
+    real_ts_feat = _as_feat(real_ts_feat, "real_ts_feat")
+    real_cond_feat = _as_feat(real_cond_feat, "real_cond_feat")
+    gen_ts_feat = _as_feat(gen_ts_feat, "gen_ts_feat")
+    gen_cond_feat = _as_feat(gen_cond_feat, "gen_cond_feat")
+    if real_ts_feat.shape[0] != real_cond_feat.shape[0]:
+        raise ValueError(f"real sample count mismatch: {real_ts_feat.shape} vs {real_cond_feat.shape}")
+    if gen_ts_feat.shape[0] != gen_cond_feat.shape[0]:
+        raise ValueError(f"generated sample count mismatch: {gen_ts_feat.shape} vs {gen_cond_feat.shape}")
+    if real_ts_feat.shape[1] != gen_ts_feat.shape[1]:
+        raise ValueError(f"TS feature dims mismatch: {real_ts_feat.shape} vs {gen_ts_feat.shape}")
+    if real_cond_feat.shape[1] != gen_cond_feat.shape[1]:
+        raise ValueError(f"text feature dims mismatch: {real_cond_feat.shape} vs {gen_cond_feat.shape}")
+
+    all_ts = np.concatenate([gen_ts_feat, real_ts_feat], axis=0)
+    all_text = np.concatenate([gen_cond_feat, real_cond_feat], axis=0)
+    mu_ts = all_ts.mean(axis=0)
+    std_ts = all_ts.std(axis=0)
+    mu_text = all_text.mean(axis=0)
+    std_text = all_text.std(axis=0)
+
+    real_ts_n = ((real_ts_feat - mu_ts) / (std_ts + eps)) * ts_weight
+    gen_ts_n = ((gen_ts_feat - mu_ts) / (std_ts + eps)) * ts_weight
+    real_text_n = ((real_cond_feat - mu_text) / (std_text + eps)) * text_weight
+    gen_text_n = ((gen_cond_feat - mu_text) / (std_text + eps)) * text_weight
+    return np.concatenate([real_ts_n, real_text_n], axis=1), np.concatenate([gen_ts_n, gen_text_n], axis=1)
+
+
+def j_ftsd(real_ts_feat: np.ndarray, real_cond_feat: np.ndarray, gen_ts_feat: np.ndarray, gen_cond_feat: np.ndarray, *, normalize_parts: bool = False) -> float:
     """Joint Frechet Time Series Distance. Lower is better."""
     real_joint = make_joint_features(real_ts_feat, real_cond_feat, normalize_parts=normalize_parts)
     gen_joint = make_joint_features(gen_ts_feat, gen_cond_feat, normalize_parts=normalize_parts)
     return frechet_distance(real_joint, gen_joint)
 
 
-def joint_precision_recall(real_ts_feat: np.ndarray, real_cond_feat: np.ndarray, gen_ts_feat: np.ndarray, gen_cond_feat: np.ndarray, *, k: int = 3, normalize_parts: bool = True, device: torch.device | str = "cpu", chunk: int = 1024) -> tuple[float, float]:
-    """Precision/Recall in the joint embedding space. Higher is better."""
-    real_joint = make_joint_features(real_ts_feat, real_cond_feat, normalize_parts=normalize_parts)
-    gen_joint = make_joint_features(gen_ts_feat, gen_cond_feat, normalize_parts=normalize_parts)
-    return precision_recall(real_joint, gen_joint, k=k, device=device, chunk=chunk)
+def joint_precision_recall(
+    real_ts_feat: np.ndarray,
+    real_cond_feat: np.ndarray,
+    gen_ts_feat: np.ndarray,
+    gen_cond_feat: np.ndarray,
+    *,
+    k: int = 5,
+    max_samples: int | None = None,
+    seed: int = 0,
+    sample_equal: bool = True,
+    device: torch.device | str = "cpu",
+    chunk: int = 1024,
+) -> tuple[float, float]:
+    """ConTSG-Bench Joint Precision/Recall with per-modality standardization."""
+    real_joint, gen_joint = make_conbench_joint_features(real_ts_feat, real_cond_feat, gen_ts_feat, gen_cond_feat)
+    return precision_recall(
+        real_joint,
+        gen_joint,
+        k=k,
+        max_samples=max_samples,
+        seed=seed,
+        sample_equal=sample_equal,
+        device=device,
+        chunk=chunk,
+    )
+
+
+def _prepare_prdc_features(
+    real_feat: np.ndarray,
+    gen_feat: np.ndarray,
+    *,
+    max_samples: int | None,
+    seed: int,
+    sample_equal: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    real = _filter_finite_rows(_as_feat(real_feat, "real_feat"))
+    gen = _filter_finite_rows(_as_feat(gen_feat, "gen_feat"))
+    if real.shape[1] != gen.shape[1]:
+        raise ValueError(f"feature dims mismatch: {real.shape} vs {gen.shape}")
+    if real.shape[0] < 2 or gen.shape[0] < 2:
+        raise ValueError(f"need at least two samples per set, got real={real.shape[0]}, gen={gen.shape[0]}")
+    if not sample_equal:
+        return real, gen
+    n_cap = int(max_samples) if max_samples is not None else min(real.shape[0], gen.shape[0])
+    n = min(real.shape[0], gen.shape[0], n_cap)
+    if n < 2:
+        raise ValueError(f"need at least two sampled points, got n={n}")
+    return real[_sample_indices(real.shape[0], n, seed)], gen[_sample_indices(gen.shape[0], n, seed)]
+
+
+def _filter_finite_rows(x: np.ndarray) -> np.ndarray:
+    mask = np.isfinite(x).all(axis=1)
+    return x[mask]
+
+
+def _sample_indices(n: int, k: int, seed: int) -> np.ndarray:
+    if k >= n:
+        return np.arange(n, dtype=np.int64)
+    rng = np.random.RandomState(int(seed))
+    return rng.choice(n, size=int(k), replace=False)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +399,7 @@ def joint_precision_recall(real_ts_feat: np.ndarray, real_cond_feat: np.ndarray,
 # ---------------------------------------------------------------------------
 
 
-def compute_statistical_metrics(real_ts: np.ndarray, gen_ts: np.ndarray, *, train_reference: np.ndarray | None = None, bins: int = 50, max_lag: int | None = None) -> dict[str, float]:
+def compute_statistical_metrics(real_ts: np.ndarray, gen_ts: np.ndarray, *, train_reference: np.ndarray | None = None, bins: int = 32, max_lag: int | None = None) -> dict[str, float]:
     """The four encoder-free statistical metrics (cheap enough for training)."""
     return {
         "MDD": mdd(real_ts, gen_ts, train_reference=train_reference, bins=bins),
@@ -266,7 +415,7 @@ def compute_embedding_metrics(
     gen_ts_feat: np.ndarray,
     real_cond_feat: np.ndarray,
     gen_cond_feat: np.ndarray,
-    k: int = 3,
+    k: int = 5,
     device: torch.device | str = "cpu",
     chunk: int = 1024,
 ) -> dict[str, float]:

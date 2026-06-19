@@ -114,6 +114,57 @@ def test_text2ts_model_forward_and_train_step_updates_params():
     assert not torch.allclose(before, model.mapper.op_proto.detach())
 
 
+def test_structural_operator_bank_multiscale_temporal_branch_shapes():
+    bank = ResidualOperatorBank(
+        num_channels=3,
+        num_operators=3,
+        hidden=8,
+        t_dim=4,
+        architecture="structural",
+        temporal_long_range_mode="multiscale",
+        temporal_long_range_scales=[2, 4],
+    )
+    x_t = torch.randn(2, 16, 3)
+    t = torch.rand(2)
+    velocities = bank(x_t, None, t)
+    assert velocities.shape == (2, 16, 3, 3)
+    assert torch.isfinite(velocities).all()
+    assert "time_long_range_rms" in bank.last_aux
+    assert torch.isfinite(bank.last_aux["time_long_range_rms"])
+
+
+def test_patch_merger_mixed_alignment_clean_prob_selects_target():
+    def _bridge(clean_prob: float) -> CrossModalConditionBridge:
+        bridge = CrossModalConditionBridge(
+            d_model=8,
+            num_channels=3,
+            sequence_length=12,
+            num_experts=3,
+            state_connector="patch_merger",
+            temporal_merge=3,
+            token_budget=16,
+            alignment_mode="siglip",
+            alignment_dense=True,
+            alignment_target="mixed",
+            alignment_clean_prob=clean_prob,
+        )
+        bridge.train()
+        return bridge
+
+    slot_tokens = torch.randn(2, 4, 8)
+    slot_mask = torch.ones(2, 4)
+    x_t = torch.randn(2, 12, 3)
+    target = torch.randn(2, 12, 3)
+    t = torch.rand(2)
+
+    *_, aux_state = _bridge(0.0)(slot_tokens=slot_tokens, slot_mask=slot_mask, x_t=x_t, t=t, target=target)
+    *_, aux_clean = _bridge(1.0)(slot_tokens=slot_tokens, slot_mask=slot_mask, x_t=x_t, t=t, target=target)
+    assert aux_state["bridge_alignment_used_clean"].item() == 0.0
+    assert aux_clean["bridge_alignment_used_clean"].item() == 1.0
+    assert torch.isfinite(aux_state["bridge_alignment_loss"])
+    assert torch.isfinite(aux_clean["bridge_alignment_loss"])
+
+
 def test_clean_v6_rejects_routing_loss_weight():
     """Clean V6 must raise ValueError if routing_loss_weight != 0."""
     model = build_model(_text2ts_config(), sequence_length=12, num_channels=4)

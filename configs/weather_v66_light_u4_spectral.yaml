@@ -35,27 +35,23 @@ model:
   mapper_flow_time_condition: true
 
   operator_architecture: structural
-  operator_hidden: 128
+  operator_hidden: 192
   operator_t_dim: 32
   operator_max_velocity: 5.0
-  operator_depth: 2
+  operator_depth: 3
   operator_kernel_size: 3
-  operator_dropout: 0.0
+  operator_dropout: 0.05
   operator_context_mode: global
   operator_context_film: true
   operator_multiview_context: true
   operator_norm: group
   operator_channel_heads: 4
-  # Long-range temporal branch inside TemporalSegmentExpert. "none" preserves
-  # current V65 behavior; "multiscale" adds a TimeMixer-style coarse temporal
-  # path with the scales below.
-  operator_temporal_long_range_mode: none
-  operator_temporal_long_range_scales: [2, 4, 8]
+  operator_frequency_band_mode: gaussian
 
   use_cross_modal_bridge: true
   bridge_focal_mode: legacy
   bridge_num_heads: 4
-  bridge_dropout: 0.0
+  bridge_dropout: 0.05
   bridge_patch_size: 6
   bridge_num_spectral_tokens: 3
   bridge_num_stage_tokens: 3
@@ -65,18 +61,19 @@ model:
   bridge_channel_merge: 1
   bridge_token_budget: 96
   bridge_alignment_mode: siglip
-  # P1: dense (ColBERT MaxSim) alignment over region tokens, against the clean
-  # target encoding instead of pooled-vs-pooled on the noisy flow state. This
-  # turns the alignment from a single-direction cosine into token<->timestep
-  # correspondence.
   bridge_alignment_dense: true
   bridge_alignment_regions: 8
   bridge_alignment_target: clean
-  # Only used when bridge_alignment_target: mixed. 1.0 keeps clean-target
-  # alignment; 0.0 uses state alignment; intermediate values scheduled-sample
-  # between train-clean and inference-state targets.
   bridge_alignment_clean_prob: 1.0
   bridge_diagnostics: false
+  bridge_text_agg_tokens: 8
+
+  use_spectral_prompt: true
+  spectral_prompt_bands: 3
+  spectral_prompt_heads: 4
+  spectral_prompt_dropout: 0.05
+  spectral_prompt_gate_temperature: 0.7
+  spectral_prompt_residual_gate: true
 
   use_latent_regime_adapter: false
   num_regimes: 4
@@ -90,11 +87,12 @@ model:
   router_mode: global_operator
   operator_gate_router: attention
   operator_gate_heads: 4
+  operator_gate_dropout: 0.05
 
 text_encoder:
   mode: longclip
   output_type: tokens
-  max_output_tokens: 96
+  max_output_tokens: 128
   hash_dim: 256
   precomputed_dim: 128
   hf_model_name: "BAAI/bge-small-en-v1.5"
@@ -105,11 +103,11 @@ text_encoder:
   fallback_hash_dim: 256
 
 train:
-  batch_size: 1024
-  eval_batch_size: 512
+  batch_size: 512
+  eval_batch_size: 384
   lr: 0.0001
   weight_decay: 0.0001
-  max_steps: 10000
+  max_steps: 15000
   cfm_loss_mode: global
   noise_scale: 1.0
 
@@ -118,52 +116,38 @@ train:
   include_all_caption_candidates: false
   routing_loss_weight: 0.0
   regime_ortho_weight: 0.0
-  # P1: dense alignment carries a real learning signal, so raise its weight from
-  # the cosmetic 3e-4 toward the same order as the auxiliary losses.
   bridge_alignment_weight: 0.01
   caption_ranking_weight: 0.001
   caption_ranking_margin: 0.05
-  # P1: load-balance KL on the operator gate to prevent expert collapse and let
-  # the structural time/channel/frequency experts actually specialize.
   operator_balance_weight: 0.01
-  # P0: classifier-free guidance requires null-caption dropout during training.
   condition_dropout_prob: 0.1
-  # P0: frequency-domain supervision on the predicted clean signal. Directly
-  # targets the spectral/distributional fidelity gap (FID / J-FTSD) and gives
-  # the structural FrequencyBandExpert a reason to specialize.
-  spectral_loss_weight: 0.1
+  spectral_loss_weight: 0.03
+  spectral_loss_type: normalized_mrfft
+  spectral_fft_sizes: [16, 32, 64, 128]
+  spectral_distance: l1
   spectral_log_magnitude: true
-  # (1 - t)^power time weighting on the spectral magnitude loss. 0.0 == uniform
-  # over t (exact no-op); power > 0 downweights high-t samples (recovered x0 is
-  # already well constrained by x_t there) and shrinks the effective magnitude.
   spectral_time_weight_power: 0.0
-  warmup_steps: 200
+  warmup_steps: 1000
   min_lr: 1.0e-6
 
   grad_clip: 1.0
   num_workers: 0
   device: auto
-  checkpoint_dir: checkpoints/v65_patch_merger_rank001
+  checkpoint_dir: checkpoints/v66_light_u4_spectral
   log_every: 20
-  eval_every: 200
+  eval_every: 500
   eval_batches: 20
   eval_seed_offset: 50000
-  # ConTSG statistical metrics (MDD/ACD/SD/KD) during periodic validation. These
-  # are encoder-free (raw-series histograms/moments), so the overhead is tiny.
-  # The 7 embedding metrics (FID/J-FTSD/Precision/Recall/...) only run in the
-  # final eval_verbalts_metrics.py pass, which reports all 11.
   eval_statistical_metrics: true
-  best_metric: mse
+  best_metric: fid_jftsd_cttp_score
   best_metric_mode: min
-  save_every: 1000
+  allow_best_metric_fallback: false
+  save_every: 500
 
 sample:
   solver: rk4
   steps: 32
   noise_scale: 1.0
-  # P0: classifier-free guidance scale. 1.0 disables guidance; >1.0 sharpens how
-  # strongly the generated series follows the caption. Sweep {1.0, 2.0, 4.0}.
   cfg_scale: 2.0
-  # Limited-Interval Guidance interval; [0.0,1.0] = guide all t / no-op.
   guidance_t_lo: 0.0
   guidance_t_hi: 1.0

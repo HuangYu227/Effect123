@@ -156,6 +156,7 @@ def run_train(cfg: dict) -> None:
     save_every = int(cfg["train"].get("save_every", eval_every))
     best_metric = str(cfg["train"].get("best_metric", "mse"))
     best_metric_mode = str(cfg["train"].get("best_metric_mode", "auto"))
+    allow_best_metric_fallback = bool(cfg["train"].get("allow_best_metric_fallback", True))
     step = 0
     progress = tqdm(total=max_steps, desc="train", dynamic_ncols=True)
     last_metrics: dict[str, float] = {}
@@ -201,6 +202,9 @@ def run_train(cfg: dict) -> None:
                 caption_ranking_weight=float(cfg["train"].get("caption_ranking_weight", 0.0)),
                 caption_ranking_margin=float(cfg["train"].get("caption_ranking_margin", 0.05)),
                 spectral_loss_weight=float(cfg["train"].get("spectral_loss_weight", 0.0)),
+                spectral_loss_type=str(cfg["train"].get("spectral_loss_type", "magnitude")),
+                spectral_fft_sizes=cfg["train"].get("spectral_fft_sizes", (16, 32, 64, 128)),
+                spectral_distance=str(cfg["train"].get("spectral_distance", "l1")),
                 spectral_log_magnitude=bool(cfg["train"].get("spectral_log_magnitude", True)),
                 spectral_time_weight_power=float(cfg["train"].get("spectral_time_weight_power", 0.0)),
                 operator_balance_weight=float(cfg["train"].get("operator_balance_weight", 0.0)),
@@ -249,6 +253,14 @@ def run_train(cfg: dict) -> None:
                 spectral = _scalar(out, "loss_spectral")
                 if spectral > 0.0:
                     postfix["spec"] = f"{spectral:.4f}"
+                sp_entropy = _scalar(out, "spectral_prompt_entropy_norm")
+                if sp_entropy == sp_entropy:
+                    postfix["spH"] = f"{sp_entropy:.2f}"
+                    postfix["spG"] = (
+                        f"{_scalar(out, 'spectral_prompt_gate_low'):.2f}/"
+                        f"{_scalar(out, 'spectral_prompt_gate_mid'):.2f}/"
+                        f"{_scalar(out, 'spectral_prompt_gate_high'):.2f}"
+                    )
                 op_balance = _scalar(out, "loss_operator_balance")
                 if op_balance > 0.0:
                     postfix["opBal"] = f"{op_balance:.4f}"
@@ -288,7 +300,11 @@ def run_train(cfg: dict) -> None:
                 save_checkpoint(checkpoint_dir / "latest.pt", model, optimizer, cfg, stats, step)
                 if save_every > 0 and (step % save_every == 0 or step == max_steps):
                     save_checkpoint(checkpoint_dir / f"step_{step:08d}.pt", model, optimizer, cfg, stats, step)
-                score_name, score = _select_best_metric(metrics, best_metric)
+                score_name, score = _select_best_metric(
+                    metrics,
+                    best_metric,
+                    allow_fallback=allow_best_metric_fallback,
+                )
                 if score_name is None or score is None:
                     if not warned_missing_best_metric:
                         progress.write(
@@ -471,6 +487,15 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "bridge_budget_pool_active",
         "bridge_token_budget",
         "bridge_connector_patch_merger",
+        "bridge_alignment_used_clean",
+        "time_long_range_rms",
+        "spectral_prompt_entropy",
+        "spectral_prompt_entropy_norm",
+        "spectral_prompt_gate_low",
+        "spectral_prompt_gate_mid",
+        "spectral_prompt_gate_high",
+        "spectral_prompt_delta_norm",
+        "spectral_prompt_attn_entropy_norm",
     ):
         if torch.is_tensor(aux.get(key)) and aux[key].numel() == 1:
             out[key] = float(aux[key].detach().cpu())
@@ -517,17 +542,23 @@ def _usage_summary(value) -> str | None:
     return "/".join(f"{float(v):.2f}" for v in flat)
 
 
-def _select_best_metric(metrics: dict[str, float], requested: str) -> tuple[str | None, float | None]:
+def _select_best_metric(
+    metrics: dict[str, float],
+    requested: str,
+    *,
+    allow_fallback: bool = True,
+) -> tuple[str | None, float | None]:
     """Select a finite validation score for checkpoint ranking.
 
     Training validation is intentionally lightweight and normally does not run
     VerbalTS. If a config requests a missing VerbalTS metric, fall back to the
-    available validation metrics so best.pt is still useful during training.
+    available validation metrics only when allow_fallback=True.
     """
     candidates = [requested]
-    for fallback in ("mse", "mae", "mask_iou", "field_scope_precision"):
-        if fallback not in candidates:
-            candidates.append(fallback)
+    if allow_fallback:
+        for fallback in ("mse", "mae", "mask_iou", "field_scope_precision"):
+            if fallback not in candidates:
+                candidates.append(fallback)
     for name in candidates:
         value = metrics.get(name)
         if value is None:

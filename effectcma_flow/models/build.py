@@ -18,7 +18,14 @@ _V62_KEYS = frozenset({
     "bridge_num_stage_tokens", "bridge_state_connector", "bridge_temporal_merge",
     "bridge_channel_merge", "bridge_token_budget", "bridge_alignment_mode",
     "bridge_alignment_dense", "bridge_alignment_regions", "bridge_alignment_target",
-    "bridge_text_agg_tokens", "bridge_diagnostics", "operator_multiview_context",
+    "bridge_alignment_clean_prob", "bridge_text_agg_tokens", "bridge_diagnostics",
+    "operator_multiview_context", "operator_temporal_long_range_mode",
+    "operator_temporal_long_range_scales",
+})
+_V66_LIGHT_KEYS = frozenset({
+    "use_spectral_prompt", "spectral_prompt_bands", "spectral_prompt_heads",
+    "spectral_prompt_dropout", "spectral_prompt_gate_temperature",
+    "spectral_prompt_residual_gate",
 })
 
 
@@ -74,6 +81,8 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         operator_frequency_temp_start=float(model_cfg.get("operator_frequency_temp_start", 1.0)),
         operator_frequency_temp_end=float(model_cfg.get("operator_frequency_temp_end", 0.1)),
         operator_frequency_anneal_steps=int(model_cfg.get("operator_frequency_anneal_steps", 10000)),
+        operator_temporal_long_range_mode=str(model_cfg.get("operator_temporal_long_range_mode", "none")),
+        operator_temporal_long_range_scales=model_cfg.get("operator_temporal_long_range_scales"),
         # V6.1 latent regime adapter
         use_latent_regime_adapter=bool(model_cfg.get("use_latent_regime_adapter", False)),
         num_regimes=int(model_cfg.get("num_regimes", 4)),
@@ -107,12 +116,20 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         bridge_alignment_dense=bool(model_cfg.get("bridge_alignment_dense", False)),
         bridge_alignment_regions=int(model_cfg.get("bridge_alignment_regions", 8)),
         bridge_alignment_target=str(model_cfg.get("bridge_alignment_target", "state")),
+        bridge_alignment_clean_prob=float(model_cfg.get("bridge_alignment_clean_prob", 1.0)),
         bridge_text_agg_tokens=int(model_cfg.get("bridge_text_agg_tokens", 0)),
         bridge_diagnostics=bool(model_cfg.get("bridge_diagnostics", False)),
+        # V6.6-light spectral prompt
+        use_spectral_prompt=bool(model_cfg.get("use_spectral_prompt", False)),
+        spectral_prompt_bands=int(model_cfg.get("spectral_prompt_bands", 3)),
+        spectral_prompt_heads=int(model_cfg.get("spectral_prompt_heads", 4)),
+        spectral_prompt_dropout=float(model_cfg.get("spectral_prompt_dropout", 0.0)),
+        spectral_prompt_gate_temperature=float(model_cfg.get("spectral_prompt_gate_temperature", 1.0)),
+        spectral_prompt_residual_gate=bool(model_cfg.get("spectral_prompt_residual_gate", True)),
     )
     if task_mode == "edit":
         # EffectCMAFlow does not accept text-to-series regime/gate/bridge params.
-        edit_kwargs = {k: v for k, v in kwargs.items() if k not in (_V61_KEYS | _V62_KEYS)}
+        edit_kwargs = {k: v for k, v in kwargs.items() if k not in (_V61_KEYS | _V62_KEYS | _V66_LIGHT_KEYS)}
         return EffectCMAFlow(**edit_kwargs)
     if task_mode == "text2ts":
         return TextToTSFlow(**kwargs)

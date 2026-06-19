@@ -118,6 +118,18 @@ class TextToTSFlow(nn.Module):
         spectral_prompt_dropout: float = 0.0,
         spectral_prompt_gate_temperature: float = 1.0,
         spectral_prompt_residual_gate: bool = True,
+        # V6.7 TSP-Bridge V2 (temporal semantic pyramid)
+        temporal_pyramid_patch_lens: list[int] | tuple[int, ...] | None = None,
+        temporal_pyramid_token_budget: int = 128,
+        temporal_pyramid_anchor_tokens: int = 8,
+        temporal_pyramid_cross_scale_layers: int = 2,
+        temporal_pyramid_dropout: float = 0.05,
+        temporal_pyramid_use_topdown: bool = True,
+        temporal_pyramid_use_bottomup: bool = True,
+        temporal_pyramid_use_text_routing: bool = True,
+        temporal_pyramid_temporal_bias_tau: float = 0.25,
+        temporal_pyramid_gate_temperature: float = 0.7,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.sequence_length = int(sequence_length)
@@ -156,6 +168,17 @@ class TextToTSFlow(nn.Module):
                 alignment_clean_prob=bridge_alignment_clean_prob,
                 text_agg_tokens=bridge_text_agg_tokens,
                 diagnostics=bridge_diagnostics,
+                # TSP-Bridge V2 parameters
+                temporal_pyramid_patch_lens=temporal_pyramid_patch_lens or [4, 8, 16, 32],
+                temporal_pyramid_token_budget=temporal_pyramid_token_budget,
+                temporal_pyramid_anchor_tokens=temporal_pyramid_anchor_tokens,
+                temporal_pyramid_cross_scale_layers=temporal_pyramid_cross_scale_layers,
+                temporal_pyramid_dropout=temporal_pyramid_dropout,
+                temporal_pyramid_use_topdown=temporal_pyramid_use_topdown,
+                temporal_pyramid_use_bottomup=temporal_pyramid_use_bottomup,
+                temporal_pyramid_use_text_routing=temporal_pyramid_use_text_routing,
+                temporal_pyramid_temporal_bias_tau=temporal_pyramid_temporal_bias_tau,
+                temporal_pyramid_gate_temperature=temporal_pyramid_gate_temperature,
             )
             if self.use_cross_modal_bridge
             else None

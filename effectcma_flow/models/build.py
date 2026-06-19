@@ -27,6 +27,13 @@ _V66_LIGHT_KEYS = frozenset({
     "spectral_prompt_dropout", "spectral_prompt_gate_temperature",
     "spectral_prompt_residual_gate",
 })
+_V67_TSP_BRIDGE_KEYS = frozenset({
+    "temporal_pyramid_patch_lens", "temporal_pyramid_token_budget",
+    "temporal_pyramid_anchor_tokens", "temporal_pyramid_cross_scale_layers",
+    "temporal_pyramid_dropout", "temporal_pyramid_use_topdown",
+    "temporal_pyramid_use_bottomup", "temporal_pyramid_use_text_routing",
+    "temporal_pyramid_temporal_bias_tau", "temporal_pyramid_gate_temperature",
+})
 
 
 def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: int) -> EffectCMAFlow | TextToTSFlow:
@@ -126,10 +133,21 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         spectral_prompt_dropout=float(model_cfg.get("spectral_prompt_dropout", 0.0)),
         spectral_prompt_gate_temperature=float(model_cfg.get("spectral_prompt_gate_temperature", 1.0)),
         spectral_prompt_residual_gate=bool(model_cfg.get("spectral_prompt_residual_gate", True)),
+        # V6.7 TSP-Bridge V2 (temporal semantic pyramid)
+        temporal_pyramid_patch_lens=model_cfg.get("temporal_pyramid_patch_lens", [4, 8, 16, 32]),
+        temporal_pyramid_token_budget=int(model_cfg.get("temporal_pyramid_token_budget", 128)),
+        temporal_pyramid_anchor_tokens=int(model_cfg.get("temporal_pyramid_anchor_tokens", 8)),
+        temporal_pyramid_cross_scale_layers=int(model_cfg.get("temporal_pyramid_cross_scale_layers", 2)),
+        temporal_pyramid_dropout=float(model_cfg.get("temporal_pyramid_dropout", 0.05)),
+        temporal_pyramid_use_topdown=bool(model_cfg.get("temporal_pyramid_use_topdown", True)),
+        temporal_pyramid_use_bottomup=bool(model_cfg.get("temporal_pyramid_use_bottomup", True)),
+        temporal_pyramid_use_text_routing=bool(model_cfg.get("temporal_pyramid_use_text_routing", True)),
+        temporal_pyramid_temporal_bias_tau=float(model_cfg.get("temporal_pyramid_temporal_bias_tau", 0.25)),
+        temporal_pyramid_gate_temperature=float(model_cfg.get("temporal_pyramid_gate_temperature", 0.7)),
     )
     if task_mode == "edit":
         # EffectCMAFlow does not accept text-to-series regime/gate/bridge params.
-        edit_kwargs = {k: v for k, v in kwargs.items() if k not in (_V61_KEYS | _V62_KEYS | _V66_LIGHT_KEYS)}
+        edit_kwargs = {k: v for k, v in kwargs.items() if k not in (_V61_KEYS | _V62_KEYS | _V66_LIGHT_KEYS | _V67_TSP_BRIDGE_KEYS)}
         return EffectCMAFlow(**edit_kwargs)
     if task_mode == "text2ts":
         return TextToTSFlow(**kwargs)

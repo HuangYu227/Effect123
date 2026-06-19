@@ -240,6 +240,8 @@ class TSPatchMergerConnector(nn.Module):
         alignment_clean_prob: float = 1.0,
         text_agg_tokens: int = 0,
         diagnostics: bool = False,
+        state_encoder: str = "patch_merger",
+        **kwargs,
     ) -> None:
         super().__init__()
         if d_model <= 0 or num_channels <= 0 or sequence_length <= 0 or num_experts <= 0:
@@ -279,27 +281,69 @@ class TSPatchMergerConnector(nn.Module):
         self.text_agg_token_count = max(0, int(text_agg_tokens))
         self.diagnostics = bool(diagnostics)
 
+        # State encoder type: "patch_merger" (default) or "temporal_pyramid_v2"
+        self.state_encoder_type = str(state_encoder).lower()
+        if self.state_encoder_type not in {"patch_merger", "temporal_pyramid_v2"}:
+            raise ValueError(f"state_encoder must be 'patch_merger' or 'temporal_pyramid_v2', got {state_encoder!r}")
+
         heads = max(1, min(int(num_heads), self.d_model))
         while self.d_model % heads != 0 and heads > 1:
             heads -= 1
         self.num_heads = heads
 
-        self.value_proj = nn.Linear(3, self.d_model)
-        self.channel_embed = nn.Embedding(self.num_channels, self.d_model)
-        self.latent_blocks = nn.Sequential(
-            LatentGridBlock(self.d_model, self.num_channels, dropout),
-            LatentGridBlock(self.d_model, self.num_channels, dropout),
-        )
-        merged_dim = self.d_model * self.temporal_merge * self.channel_merge
-        self.patch_merger_norm = nn.LayerNorm(self.d_model)
-        self.patch_merger_mlp = nn.Sequential(
-            nn.Linear(merged_dim, merged_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(merged_dim, self.d_model),
-        )
-        self.merged_norm = nn.LayerNorm(self.d_model)
-        self.budget_pool = TokenBudgetPool(self.d_model, self.token_budget, heads, dropout)
+        # TSP-Bridge V2 state encoder (optional)
+        self.tsp_encoder = None
+        if self.state_encoder_type == "temporal_pyramid_v2":
+            from effectcma_flow.models.temporal_pyramid_bridge_v2 import TemporalSemanticPyramidConnectorV2
+
+            # Extract TSP-specific parameters from kwargs
+            tsp_patch_lens = kwargs.get("temporal_pyramid_patch_lens", (4, 8, 16, 32))
+            tsp_token_budget = kwargs.get("temporal_pyramid_token_budget", 128)
+            tsp_anchor_tokens = kwargs.get("temporal_pyramid_anchor_tokens", 8)
+            tsp_cross_scale_layers = kwargs.get("temporal_pyramid_cross_scale_layers", 2)
+            tsp_dropout = kwargs.get("temporal_pyramid_dropout", dropout)
+            tsp_use_topdown = kwargs.get("temporal_pyramid_use_topdown", True)
+            tsp_use_bottomup = kwargs.get("temporal_pyramid_use_bottomup", True)
+            tsp_use_text_routing = kwargs.get("temporal_pyramid_use_text_routing", True)
+            tsp_temporal_bias_tau = kwargs.get("temporal_pyramid_temporal_bias_tau", 0.25)
+            tsp_gate_temperature = kwargs.get("temporal_pyramid_gate_temperature", 0.7)
+
+            self.tsp_encoder = TemporalSemanticPyramidConnectorV2(
+                sequence_length=sequence_length,
+                num_channels=num_channels,
+                d_model=d_model,
+                patch_lens=tsp_patch_lens,
+                token_budget=tsp_token_budget,
+                anchor_tokens=tsp_anchor_tokens,
+                cross_scale_layers=tsp_cross_scale_layers,
+                num_heads=heads,
+                dropout=tsp_dropout,
+                use_topdown=tsp_use_topdown,
+                use_bottomup=tsp_use_bottomup,
+                use_text_routing=tsp_use_text_routing,
+                temporal_bias_tau=tsp_temporal_bias_tau,
+                gate_temperature=tsp_gate_temperature,
+            )
+            # TSP encoder handles its own budget pooling
+            self.budget_pool = nn.Identity()
+        else:
+            # Standard patch merger encoder
+            self.value_proj = nn.Linear(3, self.d_model)
+            self.channel_embed = nn.Embedding(self.num_channels, self.d_model)
+            self.latent_blocks = nn.Sequential(
+                LatentGridBlock(self.d_model, self.num_channels, dropout),
+                LatentGridBlock(self.d_model, self.num_channels, dropout),
+            )
+            merged_dim = self.d_model * self.temporal_merge * self.channel_merge
+            self.patch_merger_norm = nn.LayerNorm(self.d_model)
+            self.patch_merger_mlp = nn.Sequential(
+                nn.Linear(merged_dim, merged_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(merged_dim, self.d_model),
+            )
+            self.merged_norm = nn.LayerNorm(self.d_model)
+            self.budget_pool = TokenBudgetPool(self.d_model, self.token_budget, heads, dropout)
 
         self.text_norm = nn.LayerNorm(self.d_model)
         self.state_norm = nn.LayerNorm(self.d_model)
@@ -361,10 +405,25 @@ class TSPatchMergerConnector(nn.Module):
         if target is not None:
             target = target.to(device=device, dtype=dtype)
 
-        latent_grid = self._encode_grid(x_t, t)
-        merged_tokens = self._patch_merge(latent_grid)
-        prebudget_count = merged_tokens.shape[1]
-        state_tokens = self.budget_pool(merged_tokens)
+        # Generate state tokens using the configured encoder
+        tsp_aux: dict[str, torch.Tensor] = {}
+        if self.tsp_encoder is not None:
+            # TSP-Bridge V2: multi-scale temporal pyramid encoder
+            text_context = _masked_mean(slot_tokens, slot_mask) if slot_mask is not None else slot_tokens.mean(dim=1)
+            state_tokens, tsp_aux = self.tsp_encoder(
+                x_t=x_t,
+                t=t,
+                slot_tokens=slot_tokens,
+                slot_mask=slot_mask,
+                text_context=text_context,
+            )
+            prebudget_count = tsp_aux.get("tsp_raw_token_count", torch.tensor(0.0)).item()
+        else:
+            # Standard patch merger encoder
+            latent_grid = self._encode_grid(x_t, t)
+            merged_tokens = self._patch_merge(latent_grid)
+            prebudget_count = merged_tokens.shape[1]
+            state_tokens = self.budget_pool(merged_tokens)
 
         # Optionally prepend K learnable text aggregation tokens to the slot
         # sequence ONLY for the bidirectional cross-attn, then strip them before
@@ -429,7 +488,11 @@ class TSPatchMergerConnector(nn.Module):
             # alignment target is not diluted by flow noise; falls back to the
             # fused current state when no target is supplied (e.g. at sampling).
             use_clean = self._use_clean_alignment_target(target)
-            if use_clean:
+            if use_clean and self.tsp_encoder is not None:
+                # TSP encoder does not have _encode_grid/_patch_merge; fall back
+                # to fused_state for alignment target
+                align_state_tokens = fused_state
+            elif use_clean:
                 clean_grid = self._encode_grid(target, torch.ones_like(t))
                 align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
             else:
@@ -482,6 +545,9 @@ class TSPatchMergerConnector(nn.Module):
             "bridge_alignment_used_clean": torch.tensor(1.0 if compute_alignment and use_clean else 0.0, device=device, dtype=dtype),
             **alignment_aux,
         }
+        # Add TSP-Bridge V2 diagnostics if available
+        if tsp_aux:
+            aux.update(tsp_aux)
         return bridged_text, bridge_context, expert_context, channel_context, aux
 
     def _use_clean_alignment_target(self, target: torch.Tensor | None) -> bool:
@@ -646,6 +712,7 @@ class CrossModalConditionBridge(nn.Module):
         alignment_clean_prob: float = 1.0,
         text_agg_tokens: int = 0,
         diagnostics: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__()
         if d_model <= 0 or num_channels <= 0 or sequence_length <= 0 or num_experts <= 0:
@@ -666,8 +733,8 @@ class CrossModalConditionBridge(nn.Module):
         self.state_connector = str(state_connector).lower()
         if self.state_connector in {"ts_patch_merger", "patchmerger"}:
             self.state_connector = "patch_merger"
-        if self.state_connector not in {"legacy", "patch_merger"}:
-            raise ValueError(f"state_connector must be 'legacy' or 'patch_merger', got {state_connector!r}")
+        if self.state_connector not in {"legacy", "patch_merger", "temporal_pyramid_v2"}:
+            raise ValueError(f"state_connector must be 'legacy', 'patch_merger', or 'temporal_pyramid_v2', got {state_connector!r}")
         self.alignment_mode = str(alignment_mode).lower()
         if self.alignment_mode not in {"auto", "infonce", "siglip"}:
             raise ValueError(f"alignment_mode must be 'auto', 'infonce', or 'siglip', got {alignment_mode!r}")
@@ -677,8 +744,15 @@ class CrossModalConditionBridge(nn.Module):
         self.num_stage_tokens = int(num_stage_tokens)
         if self.num_stage_tokens <= 0:
             raise ValueError("num_stage_tokens must be positive")
-        self.patch_merger_connector = (
-            TSPatchMergerConnector(
+
+        # State connector: patch_merger, temporal_pyramid_v2, or legacy
+        self.patch_merger_connector = None
+
+        if self.state_connector in {"patch_merger", "temporal_pyramid_v2"}:
+            # Determine state_encoder type for TSPatchMergerConnector
+            state_encoder_type = "temporal_pyramid_v2" if self.state_connector == "temporal_pyramid_v2" else "patch_merger"
+
+            self.patch_merger_connector = TSPatchMergerConnector(
                 d_model=self.d_model,
                 num_channels=self.num_channels,
                 sequence_length=self.sequence_length,
@@ -696,15 +770,14 @@ class CrossModalConditionBridge(nn.Module):
                 alignment_clean_prob=alignment_clean_prob,
                 text_agg_tokens=text_agg_tokens,
                 diagnostics=diagnostics,
+                state_encoder=state_encoder_type,
+                **kwargs,
             )
-            if self.state_connector == "patch_merger"
-            else None
-        )
 
         # Legacy state-token bridge body. When the patch-merger connector owns
         # the forward pass these modules are never executed, so we skip building
         # them entirely instead of leaving inert "built but bypassed" parameters.
-        self._has_legacy_body = self.state_connector != "patch_merger"
+        self._has_legacy_body = self.state_connector not in {"patch_merger", "temporal_pyramid_v2"}
         if self._has_legacy_body:
             self.time_patch_proj = nn.Linear(self.patch_size * self.num_channels, self.d_model)
             self.channel_stat_proj = nn.Linear(3, self.d_model)

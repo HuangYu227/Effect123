@@ -46,14 +46,8 @@ model:
   operator_multiview_context: true
   operator_norm: group
   operator_channel_heads: 4
-  # U3: soft top-K spectral mask for the FrequencyBandExpert (anneal aligned to
-  # the 15k schedule). Pairs with U2 below: U3 selects which bands, U2 controls
-  # when the spectral gradient is strongest over the flow time t.
-  operator_frequency_band_mode: soft_topk
-  operator_frequency_topk_frac: 0.15
-  operator_frequency_temp_start: 1.0
-  operator_frequency_temp_end: 0.1
-  operator_frequency_anneal_steps: 15000
+  # U3 fallback: soft_topk has been disabled; use adaptive Gaussian frequency bands.
+  operator_frequency_band_mode: gaussian
 
   use_cross_modal_bridge: true
   bridge_focal_mode: legacy

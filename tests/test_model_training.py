@@ -493,10 +493,52 @@ def test_frequency_band_mode_gaussian_default_is_state_and_output_identical():
     assert torch.equal(out_default, out_gaussian)
 
 
-def test_frequency_band_mode_soft_topk_forward_grad_and_nonneg_mask():
-    """soft_topk: forward finite, gradient reaches inputs and band params, mask >= 0."""
-    from effectcma_flow.models.operator_bank import FrequencyBandExpert
+def test_frequency_band_mode_soft_topk_is_disabled_in_operator_bank():
+    with pytest.raises(ValueError, match="soft_topk.*disabled"):
+        ResidualOperatorBank(
+            num_channels=4,
+            num_operators=3,
+            hidden=8,
+            t_dim=4,
+            architecture="structural",
+            context_dim=16,
+            frequency_band_mode="soft_topk",
+            frequency_topk_frac=0.15,
+        )
 
+
+def test_build_model_rejects_soft_topk_frequency_band_mode():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "operator_frequency_band_mode": "soft_topk",
+            "operator_frequency_topk_frac": 0.2,
+        }
+    )
+    with pytest.raises(ValueError, match="soft_topk.*disabled"):
+        build_model(cfg, sequence_length=12, num_channels=4)
+
+
+def test_build_model_passes_gaussian_frequency_band_mode():
+    cfg = _text2ts_config()
+    cfg["model"].update(
+        {
+            "operator_architecture": "structural",
+            "router_mode": "global_operator",
+            "operator_frequency_band_mode": "gaussian",
+            "operator_frequency_topk_frac": 0.2,
+        }
+    )
+    model = build_model(cfg, sequence_length=12, num_channels=4)
+    freq_expert = model.operator_bank.experts[2]
+    assert freq_expert.frequency_band_mode == "gaussian"
+    assert freq_expert.frequency_topk_frac == 0.2
+    assert not hasattr(freq_expert, "frequency_anneal_step")
+
+
+def test_frequency_band_mode_gaussian_forward_grad():
     bank = ResidualOperatorBank(
         num_channels=4,
         num_operators=3,
@@ -504,18 +546,9 @@ def test_frequency_band_mode_soft_topk_forward_grad_and_nonneg_mask():
         t_dim=4,
         architecture="structural",
         context_dim=16,
-        frequency_band_mode="soft_topk",
+        frequency_band_mode="gaussian",
         frequency_topk_frac=0.15,
     )
-    freq_expert = bank.experts[2]
-    assert isinstance(freq_expert, FrequencyBandExpert)
-    # soft_topk registers exactly one new buffer (the step counter) and starts at 0.
-    assert hasattr(freq_expert, "frequency_anneal_step")
-    assert int(freq_expert.frequency_anneal_step.item()) == 0
-
-    # Deterministic temperature so the mask is reproducible in the test.
-    freq_expert.frequency_temperature_override = 0.5
-
     x_t = torch.randn(2, 12, 4, requires_grad=True)
     base = torch.randn(2, 12, 4)
     t = torch.rand(2)
@@ -529,66 +562,11 @@ def test_frequency_band_mode_soft_topk_forward_grad_and_nonneg_mask():
     assert x_t.grad is not None
     assert torch.isfinite(x_t.grad).all()
     assert x_t.grad.abs().sum().item() > 0.0
-    # ... and the relevant (used) frequency-expert parameters: the band gate,
-    # band mixer and head all participate in the soft_topk path.
+    freq_expert = bank.experts[2]
     for name, param in freq_expert.named_parameters():
         if name.startswith(("band_gate", "band_mixer", "head")):
             assert param.grad is not None, f"{name} received no gradient"
             assert torch.isfinite(param.grad).all()
-    assert any(
-        p.grad is not None and p.grad.abs().sum().item() > 0.0
-        for n, p in freq_expert.named_parameters()
-        if n.startswith("band_gate")
-    )
-
-    # The amplitude-ranked soft mask is non-negative by construction.
-    magnitude = torch.rand(2, 8, 7)
-    soft_mask = torch.softmax(magnitude / 0.5, dim=-1) * (0.15 * magnitude.shape[-1])
-    assert (soft_mask >= 0).all()
-
-
-def test_frequency_band_mode_soft_topk_step_counter_advances_in_training_only():
-    """The anneal step buffer increments on training forwards, not in eval."""
-    bank = ResidualOperatorBank(
-        num_channels=4,
-        num_operators=3,
-        hidden=8,
-        t_dim=4,
-        architecture="structural",
-        context_dim=16,
-        frequency_band_mode="soft_topk",
-    )
-    freq_expert = bank.experts[2]
-    x_t = torch.randn(2, 12, 4)
-    base = torch.randn(2, 12, 4)
-    context = torch.randn(2, 16)
-
-    bank.train()
-    bank(x_t, base, torch.rand(2), context=context)
-    assert int(freq_expert.frequency_anneal_step.item()) == 1
-    bank(x_t, base, torch.rand(2), context=context)
-    assert int(freq_expert.frequency_anneal_step.item()) == 2
-
-    bank.eval()
-    bank(x_t, base, torch.rand(2), context=context)
-    assert int(freq_expert.frequency_anneal_step.item()) == 2
-
-
-def test_build_model_passes_frequency_band_mode():
-    cfg = _text2ts_config()
-    cfg["model"].update(
-        {
-            "operator_architecture": "structural",
-            "router_mode": "global_operator",
-            "operator_frequency_band_mode": "soft_topk",
-            "operator_frequency_topk_frac": 0.2,
-        }
-    )
-    model = build_model(cfg, sequence_length=12, num_channels=4)
-    freq_expert = model.operator_bank.experts[2]
-    assert freq_expert.frequency_band_mode == "soft_topk"
-    assert freq_expert.frequency_topk_frac == 0.2
-    assert hasattr(freq_expert, "frequency_anneal_step")
 
 
 def test_structural_operator_bank_accepts_expert_context():

@@ -30,6 +30,13 @@ def test_spectral_prompt_shapes_and_zero_init_delta():
     assert torch.isfinite(out.expert_delta).all()
     assert torch.allclose(out.expert_delta, torch.zeros_like(out.expert_delta), atol=1e-7)
     assert "spectral_prompt_entropy_norm" in out.aux
+    assert float(out.aux["spectral_prompt_raw_delta_norm"]) > 0.0
+
+    grad_probe = torch.randn_like(out.expert_delta)
+    (out.expert_delta * grad_probe).sum().backward()
+    assert generator.residual_scale.grad is not None
+    assert torch.isfinite(generator.residual_scale.grad)
+    assert float(generator.residual_scale.grad.abs()) > 0.0
 
     expert_context = torch.randn(2, 3, 16)
     merged = merge_spectral_expert_context(expert_context, out.expert_delta)
@@ -111,7 +118,7 @@ def test_v66_light_text2ts_path_trains_with_spectral_prompt():
     assert torch.isfinite(result["spectral_prompt_gate_low"])
 
 
-def test_tsp_bridge_clean_alignment_and_optional_regularizers():
+def test_tsp_bridge_clean_alignment_and_diagnostics():
     torch.manual_seed(3)
     cfg = _tsp_v2_test_config()
     model = build_model(cfg, sequence_length=16, num_channels=3)
@@ -132,8 +139,11 @@ def test_tsp_bridge_clean_alignment_and_optional_regularizers():
     assert int(aux["tsp_connector_active"].item()) == 1
     assert int(aux["tsp_budget_token_count"].item()) == 16
     assert int(aux["bridge_alignment_tsp_clean_encoded"].item()) == 1
-    assert torch.isfinite(aux["tsp_scale_entropy_loss"])
-    assert torch.isfinite(aux["tsp_scale_balance_loss"])
+    assert int(aux["bridge_alignment_tsp_clean_detached"].item()) == 1
+    assert torch.isfinite(aux["tsp_scale_entropy_gap"])
+    assert torch.isfinite(aux["tsp_scale_usage_imbalance"])
+    assert torch.isfinite(aux["tsp_route_residual_strength"])
+    assert torch.isfinite(aux["tsp_route_factor_s0"])
 
     result = cfm_train_step(
         model,
@@ -142,13 +152,12 @@ def test_tsp_bridge_clean_alignment_and_optional_regularizers():
         text_encoder_mode="hash",
         task_mode="text2ts",
         bridge_alignment_weight=0.01,
-        tsp_scale_entropy_weight=0.001,
-        tsp_scale_balance_weight=0.001,
     )
     assert torch.isfinite(result["loss"])
-    assert torch.isfinite(result["loss_tsp_scale_entropy"])
-    assert torch.isfinite(result["loss_tsp_scale_balance"])
+    assert "loss_tsp_scale_entropy" not in result
+    assert "loss_tsp_scale_balance" not in result
     assert int(result["bridge_alignment_tsp_clean_encoded"].item()) == 1
+    assert int(result["bridge_alignment_tsp_clean_detached"].item()) == 1
 
 
 def _v66_light_test_config() -> dict:

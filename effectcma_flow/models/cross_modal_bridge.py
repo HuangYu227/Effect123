@@ -483,6 +483,7 @@ class TSPatchMergerConnector(nn.Module):
 
         use_clean = False
         tsp_alignment_clean_encoded = False
+        tsp_alignment_clean_detached = False
         if compute_alignment:
             # Choose the series tokens to align against. "clean" re-encodes the
             # ground-truth target through the same patch-merger stack so the
@@ -491,14 +492,20 @@ class TSPatchMergerConnector(nn.Module):
             use_clean = self._use_clean_alignment_target(target)
             if use_clean and self.tsp_encoder is not None:
                 clean_text_context = _masked_mean(slot_tokens, slot_mask) if slot_mask is not None else slot_tokens.mean(dim=1)
-                align_state_tokens, _clean_tsp_aux = self.tsp_encoder(
-                    x_t=target,
-                    t=torch.ones_like(t),
-                    slot_tokens=slot_tokens,
-                    slot_mask=slot_mask,
-                    text_context=clean_text_context,
-                )
+                # Clean-target alignment is an oracle target for the contrastive
+                # bridge loss. Keep it as a target representation, but do not
+                # retain a second TSP activation graph for the clean branch.
+                with torch.no_grad():
+                    align_state_tokens, _clean_tsp_aux = self.tsp_encoder(
+                        x_t=target,
+                        t=torch.ones_like(t),
+                        slot_tokens=slot_tokens,
+                        slot_mask=slot_mask,
+                        text_context=clean_text_context,
+                    )
+                align_state_tokens = align_state_tokens.detach()
                 tsp_alignment_clean_encoded = True
+                tsp_alignment_clean_detached = True
             elif use_clean:
                 clean_grid = self._encode_grid(target, torch.ones_like(t))
                 align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
@@ -551,6 +558,7 @@ class TSPatchMergerConnector(nn.Module):
             "bridge_connector_patch_merger": torch.tensor(1.0, device=device, dtype=dtype),
             "bridge_alignment_used_clean": torch.tensor(1.0 if compute_alignment and use_clean else 0.0, device=device, dtype=dtype),
             "bridge_alignment_tsp_clean_encoded": torch.tensor(1.0 if tsp_alignment_clean_encoded else 0.0, device=device, dtype=dtype),
+            "bridge_alignment_tsp_clean_detached": torch.tensor(1.0 if tsp_alignment_clean_detached else 0.0, device=device, dtype=dtype),
             **alignment_aux,
         }
         # Add TSP-Bridge V2 diagnostics if available

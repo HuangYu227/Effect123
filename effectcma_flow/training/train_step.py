@@ -6,13 +6,11 @@ Training objective:
         + lambda_bridge * L_bridge_align
         + lambda_rank * L_caption_rank
         + lambda_spectral * L_spectral
-        + lambda_tsp * L_tsp_scale
 
 No legacy routing entropy, channel entropy, field mass, trend, frequency,
 volatility, or artificial semantic-slot losses are used. The optional caption
 ranking loss uses real captions only: positive caption versus batch-shuffled
-caption. The optional TSP scale terms are disabled by default and only
-discourage cross-scale router collapse when explicitly enabled.
+caption. TSP scale statistics are diagnostics only, not training losses.
 
 The optional spectral loss supervises the rFFT magnitude of the predicted clean
 target (recovered from the flow state as ``x_t + (1 - t) * pred_v``) against the
@@ -57,14 +55,18 @@ def cfm_train_step(
     spectral_log_magnitude: bool = True,
     spectral_time_weight_power: float = 0.0,
     operator_balance_weight: float = 0.0,
-    tsp_scale_entropy_weight: float = 0.0,
-    tsp_scale_balance_weight: float = 0.0,
     # Backward-compatibility guard: old routing losses must stay disabled.
     routing_loss_weight: float = 0.0,
     **unused: Any,
 ) -> dict[str, Any]:
     if float(routing_loss_weight) != 0.0:
         raise ValueError("V6.1 forbids old routing/meta losses. Use regime_ortho_weight only.")
+    for removed_key in ("tsp_scale_entropy_weight", "tsp_scale_balance_weight"):
+        if removed_key in unused and float(unused[removed_key]) != 0.0:
+            raise ValueError(
+                f"{removed_key} has been removed: TSP scale statistics are diagnostics only, "
+                "not auxiliary losses."
+            )
     if unused:
         warnings.warn(f"Unused train_step kwargs ignored: {sorted(unused.keys())}", RuntimeWarning, stacklevel=2)
     if device is not None:
@@ -140,12 +142,6 @@ def cfm_train_step(
     operator_balance = pred_v.new_zeros(())
     if float(operator_balance_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("operator_balance_loss")):
         operator_balance = aux["operator_balance_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
-    tsp_scale_entropy = pred_v.new_zeros(())
-    if float(tsp_scale_entropy_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("tsp_scale_entropy_loss")):
-        tsp_scale_entropy = aux["tsp_scale_entropy_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
-    tsp_scale_balance = pred_v.new_zeros(())
-    if float(tsp_scale_balance_weight) > 0.0 and isinstance(aux, dict) and torch.is_tensor(aux.get("tsp_scale_balance_loss")):
-        tsp_scale_balance = aux["tsp_scale_balance_loss"].to(device=pred_v.device, dtype=pred_v.dtype)
     spectral_loss = pred_v.new_zeros(())
     if float(spectral_loss_weight) > 0.0:
         pred_x0 = x_t + (1.0 - t[:, None, None]) * pred_v
@@ -198,8 +194,6 @@ def cfm_train_step(
         + float(caption_ranking_weight) * caption_ranking
         + float(spectral_loss_weight) * spectral_loss
         + float(operator_balance_weight) * operator_balance
-        + float(tsp_scale_entropy_weight) * tsp_scale_entropy
-        + float(tsp_scale_balance_weight) * tsp_scale_balance
     )
 
     if optimizer is not None:
@@ -220,8 +214,6 @@ def cfm_train_step(
         "loss_caption_ranking": caption_ranking.detach(),
         "loss_spectral": spectral_loss.detach(),
         "loss_operator_balance": operator_balance.detach(),
-        "loss_tsp_scale_entropy": tsp_scale_entropy.detach(),
-        "loss_tsp_scale_balance": tsp_scale_balance.detach(),
         "caption_pos_mse": caption_pos_mse.detach(),
         "caption_neg_mse": caption_neg_mse.detach(),
         "caption_ranking_acc": caption_ranking_acc.detach(),
@@ -533,6 +525,7 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "spectral_prompt_gate_mid",
         "spectral_prompt_gate_high",
         "spectral_prompt_delta_norm",
+        "spectral_prompt_raw_delta_norm",
         "spectral_prompt_attn_entropy_norm",
         "tsp_connector_active",
         "tsp_raw_token_count",
@@ -546,8 +539,9 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "tsp_scale_gate_entropy_norm",
         "tsp_scale_context_norm",
         "tsp_scale_context_norm_global",
-        "tsp_scale_entropy_loss",
-        "tsp_scale_balance_loss",
+        "tsp_scale_entropy_gap",
+        "tsp_scale_usage_imbalance",
+        "tsp_route_residual_strength",
         "tsp_global_gate_s0",
         "tsp_global_gate_s1",
         "tsp_global_gate_s2",
@@ -556,7 +550,16 @@ def _aux_diagnostics(aux: dict[str, Any]) -> dict[str, torch.Tensor]:
         "tsp_local_gate_s1",
         "tsp_local_gate_s2",
         "tsp_local_gate_s3",
+        "tsp_route_weight_s0",
+        "tsp_route_weight_s1",
+        "tsp_route_weight_s2",
+        "tsp_route_weight_s3",
+        "tsp_route_factor_s0",
+        "tsp_route_factor_s1",
+        "tsp_route_factor_s2",
+        "tsp_route_factor_s3",
         "bridge_alignment_tsp_clean_encoded",
+        "bridge_alignment_tsp_clean_detached",
     ]:
         val = aux.get(key)
         if torch.is_tensor(val):

@@ -44,6 +44,12 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         raise ValueError("config.task.mode must be explicitly set to 'text2ts' or 'edit'.")
     task_mode = str(task_cfg["mode"]).lower()
     d_model = int(model_cfg.get("d_model", 128))
+    frequency_band_mode = str(model_cfg.get("operator_frequency_band_mode", "gaussian")).lower()
+    if frequency_band_mode != "gaussian":
+        raise ValueError(
+            "operator_frequency_band_mode='soft_topk' has been disabled because it is not a true "
+            "frequency top-k operator. Use operator_frequency_band_mode: gaussian."
+        )
     text_encoder = build_text_encoder(text_cfg, d_model=d_model)
     kwargs = dict(
         sequence_length=sequence_length,
@@ -83,7 +89,7 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         operator_norm=str(model_cfg.get("operator_norm", "group")),
         operator_architecture=str(model_cfg.get("operator_architecture", "homogeneous")),
         operator_channel_heads=int(model_cfg.get("operator_channel_heads", 4)),
-        operator_frequency_band_mode=str(model_cfg.get("operator_frequency_band_mode", "gaussian")),
+        operator_frequency_band_mode=frequency_band_mode,
         operator_frequency_topk_frac=float(model_cfg.get("operator_frequency_topk_frac", 0.15)),
         operator_frequency_temp_start=float(model_cfg.get("operator_frequency_temp_start", 1.0)),
         operator_frequency_temp_end=float(model_cfg.get("operator_frequency_temp_end", 0.1)),

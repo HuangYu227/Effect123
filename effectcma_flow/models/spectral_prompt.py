@@ -24,8 +24,9 @@ class SpectralPromptGenerator(nn.Module):
     introduce a supervised auxiliary head. It uses low/mid/high learnable band
     queries to read the existing text-token memory, then converts those band
     prompts into a residual update for the existing operator expert context.
-    The final projection is zero-initialised so enabling the module is a no-op
-    at step 0 and can be ablated cleanly.
+    The residual gate is zero-initialised so enabling the module is a no-op at
+    step 0, while the residual branch itself uses a small non-zero projection so
+    the gate receives gradient immediately.
     """
 
     def __init__(
@@ -97,7 +98,7 @@ class SpectralPromptGenerator(nn.Module):
         nn.init.normal_(self.expert_queries, mean=0.0, std=self.d_model ** -0.5)
         nn.init.zeros_(self.context_gate[-1].bias)
         nn.init.zeros_(self.band_gate[-1].bias)
-        nn.init.zeros_(self.expert_out[-1].weight)
+        nn.init.normal_(self.expert_out[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.expert_out[-1].bias)
 
     def forward(
@@ -143,11 +144,13 @@ class SpectralPromptGenerator(nn.Module):
 
         expert_queries = self.expert_queries.unsqueeze(0).expand(batch, -1, -1)
         expert_tokens, _ = self.expert_attn(expert_queries, gated_bands, gated_bands, need_weights=False)
-        expert_delta = self.expert_out(expert_tokens)
+        raw_expert_delta = self.expert_out(expert_tokens)
         if self.use_residual_gate:
-            expert_delta = expert_delta * torch.tanh(self.residual_scale)
+            expert_delta = raw_expert_delta * torch.tanh(self.residual_scale)
+        else:
+            expert_delta = raw_expert_delta
 
-        aux = self._diagnostics(band_gates, expert_delta, band_attn, mask)
+        aux = self._diagnostics(band_gates, expert_delta, raw_expert_delta, band_attn, mask)
         return SpectralPromptOutput(
             band_tokens=band_tokens,
             band_gates=band_gates,
@@ -159,6 +162,7 @@ class SpectralPromptGenerator(nn.Module):
         self,
         band_gates: torch.Tensor,
         expert_delta: torch.Tensor,
+        raw_expert_delta: torch.Tensor,
         band_attn: torch.Tensor | None,
         mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
@@ -170,6 +174,7 @@ class SpectralPromptGenerator(nn.Module):
             "spectral_prompt_entropy_norm": entropy / denom.clamp_min(eps),
             "spectral_prompt_gate_low": band_gates[:, 0].mean(),
             "spectral_prompt_delta_norm": expert_delta.detach().float().square().mean().sqrt().to(band_gates.dtype),
+            "spectral_prompt_raw_delta_norm": raw_expert_delta.detach().float().square().mean().sqrt().to(band_gates.dtype),
         }
         if self.num_bands > 1:
             aux["spectral_prompt_gate_mid"] = band_gates[:, 1].mean()

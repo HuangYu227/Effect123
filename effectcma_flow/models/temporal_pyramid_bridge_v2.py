@@ -483,6 +483,10 @@ class TextGuidedTokenScaleRouter(nn.Module):
             nn.Linear(d_model, 1),
         )
         self.scale_context_norm = nn.LayerNorm(d_model)
+        # Residual route strength keeps all TSP tokens available. The 0.5 cap
+        # means even a near-zero route preserves at least half of the token
+        # amplitude, avoiding the non-residual gate collapse seen in ablations.
+        self.route_residual_logit = nn.Parameter(torch.tensor(-2.0))
 
     def forward(
         self,
@@ -509,6 +513,9 @@ class TextGuidedTokenScaleRouter(nn.Module):
 
         weighted_tokens: list[torch.Tensor] = []
         local_means = []
+        route_weight_means = []
+        route_factor_means = []
+        route_strength = (0.5 * torch.sigmoid(self.route_residual_logit)).to(device=device, dtype=dtype)
         for s, level in enumerate(levels):
             tokens = level.tokens.reshape(b, -1, self.d_model)
             text_tok = text_context[:, None, :].expand(-1, tokens.shape[1], -1)
@@ -516,8 +523,15 @@ class TextGuidedTokenScaleRouter(nn.Module):
             local_logits = self.local_gate(torch.cat([tokens, text_tok, tokens * text_tok, scale_tok], dim=-1))
             local = torch.sigmoid(local_logits)
             local_means.append(local.detach().mean())
-            weight = local * global_gate[:, s].view(b, 1, 1).to(dtype=dtype)
-            weighted_tokens.append(tokens * weight)
+            # Normalize the expected cold-start route weight around 1.0:
+            # sigmoid(local) ~= 0.5 and softmax(global) ~= 1/S, so
+            # 2 * S * local * global ~= 1. The residual form bounds collapse:
+            # even a zero route keeps factor ~= 1 - route_strength.
+            route_weight = local * global_gate[:, s].view(b, 1, 1).to(dtype=dtype) * float(2 * self.num_scales)
+            route_factor = 1.0 + route_strength * (route_weight - 1.0)
+            route_weight_means.append(route_weight.detach().mean())
+            route_factor_means.append(route_factor.detach().mean())
+            weighted_tokens.append(tokens * route_factor)
         entropy = -(global_gate.float().clamp_min(1e-8) * global_gate.float().clamp_min(1e-8).log()).sum(dim=-1)
         entropy_norm = entropy / math.log(max(self.num_scales, 2))
         mean_usage = global_gate.float().mean(dim=0)
@@ -525,16 +539,15 @@ class TextGuidedTokenScaleRouter(nn.Module):
         aux: dict[str, torch.Tensor] = {
             "tsp_scale_gate_entropy_norm": entropy_norm.detach().mean().to(dtype=dtype),
             "tsp_scale_context_norm": scale_ctx_t.detach().norm(dim=-1).mean(),
-            # Optional regularizers consumed only when the training config gives
-            # them non-zero weights. They are intentionally light and generic:
-            # entropy discourages hard scale collapse, while batch balance keeps
-            # all temporal granularities reachable without supervising labels.
-            "tsp_scale_entropy_loss": (1.0 - entropy_norm.mean()).clamp_min(0.0).to(dtype=dtype),
-            "tsp_scale_balance_loss": (mean_usage - uniform).square().mean().to(dtype=dtype),
+            "tsp_scale_entropy_gap": (1.0 - entropy_norm.detach().mean()).clamp_min(0.0).to(dtype=dtype),
+            "tsp_scale_usage_imbalance": (mean_usage.detach() - uniform).square().mean().to(dtype=dtype),
+            "tsp_route_residual_strength": route_strength.detach(),
         }
         for s in range(self.num_scales):
             aux[f"tsp_global_gate_s{s}"] = global_gate[:, s].detach().mean().to(dtype=dtype)
             aux[f"tsp_local_gate_s{s}"] = local_means[s].to(device=device, dtype=dtype)
+            aux[f"tsp_route_weight_s{s}"] = route_weight_means[s].to(device=device, dtype=dtype)
+            aux[f"tsp_route_factor_s{s}"] = route_factor_means[s].to(device=device, dtype=dtype)
         return weighted_tokens, scale_ctx_t, aux
 
 

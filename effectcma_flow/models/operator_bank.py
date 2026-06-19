@@ -254,27 +254,20 @@ class FrequencyBandExpert(nn.Module):
         self.num_channels = int(num_channels)
         self.hidden = int(hidden)
         self.frequency_band_mode = str(frequency_band_mode).lower()
-        if self.frequency_band_mode not in {"gaussian", "soft_topk"}:
+        if self.frequency_band_mode != "gaussian":
             raise ValueError(
-                f"frequency_band_mode must be 'gaussian' or 'soft_topk', got {frequency_band_mode!r}"
+                "frequency_band_mode='soft_topk' has been disabled because it is not a true "
+                f"frequency top-k operator; use 'gaussian', got {frequency_band_mode!r}"
             )
         self.frequency_topk_frac = float(frequency_topk_frac)
         self.frequency_temp_start = float(frequency_temp_start)
         self.frequency_temp_end = float(frequency_temp_end)
         self.frequency_anneal_steps = max(1, int(frequency_anneal_steps))
-        # Optional direct temperature override (None -> use the annealed schedule).
-        # Tests set this to keep the soft top-K mask deterministic.
-        self.frequency_temperature_override: float | None = None
         self.ada_norm = AdaFeatureNorm(hidden, t_dim)
         centers = torch.tensor([0.08, 0.32, 0.72], dtype=torch.float32).clamp(1e-3, 0.999)
         widths = torch.tensor([0.12, 0.18, 0.22], dtype=torch.float32).clamp_min(1e-3)
         self.band_center_logits = nn.Parameter(torch.logit(centers))
         self.band_log_widths = nn.Parameter(widths.log())
-        # Only the soft top-K path needs a training-progress signal. Registering
-        # the buffer exclusively in that mode keeps the default ("gaussian")
-        # state_dict byte-for-byte identical to the pre-upgrade module.
-        if self.frequency_band_mode == "soft_topk":
-            self.register_buffer("frequency_anneal_step", torch.zeros((), dtype=torch.long))
         self.band_gate = nn.Sequential(
             nn.LayerNorm(hidden + t_dim),
             nn.Linear(hidden + t_dim, hidden),
@@ -300,29 +293,14 @@ class FrequencyBandExpert(nn.Module):
         freq = torch.fft.rfft(x.to(fft_dtype), dim=-1)
         pooled = h_n.mean(dim=(1, 2))
         band_gate = torch.softmax(self.band_gate(torch.cat([pooled, t_code], dim=-1)), dim=-1).to(fft_dtype)
-        if self.frequency_band_mode == "soft_topk":
-            # Amplitude-ranked, temperature-annealed soft spectral mask. Computed
-            # from the RAW rFFT magnitude (not the gated energy below) so there is
-            # no gradient self-loop, and fully differentiable (no argmax/topk
-            # index masking). Shared across the 3 band slots; the per-sample
-            # band_gate then mixes the same sparse spectrum into the mixer inputs.
-            magnitude = freq.abs()
-            temperature = self._frequency_temperature(magnitude.dtype, magnitude.device)
-            soft_mask = torch.softmax(magnitude / temperature, dim=-1)
-            # softmax sums to 1 over frequency; scaling by ~topk_frac * F gives an
-            # average per-bin weight of frequency_topk_frac, i.e. a soft top-K gain
-            # that "keeps" roughly that fraction of bins by energy. Stays >= 0.
-            soft_mask = soft_mask * (self.frequency_topk_frac * magnitude.shape[-1])
-            bands = (soft_mask, soft_mask, soft_mask)
-        else:
-            bands = _adaptive_frequency_bands(
-                freq.shape[-1],
-                freq.device,
-                dtype=fft_dtype,
-                center_logits=self.band_center_logits,
-                log_widths=self.band_log_widths,
-            )
-            bands = (bands[0][None, None, :], bands[1][None, None, :], bands[2][None, None, :])
+        bands = _adaptive_frequency_bands(
+            freq.shape[-1],
+            freq.device,
+            dtype=fft_dtype,
+            center_logits=self.band_center_logits,
+            log_widths=self.band_log_widths,
+        )
+        bands = (bands[0][None, None, :], bands[1][None, None, :], bands[2][None, None, :])
         components = []
         energy = []
         for band_idx, mask_t in enumerate(bands):
@@ -344,27 +322,6 @@ class FrequencyBandExpert(nn.Module):
             "frequency_film_shift_rms": shift.detach().square().mean().sqrt(),
         }
         return out, aux
-
-    def _frequency_temperature(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Temperature for the soft top-K spectral mask.
-
-        Uses ``frequency_temperature_override`` when set (deterministic for
-        tests); otherwise anneals linearly from ``frequency_temp_start`` down to
-        ``frequency_temp_end`` over ``frequency_anneal_steps``. The step counter
-        buffer is advanced only on training-mode forwards so eval/sampling is
-        reproducible.
-        """
-        if self.frequency_temperature_override is not None:
-            value = float(self.frequency_temperature_override)
-        else:
-            step = float(self.frequency_anneal_step.item()) if hasattr(self, "frequency_anneal_step") else 0.0
-            frac = min(1.0, max(0.0, step / float(self.frequency_anneal_steps)))
-            value = self.frequency_temp_end + (self.frequency_temp_start - self.frequency_temp_end) * (1.0 - frac)
-            if self.training and hasattr(self, "frequency_anneal_step"):
-                self.frequency_anneal_step += 1
-        value = max(value, 1e-4)
-        return torch.tensor(value, dtype=dtype, device=device)
-
 
 class ResidualOperatorBank(nn.Module):
     def __init__(

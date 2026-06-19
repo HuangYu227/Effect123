@@ -168,6 +168,12 @@ def run_train(cfg: dict) -> None:
     max_caption_slots = int(train_cfg.get("max_caption_slots", 1))
     include_all_caption_candidates = bool(train_cfg.get("include_all_caption_candidates", False))
     routing_loss_weight = float(train_cfg.get("routing_loss_weight", 0.0))
+    for removed_key in ("tsp_scale_entropy_weight", "tsp_scale_balance_weight"):
+        if float(train_cfg.get(removed_key, 0.0)) != 0.0:
+            raise ValueError(
+                f"train.{removed_key} has been removed: TSP scale statistics are diagnostics only, "
+                "not auxiliary losses."
+            )
     caption_shuffle = bool(train_cfg.get("caption_shuffle", False))
     blank_captions = bool(train_cfg.get("blank_captions", False))
     if routing_loss_weight != 0.0:
@@ -208,8 +214,6 @@ def run_train(cfg: dict) -> None:
                 spectral_log_magnitude=bool(cfg["train"].get("spectral_log_magnitude", True)),
                 spectral_time_weight_power=float(cfg["train"].get("spectral_time_weight_power", 0.0)),
                 operator_balance_weight=float(cfg["train"].get("operator_balance_weight", 0.0)),
-                tsp_scale_entropy_weight=float(cfg["train"].get("tsp_scale_entropy_weight", 0.0)),
-                tsp_scale_balance_weight=float(cfg["train"].get("tsp_scale_balance_weight", 0.0)),
             )
             step += 1
             scheduler.step()
@@ -266,12 +270,6 @@ def run_train(cfg: dict) -> None:
                 op_balance = _scalar(out, "loss_operator_balance")
                 if op_balance > 0.0:
                     postfix["opBal"] = f"{op_balance:.4f}"
-                tsp_entropy_loss = _scalar(out, "loss_tsp_scale_entropy")
-                if tsp_entropy_loss > 0.0:
-                    postfix["tspHloss"] = f"{tsp_entropy_loss:.4f}"
-                tsp_balance_loss = _scalar(out, "loss_tsp_scale_balance")
-                if tsp_balance_loss > 0.0:
-                    postfix["tspBloss"] = f"{tsp_balance_loss:.4f}"
                 tsp_entropy = _scalar(out, "tsp_scale_gate_entropy_norm")
                 if tsp_entropy == tsp_entropy:
                     postfix["tspH"] = f"{tsp_entropy:.2f}"
@@ -506,6 +504,7 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "bridge_connector_patch_merger",
         "bridge_alignment_used_clean",
         "bridge_alignment_tsp_clean_encoded",
+        "bridge_alignment_tsp_clean_detached",
         "time_long_range_rms",
         "spectral_prompt_entropy",
         "spectral_prompt_entropy_norm",
@@ -513,6 +512,7 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "spectral_prompt_gate_mid",
         "spectral_prompt_gate_high",
         "spectral_prompt_delta_norm",
+        "spectral_prompt_raw_delta_norm",
         "spectral_prompt_attn_entropy_norm",
         "tsp_connector_active",
         "tsp_raw_token_count",
@@ -526,8 +526,9 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "tsp_scale_gate_entropy_norm",
         "tsp_scale_context_norm",
         "tsp_scale_context_norm_global",
-        "tsp_scale_entropy_loss",
-        "tsp_scale_balance_loss",
+        "tsp_scale_entropy_gap",
+        "tsp_scale_usage_imbalance",
+        "tsp_route_residual_strength",
         "tsp_global_gate_s0",
         "tsp_global_gate_s1",
         "tsp_global_gate_s2",
@@ -536,6 +537,14 @@ def _field_summary(aux: dict[str, torch.Tensor]) -> dict[str, float]:
         "tsp_local_gate_s1",
         "tsp_local_gate_s2",
         "tsp_local_gate_s3",
+        "tsp_route_weight_s0",
+        "tsp_route_weight_s1",
+        "tsp_route_weight_s2",
+        "tsp_route_weight_s3",
+        "tsp_route_factor_s0",
+        "tsp_route_factor_s1",
+        "tsp_route_factor_s2",
+        "tsp_route_factor_s3",
         "tsp_inject_strength_s0",
         "tsp_inject_strength_s1",
         "tsp_inject_strength_s2",

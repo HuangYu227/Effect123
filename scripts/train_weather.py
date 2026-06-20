@@ -157,6 +157,7 @@ def run_train(cfg: dict) -> None:
     best_metric = str(cfg["train"].get("best_metric", "mse"))
     best_metric_mode = str(cfg["train"].get("best_metric_mode", "auto"))
     allow_best_metric_fallback = bool(cfg["train"].get("allow_best_metric_fallback", True))
+    best_metric_fallbacks = _metric_fallbacks(cfg["train"].get("best_metric_fallbacks"))
     step = 0
     progress = tqdm(total=max_steps, desc="train", dynamic_ncols=True)
     last_metrics: dict[str, float] = {}
@@ -276,6 +277,9 @@ def run_train(cfg: dict) -> None:
                 op_balance = _scalar(out, "loss_operator_balance")
                 if op_balance > 0.0:
                     postfix["opBal"] = f"{op_balance:.4f}"
+                weighted_loss_summary = _weighted_aux_loss_summary(out, cfg["train"])
+                if weighted_loss_summary:
+                    postfix.update(weighted_loss_summary)
                 tsp_entropy = _scalar(out, "tsp_scale_gate_entropy_norm")
                 if tsp_entropy == tsp_entropy:
                     postfix["tspH"] = f"{tsp_entropy:.2f}"
@@ -325,17 +329,20 @@ def run_train(cfg: dict) -> None:
                     metrics,
                     best_metric,
                     allow_fallback=allow_best_metric_fallback,
+                    fallbacks=best_metric_fallbacks,
                 )
                 if score_name is None or score is None:
                     if not warned_missing_best_metric:
                         progress.write(
                             f"[checkpoint] best metric {best_metric!r} is absent from validation metrics; "
-                            "best.pt will not be updated until a comparable metric is available."
+                            "best.pt will not be updated until a comparable metric is available. "
+                            f"available={sorted(metrics.keys())}"
                         )
                         warned_missing_best_metric = True
                 elif score_name != best_metric and not warned_missing_best_metric:
                     progress.write(
-                        f"[checkpoint] best metric {best_metric!r} is absent; using {score_name!r} for best.pt."
+                        f"[checkpoint] best metric {best_metric!r} is absent; "
+                        f"using fallback {score_name!r} for best.pt."
                     )
                     warned_missing_best_metric = True
                 if score_name is not None and score is not None and _is_better_metric(
@@ -610,11 +617,38 @@ def _usage_summary(value) -> str | None:
     return "/".join(f"{float(v):.2f}" for v in flat)
 
 
+def _weighted_aux_loss_summary(output: dict, train_cfg: dict) -> dict[str, str]:
+    cfm = _scalar(output, "loss_cfm")
+    if not math.isfinite(cfm) or cfm <= 1e-12:
+        return {}
+    specs = [
+        ("bridge_alignment_weight", "loss_bridge_alignment", "wB%"),
+        ("spectral_loss_weight", "loss_spectral", "wS%"),
+        ("caption_ranking_weight", "loss_caption_ranking", "wR%"),
+        ("operator_balance_weight", "loss_operator_balance", "wO%"),
+        ("regime_ortho_weight", "loss_regime_ortho", "wReg%"),
+    ]
+    out: dict[str, str] = {}
+    total = 0.0
+    for weight_key, loss_key, label in specs:
+        weight = float(train_cfg.get(weight_key, 0.0))
+        value = _scalar(output, loss_key)
+        if weight <= 0.0 or not math.isfinite(value) or value <= 0.0:
+            continue
+        contrib = weight * value
+        total += contrib
+        out[label] = f"{100.0 * contrib / cfm:.1f}"
+    if total > 0.0:
+        out["wAux%"] = f"{100.0 * total / cfm:.1f}"
+    return out
+
+
 def _select_best_metric(
     metrics: dict[str, float],
     requested: str,
     *,
     allow_fallback: bool = True,
+    fallbacks: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[str | None, float | None]:
     """Select a finite validation score for checkpoint ranking.
 
@@ -624,7 +658,7 @@ def _select_best_metric(
     """
     candidates = [requested]
     if allow_fallback:
-        for fallback in ("mse", "mae", "mask_iou", "field_scope_precision"):
+        for fallback in (fallbacks or ("mse", "mae", "mask_iou", "field_scope_precision")):
             if fallback not in candidates:
                 candidates.append(fallback)
     for name in candidates:
@@ -638,6 +672,18 @@ def _select_best_metric(
         if math.isfinite(score):
             return name, score
     return None, None
+
+
+def _metric_fallbacks(value) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = [str(part).strip() for part in value]
+    else:
+        raise TypeError("train.best_metric_fallbacks must be a list or comma-separated string")
+    return [item for item in items if item]
 
 
 def _is_better_metric(score: float, best_score: float | None, *, metric_name: str, mode: str = "auto") -> bool:

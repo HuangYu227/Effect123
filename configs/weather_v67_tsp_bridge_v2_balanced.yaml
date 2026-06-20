@@ -157,7 +157,8 @@ train:
   eval_statistical_metrics: true
   best_metric: fid_jftsd_cttp_score
   best_metric_mode: min
-  allow_best_metric_fallback: false
+  allow_best_metric_fallback: true
+  best_metric_fallbacks: [mse, mae]
   save_every: 500
 
 sample:

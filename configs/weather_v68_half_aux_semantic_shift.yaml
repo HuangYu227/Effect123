@@ -120,7 +120,7 @@ train:
   eval_batch_size: 384
   lr: 0.0001
   weight_decay: 0.0001
-  max_steps: 15000
+  max_steps: 20000
   cfm_loss_mode: global
   noise_scale: 1.0
 

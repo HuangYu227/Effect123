@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from effectcma_flow.evaluation.checkpoint_proxy import JointProxyCheckpointSelector, joint_f1
 from effectcma_flow.training.checkpoint import checkpoint_eval_config, checkpoint_stats_or_none, validate_checkpoint_payload
 from scripts.eval_verbalts_metrics import (
     _blank_caption_fields as eval_blank_caption_fields,
@@ -15,6 +16,7 @@ from scripts.train_weather import (
     _is_better_metric,
     _select_best_metric,
     _shuffle_caption_fields as train_shuffle_caption_fields,
+    save_checkpoint,
 )
 
 
@@ -166,8 +168,18 @@ def test_caption_blank_removes_candidate_leakage():
         assert blanked["caption_candidates"] == [[], []]
 
 
-def test_train_best_metric_falls_back_to_mse_when_verbalts_absent():
+def test_train_best_metric_does_not_fall_back_by_default():
     name, score = _select_best_metric({"mse": 1.2, "mae": 0.8}, "verbalts_jftsd")
+    assert name is None
+    assert score is None
+
+
+def test_train_best_metric_legacy_fallback_is_explicit():
+    name, score = _select_best_metric(
+        {"mse": 1.2, "mae": 0.8},
+        "verbalts_jftsd",
+        allow_fallback=True,
+    )
     assert name == "mse"
     assert score == 1.2
 
@@ -177,3 +189,80 @@ def test_train_best_metric_direction_auto_handles_min_and_max():
     assert not _is_better_metric(1.3, 1.2, metric_name="mse", mode="auto")
     assert _is_better_metric(0.7, 0.6, metric_name="mask_iou", mode="auto")
     assert not _is_better_metric(0.5, 0.6, metric_name="mask_iou", mode="auto")
+
+
+def test_joint_proxy_selector_uses_joint_f1_then_mdd_tiebreak():
+    selector = JointProxyCheckpointSelector(mdd_threshold=0.012, joint_f1_tolerance=0.002)
+    first = selector.consider(
+        {"MDD": 0.010, "JointPrecision": 0.80, "JointRecall": 0.76},
+        step=1500,
+    )
+    assert first.selected
+    assert first.reason == "first_eligible"
+
+    improved = selector.consider(
+        {"MDD": 0.011, "JointPrecision": 0.83, "JointRecall": 0.79},
+        step=3000,
+    )
+    assert improved.selected
+    assert improved.reason == "joint_f1_improved"
+
+    tied_better_mdd = selector.consider(
+        {
+            "MDD": 0.009,
+            "JointPrecision": improved.joint_precision,
+            "JointRecall": improved.joint_recall,
+        },
+        step=4500,
+    )
+    assert tied_better_mdd.selected
+    assert tied_better_mdd.reason == "mdd_tiebreak"
+    assert selector.best_step == 4500
+
+
+def test_joint_proxy_selector_rejects_mdd_threshold_and_missing_metrics():
+    selector = JointProxyCheckpointSelector(mdd_threshold=0.012, joint_f1_tolerance=0.002)
+    rejected = selector.consider(
+        {"MDD": 0.013, "JointPrecision": 0.90, "JointRecall": 0.90},
+        step=1500,
+    )
+    assert not rejected.selected
+    assert rejected.reason == "mdd_threshold"
+    assert selector.best_step is None
+    with pytest.raises(KeyError, match="JointRecall"):
+        selector.consider({"MDD": 0.010, "JointPrecision": 0.8}, step=3000)
+
+
+def test_joint_f1_validates_inputs():
+    assert joint_f1(0.8, 0.6) == pytest.approx(2 * 0.8 * 0.6 / 1.4)
+    assert joint_f1(0.0, 0.0) == 0.0
+    with pytest.raises(ValueError, match="finite"):
+        joint_f1(float("nan"), 0.5)
+
+
+def test_joint_proxy_checkpoint_records_selection_metadata(tmp_path):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    path = tmp_path / "best_joint_proxy.pt"
+    selection = {
+        "type": "joint_proxy",
+        "step": 3000,
+        "MDD": 0.009,
+        "JointPrecision": 0.82,
+        "JointRecall": 0.78,
+        "JointF1": joint_f1(0.82, 0.78),
+    }
+
+    save_checkpoint(
+        path,
+        model,
+        optimizer,
+        {"task": {"mode": "text2ts"}},
+        {"mean": torch.zeros(1), "std": torch.ones(1)},
+        3000,
+        selection=selection,
+    )
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert payload["step"] == 3000
+    assert payload["selection"] == selection

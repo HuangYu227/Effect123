@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 import json
@@ -49,20 +50,39 @@ class VerbalTSMetricComputer:
     def __init__(
         self,
         *,
-        verbalts_root: str | Path,
+        verbalts_root: str | Path | None,
         clip_config_path: str | Path,
         clip_model_path: str | Path,
         device: torch.device,
         stats: dict[str, torch.Tensor] | None,
+        cttp_backend: str = "verbalts",
+        contsg_root: str | Path | None = None,
+        cttp_text_encoder_model: str | Path | None = None,
     ) -> None:
         self.device = device
         self.stats = stats
-        self.clip = _load_verbalts_cttp(
-            verbalts_root=verbalts_root,
-            clip_config_path=clip_config_path,
-            clip_model_path=clip_model_path,
-            device=device,
-        )
+        self.cttp_backend = str(cttp_backend).lower()
+        if self.cttp_backend == "verbalts":
+            if verbalts_root is None:
+                raise ValueError("verbalts_root is required when cttp_backend='verbalts'")
+            self.clip = _load_verbalts_cttp(
+                verbalts_root=verbalts_root,
+                clip_config_path=clip_config_path,
+                clip_model_path=clip_model_path,
+                device=device,
+            )
+        elif self.cttp_backend == "contsg":
+            if contsg_root is None:
+                raise ValueError("contsg_root is required when cttp_backend='contsg'")
+            self.clip = _load_contsg_cttp(
+                contsg_root=contsg_root,
+                clip_config_path=clip_config_path,
+                clip_model_path=clip_model_path,
+                text_encoder_model=cttp_text_encoder_model,
+                device=device,
+            )
+        else:
+            raise ValueError("cttp_backend must be 'verbalts' or 'contsg'")
 
     @torch.no_grad()
     def compute(
@@ -138,11 +158,11 @@ class VerbalTSMetricComputer:
         gen_ts_mean, gen_ts_cov = _mean_cov(gen_ts)
         gen_joint_mean, gen_joint_cov = _mean_cov(gen_joint)
         out = {
-            "verbalts_fid": calculate_frechet_distance(ref_stats["ts_mean"], ref_stats["ts_cov"], gen_ts_mean, gen_ts_cov),
-            "verbalts_jftsd": calculate_frechet_distance(ref_stats["joint_mean"], ref_stats["joint_cov"], gen_joint_mean, gen_joint_cov),
-            "verbalts_cttp": float(cttp),
-            "verbalts_reference_count": float(ref_stats["reference_count"]),
-            "verbalts_generated_count": float(gen_ts.shape[0]),
+            f"{self.cttp_backend}_fid": calculate_frechet_distance(ref_stats["ts_mean"], ref_stats["ts_cov"], gen_ts_mean, gen_ts_cov),
+            f"{self.cttp_backend}_jftsd": calculate_frechet_distance(ref_stats["joint_mean"], ref_stats["joint_cov"], gen_joint_mean, gen_joint_cov),
+            f"{self.cttp_backend}_cttp": float(cttp),
+            f"{self.cttp_backend}_reference_count": float(ref_stats["reference_count"]),
+            f"{self.cttp_backend}_generated_count": float(gen_ts.shape[0]),
             "CTTPScore": float(cttp),
         }
         out.update(
@@ -437,6 +457,93 @@ def _load_verbalts_cttp(
     for param in clip.parameters():
         param.requires_grad_(False)
     return clip
+
+
+class _ConTSGCTTPAdapter:
+    """Expose ConTSG's official CLIPEmbedder through the legacy CTTP API."""
+
+    def __init__(self, embedder) -> None:
+        self.embedder = embedder
+
+    def get_ts_coemb(self, ts: torch.Tensor, ts_len: torch.Tensor | None = None) -> torch.Tensor:
+        return self.embedder.get_ts_embedding(ts, ts_len)
+
+    def get_text_coemb(self, text: list[str], _unused=None) -> torch.Tensor:
+        return self.embedder.get_text_embedding({"cap": text})
+
+
+def _load_contsg_cttp(
+    *,
+    contsg_root: str | Path,
+    clip_config_path: str | Path,
+    clip_model_path: str | Path,
+    text_encoder_model: str | Path | None,
+    device: torch.device,
+):
+    root = Path(contsg_root).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"ConTSG-Bench root not found: {root}")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from contsg.eval.embedder import CLIPEmbedder
+    except ImportError as exc:
+        raise ImportError(
+            "Unable to import ConTSG CLIPEmbedder. Install ConTSG-Bench dependencies "
+            "and pass --contsg-root to the repository root."
+        ) from exc
+
+    config_path = Path(clip_config_path).resolve()
+    model_path = Path(clip_model_path).resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"ConTSG CTTP config not found: {config_path}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"ConTSG CTTP checkpoint not found: {model_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        configs = yaml.safe_load(handle)
+    if not isinstance(configs, dict):
+        raise ValueError("ConTSG CTTP config must be a mapping")
+    if isinstance(configs.get("model"), dict):
+        text_config = configs["model"]
+    elif isinstance(configs.get("text"), dict) and isinstance(configs.get("ts"), dict):
+        text_config = configs["text"]
+    else:
+        raise ValueError(
+            "Unrecognized ConTSG CTTP config; expected model or legacy ts/text mappings"
+        )
+
+    configured_text_model = text_config.get("pretrain_model_path")
+    if text_encoder_model is not None:
+        text_model_path = Path(text_encoder_model).expanduser().resolve()
+        if not text_model_path.exists():
+            raise FileNotFoundError(f"ConTSG CTTP text encoder not found: {text_model_path}")
+        text_config["pretrain_model_path"] = str(text_model_path)
+    elif not configured_text_model or "${" in str(configured_text_model):
+        raise ValueError(
+            "The released ConTSG CTTP config has an unresolved text encoder path; "
+            "pass --cttp-text-encoder-model with the exact LongCLIP-GmP directory."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="effectcma-contsg-cttp-") as temp_dir:
+        resolved_config = Path(temp_dir) / "model_configs.yaml"
+        resolved_config.write_text(
+            yaml.safe_dump(configs, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        embedder = CLIPEmbedder(
+            clip_config_path=resolved_config,
+            clip_model_path=model_path,
+            device=device,
+            use_longalign=False,
+            normalize_embeddings=None,
+        )
+    model = getattr(embedder, "model", None)
+    if model is not None:
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+    return _ConTSGCTTPAdapter(embedder)
 
 
 def _mean_cov(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

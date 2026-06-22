@@ -42,7 +42,19 @@ def main() -> None:
     parser.add_argument("--text-encoder-mode", default=None, choices=["hash", "precomputed", "hf", "longclip"])
     parser.add_argument("--text-encoder-model", default=None, help="Override hf_model_name or longclip_model_name")
     parser.add_argument("--task-mode", default=None, choices=["text2ts", "edit"])
+    parser.add_argument(
+        "--cttp-backend",
+        default="verbalts",
+        choices=["verbalts", "contsg"],
+        help="CTTP implementation/checkpoint family. Default preserves the VerbalTS protocol.",
+    )
     parser.add_argument("--verbalts-root", default=None)
+    parser.add_argument("--contsg-root", default=None, help="ConTSG-Bench repository root for the contsg CTTP backend")
+    parser.add_argument(
+        "--cttp-text-encoder-model",
+        default=None,
+        help="Exact LongCLIP model directory used by the ConTSG CTTP checkpoint",
+    )
     parser.add_argument("--clip-folder", default=None, help="Folder containing model_configs.yaml and clip_model_best.pth")
     parser.add_argument("--clip-config", default=None)
     parser.add_argument("--clip-model", default=None)
@@ -144,7 +156,9 @@ def run(args: argparse.Namespace, cfg: dict) -> dict[str, float]:
     model.load_state_dict(payload["model"])
     model.eval()
 
-    verbalts_root, clip_config, clip_model = _resolve_verbalts_paths(args)
+    cttp_backend = str(getattr(args, "cttp_backend", "verbalts")).lower()
+    cttp_text_encoder_model = getattr(args, "cttp_text_encoder_model", None)
+    cttp_root, clip_config, clip_model = _resolve_cttp_paths(args)
     cache_metadata = {
         "metric_protocol": args.metric_protocol,
         "data_root": str(Path(cfg["data"]["root"]).resolve()),
@@ -155,13 +169,24 @@ def run(args: argparse.Namespace, cfg: dict) -> dict[str, float]:
         "clip_config": _file_fingerprint(clip_config),
         "clip_model": _file_fingerprint(clip_model),
     }
+    if cttp_backend == "contsg":
+        cache_metadata["cttp_backend"] = "contsg"
+        cache_metadata["cttp_text_encoder_model"] = str(
+            Path(cttp_text_encoder_model).expanduser().resolve()
+        )
     computer = VerbalTSMetricComputer(
-        verbalts_root=verbalts_root,
+        verbalts_root=cttp_root if cttp_backend == "verbalts" else None,
         clip_config_path=clip_config,
         clip_model_path=clip_model,
         device=device,
         stats=stats,
+        cttp_backend=cttp_backend,
+        contsg_root=cttp_root if cttp_backend == "contsg" else None,
+        cttp_text_encoder_model=cttp_text_encoder_model,
     )
+    cache_subdir = Path(args.metric_protocol)
+    if cttp_backend == "contsg":
+        cache_subdir = Path("contsg") / cache_subdir
     return computer.compute(
         model=model,
         reference_loader=reference_loader,
@@ -184,7 +209,7 @@ def run(args: argparse.Namespace, cfg: dict) -> dict[str, float]:
         reference_denormalize=reference_denormalize,
         reference_max_batches=_none_if_zero(args.reference_max_batches),
         generated_max_batches=_none_if_zero(args.max_batches),
-        cache_dir=str(Path(args.cache_dir) / args.metric_protocol),
+        cache_dir=str(Path(args.cache_dir) / cache_subdir),
         cache_metadata=cache_metadata,
     )
 
@@ -193,6 +218,27 @@ def _resolve_verbalts_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]
     if args.verbalts_root is None:
         raise ValueError("--verbalts-root is required, e.g. /home/newuser001/huangyu/Research/VerbalTS")
     root = Path(args.verbalts_root)
+    if args.clip_folder is not None:
+        clip_folder = Path(args.clip_folder)
+        return root, clip_folder / "model_configs.yaml", clip_folder / "clip_model_best.pth"
+    if args.clip_config is None or args.clip_model is None:
+        raise ValueError("Provide either --clip-folder or both --clip-config and --clip-model")
+    return root, Path(args.clip_config), Path(args.clip_model)
+
+
+def _resolve_cttp_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+    backend = str(getattr(args, "cttp_backend", "verbalts")).lower()
+    if backend == "verbalts":
+        return _resolve_verbalts_paths(args)
+    if backend != "contsg":
+        raise ValueError("--cttp-backend must be 'verbalts' or 'contsg'")
+    if args.contsg_root is None:
+        raise ValueError("--contsg-root is required when --cttp-backend contsg")
+    if args.cttp_text_encoder_model is None:
+        raise ValueError(
+            "--cttp-text-encoder-model is required for ConTSG checkpoint reproducibility"
+        )
+    root = Path(args.contsg_root)
     if args.clip_folder is not None:
         clip_folder = Path(args.clip_folder)
         return root, clip_folder / "model_configs.yaml", clip_folder / "clip_model_best.pth"

@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--caption-policy", default="random", choices=["random", "first", "cyclic"])
-    parser.add_argument("--loss-type", default="CE", choices=["CE", "Contrastive"])
+    parser.add_argument("--loss-type", default="Contrastive", choices=["CE", "Contrastive"])
     parser.add_argument("--coemb-dim", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--text-hidden-dim", type=int, default=None)
@@ -283,7 +283,7 @@ def default_model_config(*, seq_len: int, n_var: int) -> dict[str, Any]:
     patch_len, stride, padding = resolve_patch_params(seq_len=seq_len, patch_len=None, stride=None, padding=None, cfg={})
     return {
         "clip_type": "clip_patchtst",
-        "loss_type": "CE",
+        "loss_type": "Contrastive",
         "device": "cuda:0",
         "text": {
             "pretrain_model_path": "save/Longclip",

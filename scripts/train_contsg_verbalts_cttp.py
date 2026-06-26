@@ -73,8 +73,12 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--early-stopping-patience", type=int, default=50)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true", help="Rewrite converted arrays/configs.")
     parser.add_argument("--prepare-only", action="store_true", help="Only convert data and write configs.")
+    parser.add_argument("--eval-only", action="store_true", help="Evaluate an existing checkpoint without training.")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Checkpoint for --eval-only. Only valid with one dataset.")
+    parser.add_argument("--skip-final-eval", action="store_true", help="Skip retrieval evaluation after training.")
     args = parser.parse_args()
 
     contsg_root = args.contsg_root.expanduser().resolve()
@@ -90,6 +94,8 @@ def main() -> None:
     selected = resolve_selected_datasets(data_root, args.datasets)
     if not selected:
         raise RuntimeError(f"No supported VerbalTS datasets found under {data_root}")
+    if args.checkpoint is not None and len(selected) != 1:
+        raise ValueError("--checkpoint can only be used when exactly one dataset is selected")
 
     if not args.prepare_only:
         setup_contsg(contsg_root)
@@ -120,8 +126,21 @@ def main() -> None:
         print(f"[config] {config_path}")
         if args.prepare_only:
             continue
+        if args.eval_only:
+            checkpoint = resolve_checkpoint(args.checkpoint, output_dir)
+            metrics = evaluate_checkpoint(config, checkpoint=checkpoint, contsg_root=contsg_root, eval_batch_size=args.eval_batch_size)
+            print_metrics(source_name, checkpoint, metrics)
+            continue
         final_checkpoint = train_one(config, contsg_root=contsg_root)
         print(f"[done] {source_name}: {final_checkpoint}")
+        if not args.skip_final_eval:
+            metrics = evaluate_checkpoint(config, checkpoint=final_checkpoint, contsg_root=contsg_root, eval_batch_size=args.eval_batch_size)
+            write_text(
+                output_dir / "cttp_retrieval_metrics.json",
+                json.dumps(metrics, indent=2, sort_keys=True),
+                overwrite=True,
+            )
+            print_metrics(source_name, final_checkpoint, metrics)
 
 
 def resolve_selected_datasets(data_root: Path, requested: list[str] | None) -> list[tuple[str, str]]:
@@ -354,6 +373,148 @@ def train_one(config: dict[str, Any], *, contsg_root: Path) -> Path:
     write_yaml(cfg.output_dir / "model_configs.yaml", cfg.model_dump(mode="json", exclude_none=True), overwrite=True)
     trainer = MultiStageTrainer(cfg, model_cls, datamodule, checkpoint_root=cfg.output_dir)
     return trainer.train()
+
+
+def resolve_checkpoint(explicit: Path | None, output_dir: Path) -> Path:
+    if explicit is not None:
+        path = explicit.expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return path
+
+    ckpt_root = output_dir / "checkpoints" / "finetune"
+    if not ckpt_root.exists():
+        raise FileNotFoundError(f"Checkpoint folder not found: {ckpt_root}")
+    candidates = sorted(path for path in ckpt_root.rglob("*.ckpt") if path.name != "last.ckpt")
+    if not candidates:
+        last = ckpt_root / "last.ckpt"
+        if last.exists():
+            return last
+        raise FileNotFoundError(f"No checkpoint found under {ckpt_root}")
+
+    def score(path: Path) -> float:
+        import re
+
+        match = re.search(r"loss=([0-9]+(?:\.[0-9]+)?)\.ckpt$", str(path))
+        return float(match.group(1)) if match else float("inf")
+
+    return min(candidates, key=score)
+
+
+def evaluate_checkpoint(
+    config: dict[str, Any],
+    *,
+    checkpoint: Path,
+    contsg_root: Path,
+    eval_batch_size: int | None,
+) -> dict[str, Any]:
+    setup_contsg(contsg_root)
+    import torch
+    import torch.nn.functional as F
+    from contsg.config.model_validation import validate_model_config
+    from contsg.config.schema import ExperimentConfig
+    from contsg.registry import Registry
+
+    cfg = validate_model_config(ExperimentConfig(**config), strict_schema=False).config
+    model_cls = Registry.get_model(cfg.model.name)
+    dataset_cls = Registry.get_dataset(cfg.data.name)
+    batch_size = int(eval_batch_size or cfg.train.batch_size)
+    train_config = {
+        "batch_size": batch_size,
+        "num_workers": cfg.train.num_workers,
+        "pin_memory": cfg.train.pin_memory,
+        "model_name": cfg.model.name,
+        "condition": cfg.condition,
+        "seed": cfg.seed,
+    }
+    datamodule = dataset_cls(cfg.data, train_config=train_config)
+    datamodule.setup(None)
+
+    model = model_cls.load_from_checkpoint(
+        str(checkpoint),
+        config=cfg,
+        learning_rate=cfg.train.stages[0].lr,
+        use_condition=True,
+    )
+    device = torch.device(cfg.device if torch.cuda.is_available() or not str(cfg.device).startswith("cuda") else "cpu")
+    model = model.to(device)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    metrics: dict[str, Any] = {
+        "checkpoint": str(checkpoint),
+        "dataset": cfg.data.name,
+        "batch_size": batch_size,
+    }
+    with torch.no_grad():
+        for split, loader in (("valid", datamodule.val_dataloader()), ("test", datamodule.test_dataloader())):
+            metrics[split] = retrieval_metrics(model, loader, device=device)
+    return metrics
+
+
+def retrieval_metrics(model, loader, *, device) -> dict[str, float]:
+    import torch
+    import torch.nn.functional as F
+
+    ts_embeddings = []
+    text_embeddings = []
+    raw_losses = []
+    n_items = 0
+    for batch in loader:
+        ts = batch["ts"].to(device).float()
+        text = [str(value) for value in batch["cap"]]
+        loss_dict = model({"ts": ts, "cap": text})
+        raw_losses.append(float(loss_dict["loss"].detach().cpu()) * int(ts.shape[0]))
+        ts_embeddings.append(model.get_global_ts_embedding(ts).detach().cpu())
+        text_embeddings.append(model.get_text_embedding(text).detach().cpu())
+        n_items += int(ts.shape[0])
+
+    if n_items == 0:
+        raise ValueError("Cannot evaluate an empty split")
+    ts_emb = torch.cat(ts_embeddings, dim=0)
+    text_emb = torch.cat(text_embeddings, dim=0)
+    sim = torch.mm(ts_emb, text_emb.t())
+    labels = torch.arange(sim.shape[0])
+    return {
+        "n": float(sim.shape[0]),
+        "batch_loss": float(sum(raw_losses) / n_items),
+        "global_ce": float((F.cross_entropy(sim, labels) + F.cross_entropy(sim.t(), labels)) / 2.0),
+        "diag_sim": float(sim.diag().mean()),
+        **rank_metrics(sim, labels, prefix="ts2text"),
+        **rank_metrics(sim.t(), labels, prefix="text2ts"),
+    }
+
+
+def rank_metrics(sim, labels, *, prefix: str) -> dict[str, float]:
+    import torch
+
+    order = torch.argsort(sim, dim=1, descending=True)
+    matches = order.eq(labels[:, None])
+    ranks = matches.float().argmax(dim=1) + 1
+    return {
+        f"{prefix}_top1": float((ranks <= 1).float().mean()),
+        f"{prefix}_top5": float((ranks <= 5).float().mean()),
+        f"{prefix}_top10": float((ranks <= 10).float().mean()),
+        f"{prefix}_mean_rank": float(ranks.float().mean()),
+        f"{prefix}_mrr": float((1.0 / ranks.float()).mean()),
+    }
+
+
+def print_metrics(dataset: str, checkpoint: Path, metrics: dict[str, Any]) -> None:
+    print(f"[cttp-eval] {dataset}: {checkpoint}", flush=True)
+    for split in ("valid", "test"):
+        values = metrics[split]
+        print(
+            "[cttp-eval] {split} n={n:.0f} batch_loss={batch_loss:.4f} global_ce={global_ce:.4f} "
+            "ts2text@1={ts2text_top1:.4f} ts2text@5={ts2text_top5:.4f} "
+            "text2ts@1={text2ts_top1:.4f} text2ts@5={text2ts_top5:.4f} "
+            "mrr=({ts2text_mrr:.4f},{text2ts_mrr:.4f}) diag_sim={diag_sim:.4f}".format(
+                split=split,
+                **values,
+            ),
+            flush=True,
+        )
 
 
 def dataset_registry_name(canonical_name: str) -> str:

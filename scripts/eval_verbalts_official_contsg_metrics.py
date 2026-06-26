@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=10)
     parser.add_argument("--sampler", choices=("ddim", "ddpm"), default="ddim")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--cond-modal", choices=("text", "simple_text"), default="text")
     parser.add_argument("--text-output-type", default="all")
     parser.add_argument("--text-pos-emb", default="none")
     parser.add_argument("--diff-stage-num", type=int, default=3)
@@ -95,6 +96,7 @@ def main() -> None:
         cond_cfg,
         device=device,
         longclip_root=cttp_text_encoder,
+        cond_modal=args.cond_modal,
         text_output_type=args.text_output_type,
         text_pos_emb=args.text_pos_emb,
         diff_stage_num=args.diff_stage_num,
@@ -154,6 +156,7 @@ def configure_verbalts_model(
     *,
     device: torch.device,
     longclip_root: Path,
+    cond_modal: str,
     text_output_type: str,
     text_pos_emb: str,
     diff_stage_num: int,
@@ -174,7 +177,7 @@ def configure_verbalts_model(
         diffusion["L_patch_len"] = int(l_patch_len)
 
     cond_cfg["device"] = str(device)
-    cond_cfg["cond_modal"] = "text"
+    cond_cfg["cond_modal"] = cond_modal
     text_cfg = cond_cfg.setdefault("text", {})
     text_cfg["device"] = str(device)
     text_cfg["pretrain_model_path"] = str(longclip_root)

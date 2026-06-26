@@ -540,14 +540,13 @@ def dataset_registry_name(canonical_name: str) -> str:
 
 def contsg_cttp_profile(canonical_name: str, seq_length: int) -> dict[str, Any]:
     if canonical_name == "blindways":
-        patch_len = choose_patch_len(seq_length)
         return {
             "batch_size": 128,
-            "normalize": False,
-            "patch_len": patch_len,
-            "stride": patch_len,
-            "padding": 0,
-            "normalize_embeddings": False,
+            "normalize": True,
+            "patch_len": 32,
+            "stride": 32,
+            "padding": 24,
+            "normalize_embeddings": True,
         }
     if canonical_name == "weather":
         return {

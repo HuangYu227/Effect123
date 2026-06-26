@@ -539,24 +539,59 @@ def dataset_registry_name(canonical_name: str) -> str:
 
 
 def contsg_cttp_profile(canonical_name: str, seq_length: int) -> dict[str, Any]:
-    if canonical_name == "blindways":
-        return {
+    explicit_profiles = {
+        "blindways": {
             "batch_size": 128,
             "normalize": True,
             "patch_len": 32,
             "stride": 32,
             "padding": 24,
             "normalize_embeddings": True,
-        }
-    if canonical_name == "weather":
-        return {
+        },
+        "weather": {
             "batch_size": 256,
             "normalize": True,
             "patch_len": 32,
             "stride": 32,
             "padding": 24,
             "normalize_embeddings": True,
-        }
+        },
+        "ettm1": {
+            "batch_size": 256,
+            "normalize": False,
+            "patch_len": 4,
+            "stride": 4,
+            "padding": 0,
+            "normalize_embeddings": False,
+        },
+        "istanbul_traffic": {
+            "batch_size": 256,
+            "normalize": False,
+            "patch_len": 4,
+            "stride": 4,
+            "padding": 0,
+            "normalize_embeddings": False,
+        },
+        "synth-m": {
+            "batch_size": 256,
+            "normalize": False,
+            "patch_len": 4,
+            "stride": 4,
+            "padding": 0,
+            "normalize_embeddings": False,
+        },
+        "synthetic_u": {
+            "batch_size": 256,
+            "normalize": False,
+            "patch_len": 4,
+            "stride": 4,
+            "padding": 0,
+            "normalize_embeddings": False,
+        },
+    }
+    if canonical_name in explicit_profiles:
+        return explicit_profiles[canonical_name].copy()
+
     patch_len = choose_patch_len(seq_length)
     return {
         "batch_size": 256,

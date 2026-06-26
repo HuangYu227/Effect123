@@ -129,17 +129,14 @@ def main() -> None:
         if args.eval_only:
             checkpoint = resolve_checkpoint(args.checkpoint, output_dir)
             metrics = evaluate_checkpoint(config, checkpoint=checkpoint, contsg_root=contsg_root, eval_batch_size=args.eval_batch_size)
+            write_metrics(output_dir, metrics)
             print_metrics(source_name, checkpoint, metrics)
             continue
         final_checkpoint = train_one(config, contsg_root=contsg_root)
         print(f"[done] {source_name}: {final_checkpoint}")
         if not args.skip_final_eval:
             metrics = evaluate_checkpoint(config, checkpoint=final_checkpoint, contsg_root=contsg_root, eval_batch_size=args.eval_batch_size)
-            write_text(
-                output_dir / "cttp_retrieval_metrics.json",
-                json.dumps(metrics, indent=2, sort_keys=True),
-                overwrite=True,
-            )
+            write_metrics(output_dir, metrics)
             print_metrics(source_name, final_checkpoint, metrics)
 
 
@@ -507,14 +504,24 @@ def print_metrics(dataset: str, checkpoint: Path, metrics: dict[str, Any]) -> No
         values = metrics[split]
         print(
             "[cttp-eval] {split} n={n:.0f} batch_loss={batch_loss:.4f} global_ce={global_ce:.4f} "
-            "ts2text@1={ts2text_top1:.4f} ts2text@5={ts2text_top5:.4f} "
-            "text2ts@1={text2ts_top1:.4f} text2ts@5={text2ts_top5:.4f} "
-            "mrr=({ts2text_mrr:.4f},{text2ts_mrr:.4f}) diag_sim={diag_sim:.4f}".format(
+            "diag_sim={diag_sim:.4f} "
+            "ts2text@1/@5/@10={ts2text_top1:.4f}/{ts2text_top5:.4f}/{ts2text_top10:.4f} "
+            "text2ts@1/@5/@10={text2ts_top1:.4f}/{text2ts_top5:.4f}/{text2ts_top10:.4f} "
+            "mean_rank=({ts2text_mean_rank:.1f},{text2ts_mean_rank:.1f}) "
+            "mrr=({ts2text_mrr:.4f},{text2ts_mrr:.4f})".format(
                 split=split,
                 **values,
             ),
             flush=True,
         )
+
+
+def write_metrics(output_dir: Path, metrics: dict[str, Any]) -> None:
+    write_text(
+        output_dir / "cttp_retrieval_metrics.json",
+        json.dumps(metrics, indent=2, sort_keys=True),
+        overwrite=True,
+    )
 
 
 def dataset_registry_name(canonical_name: str) -> str:

@@ -580,6 +580,14 @@ def contsg_cttp_profile(canonical_name: str, seq_length: int) -> dict[str, Any]:
             "padding": 0,
             "normalize_embeddings": False,
         },
+        "synth-u": {
+            "batch_size": 256,
+            "normalize": False,
+            "patch_len": 4,
+            "stride": 4,
+            "padding": 0,
+            "normalize_embeddings": False,
+        },
         "synthetic_u": {
             "batch_size": 256,
             "normalize": False,

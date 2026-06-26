@@ -362,6 +362,35 @@ def train_one(config: dict[str, Any], *, contsg_root: Path) -> Path:
     from contsg.registry import Registry
     from contsg.train.multi_stage import MultiStageTrainer
 
+    class CTTPEpochMetricsPrinter(pl.Callback):
+        def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+            if trainer.sanity_checking:
+                return
+            metrics = trainer.callback_metrics
+            parts = [f"[cttp-metrics] epoch={trainer.current_epoch + 1}", f"step={trainer.global_step}"]
+            for label, key in (
+                ("train_loss", "train/loss"),
+                ("train_ts2text", "train/ts2text"),
+                ("train_text2ts", "train/text2ts"),
+                ("val_loss", "val/loss"),
+                ("val_acc", "val/acc"),
+                ("grad_norm", "train/grad_norm"),
+                ("grad_norm_max", "train/grad_norm_max"),
+                ("param_norm", "train/param_norm"),
+            ):
+                value = metric_to_float(metrics.get(key))
+                if value is not None:
+                    parts.append(f"{label}={value:.4f}")
+            if trainer.optimizers:
+                parts.append(f"lr={trainer.optimizers[0].param_groups[0]['lr']:.2e}")
+            print(" ".join(parts), flush=True)
+
+    class VerboseCTTPTrainer(MultiStageTrainer):
+        def _build_callbacks(self, stage):  # type: ignore[override]
+            callbacks = super()._build_callbacks(stage)
+            callbacks.append(CTTPEpochMetricsPrinter())
+            return callbacks
+
     cfg = ExperimentConfig(**config)
     cfg = validate_model_config(cfg, strict_schema=False).config
     pl.seed_everything(cfg.seed, workers=True)
@@ -378,8 +407,23 @@ def train_one(config: dict[str, Any], *, contsg_root: Path) -> Path:
     datamodule = dataset_cls(cfg.data, train_config=train_config)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(cfg.output_dir / "model_configs.yaml", cfg.model_dump(mode="json", exclude_none=True), overwrite=True)
-    trainer = MultiStageTrainer(cfg, model_cls, datamodule, checkpoint_root=cfg.output_dir)
+    trainer = VerboseCTTPTrainer(cfg, model_cls, datamodule, checkpoint_root=cfg.output_dir)
     return trainer.train()
+
+
+def metric_to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def resolve_checkpoint(explicit: Path | None, output_dir: Path) -> Path:

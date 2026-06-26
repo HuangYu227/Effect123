@@ -187,6 +187,7 @@ def convert_dataset(
 ) -> tuple[int, int, int]:
     target_dir.mkdir(parents=True, exist_ok=True)
     split_shapes: dict[str, tuple[int, int, int]] = {}
+    train_stats: dict[str, np.ndarray] | None = None
     for split in SPLITS:
         ts, attrs, caps = load_split(source_dir, split)
         ts_out, attrs_out, caps_out = select_captions(
@@ -197,10 +198,19 @@ def convert_dataset(
             seed=seed + {"train": 0, "valid": 10_000, "test": 20_000}[split],
         )
         split_shapes[split] = tuple(int(x) for x in ts_out.shape)
-        save_array(target_dir / f"{split}_ts.npy", ts_out.astype(np.float32), overwrite)
+        ts_out = ts_out.astype(np.float32)
+        if split == "train":
+            mean = ts_out.mean(axis=(0, 1), keepdims=True)
+            std = ts_out.std(axis=(0, 1), keepdims=True)
+            std = np.where(std == 0, 1.0, std).astype(np.float32)
+            train_stats = {"mean": mean.astype(np.float32), "std": std}
+        save_array(target_dir / f"{split}_ts.npy", ts_out, overwrite)
         save_array(target_dir / f"{split}_attrs_idx.npy", attrs_out, overwrite)
         save_array(target_dir / f"{split}_caps.npy", caps_out.astype(object), overwrite)
         save_array(target_dir / f"{split}_text_caps.npy", caps_out.astype(object), overwrite)
+
+    if train_stats is not None:
+        save_npz(target_dir / "normalization_stats.npz", train_stats, overwrite)
 
     meta = load_meta(source_dir)
     meta.update(
@@ -279,8 +289,8 @@ def build_config(
     n_var: int,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    batch_size = args.batch_size or choose_batch_size(seq_length, n_var)
-    patch_len = choose_patch_len(seq_length)
+    profile = contsg_cttp_profile(canonical_name, seq_length)
+    batch_size = args.batch_size or profile["batch_size"] or choose_batch_size(seq_length, n_var)
     registry_name = dataset_registry_name(canonical_name)
     return {
         "seed": args.seed,
@@ -311,16 +321,16 @@ def build_config(
             "data_folder": str(data_dir),
             "n_var": int(n_var),
             "seq_length": int(seq_length),
-            "normalize": False,
+            "normalize": profile["normalize"],
         },
         "model": {
             "name": "cttp",
             "mode": "instance",
             "d_model": 64,
             "coemb_dim": 512,
-            "patch_len": patch_len,
-            "stride": patch_len,
-            "padding": 0,
+            "patch_len": profile["patch_len"],
+            "stride": profile["stride"],
+            "padding": profile["padding"],
             "d_ff": 256,
             "e_layers": 2,
             "factor": 1,
@@ -332,7 +342,7 @@ def build_config(
             "pretrain_model_dim": 768,
             "loss_type": "ce",
             "temperature": 0.07,
-            "normalize_embeddings": False,
+            "normalize_embeddings": profile["normalize_embeddings"],
             "ts_encoder_type": "patchtst_mae",
         },
         "condition": {
@@ -528,6 +538,27 @@ def dataset_registry_name(canonical_name: str) -> str:
     return f"verbalts_{canonical_name}"
 
 
+def contsg_cttp_profile(canonical_name: str, seq_length: int) -> dict[str, Any]:
+    if canonical_name == "weather":
+        return {
+            "batch_size": 128,
+            "normalize": True,
+            "patch_len": 32,
+            "stride": 32,
+            "padding": 24,
+            "normalize_embeddings": True,
+        }
+    patch_len = choose_patch_len(seq_length)
+    return {
+        "batch_size": None,
+        "normalize": False,
+        "patch_len": patch_len,
+        "stride": patch_len,
+        "padding": 0,
+        "normalize_embeddings": False,
+    }
+
+
 def choose_patch_len(seq_length: int) -> int:
     if seq_length <= 160:
         return 4
@@ -559,6 +590,13 @@ def save_array(path: Path, value: np.ndarray, overwrite: bool) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, value)
+
+
+def save_npz(path: Path, values: dict[str, np.ndarray], overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **values)
 
 
 def write_text(path: Path, text: str, *, overwrite: bool) -> None:

@@ -394,7 +394,7 @@ def train_one(config: dict[str, Any], *, contsg_root: Path) -> Path:
     cfg = ExperimentConfig(**config)
     cfg = validate_model_config(cfg, strict_schema=False).config
     pl.seed_everything(cfg.seed, workers=True)
-    model_cls = Registry.get_model(cfg.model.name)
+    model_cls = make_configured_optimizer_model(Registry.get_model(cfg.model.name))
     dataset_cls = Registry.get_dataset(cfg.data.name)
     train_config = {
         "batch_size": cfg.train.batch_size,
@@ -424,6 +424,75 @@ def metric_to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def make_configured_optimizer_model(model_cls):
+    class ConfiguredOptimizerModel(model_cls):
+        def configure_optimizers(self):
+            import torch
+
+            train_cfg = self.config.train
+            weight_decay = float(getattr(train_cfg, "weight_decay", 1e-6))
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=weight_decay,
+            )
+            scheduler_name = str(getattr(train_cfg, "scheduler", "none")).lower()
+            if scheduler_name == "none":
+                return optimizer
+
+            params = getattr(train_cfg, "scheduler_params", {}) or {}
+            if scheduler_name == "cosine":
+                t_max = int(getattr(self.trainer, "max_epochs", 0) or getattr(train_cfg, "epochs", 1) or 1)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, t_max),
+                    eta_min=float(params.get("eta_min", 0.0)),
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "epoch",
+                        "frequency": 1,
+                    },
+                }
+            if scheduler_name == "step":
+                scheduler = torch.optim.lr_scheduler.StepLR(
+                    optimizer,
+                    step_size=int(params.get("step_size", 30)),
+                    gamma=float(params.get("gamma", 0.1)),
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "epoch",
+                        "frequency": 1,
+                    },
+                }
+            if scheduler_name == "plateau":
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode=str(params.get("mode", "min")),
+                    factor=float(params.get("factor", 0.1)),
+                    patience=int(params.get("patience", 10)),
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "monitor": str(params.get("monitor", "val/loss")),
+                        "interval": "epoch",
+                        "frequency": 1,
+                    },
+                }
+            raise ValueError(f"Unsupported CTTP scheduler: {scheduler_name}")
+
+    ConfiguredOptimizerModel.__name__ = f"ConfiguredOptimizer{model_cls.__name__}"
+    ConfiguredOptimizerModel.__qualname__ = ConfiguredOptimizerModel.__name__
+    return ConfiguredOptimizerModel
 
 
 def resolve_checkpoint(explicit: Path | None, output_dir: Path) -> Path:

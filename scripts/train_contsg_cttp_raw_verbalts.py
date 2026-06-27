@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,16 +14,6 @@ from torch.utils.data import DataLoader, Dataset
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from scripts.train_contsg_verbalts_cttp import (
-    make_configured_optimizer_model,
-    metric_to_float,
-    print_metrics,
-    retrieval_metrics,
-    setup_contsg,
-    write_metrics,
-    write_yaml,
-)
 
 try:
     import pytorch_lightning as pl
@@ -707,6 +698,183 @@ def official_profile(canonical_name: str) -> dict[str, Any]:
 
 def split_offset(split: str) -> int:
     return {"train": 0, "valid": 10_000, "test": 20_000}[split]
+
+
+def setup_contsg(contsg_root: Path) -> None:
+    if str(contsg_root) not in sys.path:
+        sys.path.insert(0, str(contsg_root))
+    try:
+        import contsg.models  # noqa: F401
+        import contsg.data.datasets  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Unable to import ConTSG. Install ConTSG dependencies first, e.g. "
+            "`cd <ConTSG-Bench> && pip install -e \".[full,dev]\"`."
+        ) from exc
+
+
+def make_configured_optimizer_model(model_cls):
+    class ConfiguredOptimizerModel(model_cls):
+        def configure_optimizers(self):
+            train_cfg = self.config.train
+            weight_decay = float(getattr(train_cfg, "weight_decay", 1e-6))
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=weight_decay,
+            )
+            scheduler_name = str(getattr(train_cfg, "scheduler", "none")).lower()
+            if scheduler_name == "none":
+                return optimizer
+
+            params = getattr(train_cfg, "scheduler_params", {}) or {}
+            if scheduler_name == "cosine":
+                t_max = int(getattr(self.trainer, "max_epochs", 0) or getattr(train_cfg, "epochs", 1) or 1)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, t_max),
+                    eta_min=float(params.get("eta_min", 0.0)),
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "epoch",
+                        "frequency": 1,
+                    },
+                }
+            if scheduler_name == "step":
+                scheduler = torch.optim.lr_scheduler.StepLR(
+                    optimizer,
+                    step_size=int(params.get("step_size", 30)),
+                    gamma=float(params.get("gamma", 0.1)),
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "epoch",
+                        "frequency": 1,
+                    },
+                }
+            if scheduler_name == "plateau":
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode=str(params.get("mode", "min")),
+                    factor=float(params.get("factor", 0.1)),
+                    patience=int(params.get("patience", 10)),
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "monitor": str(params.get("monitor", "val/loss")),
+                        "interval": "epoch",
+                        "frequency": 1,
+                    },
+                }
+            raise ValueError(f"Unsupported CTTP scheduler: {scheduler_name}")
+
+    ConfiguredOptimizerModel.__name__ = f"ConfiguredOptimizer{model_cls.__name__}"
+    ConfiguredOptimizerModel.__qualname__ = ConfiguredOptimizerModel.__name__
+    return ConfiguredOptimizerModel
+
+
+def metric_to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def retrieval_metrics(model, loader, *, device) -> dict[str, float]:
+    ts_embeddings = []
+    text_embeddings = []
+    raw_losses = []
+    n_items = 0
+    for batch in loader:
+        ts = batch["ts"].to(device).float()
+        text = [str(value) for value in batch["cap"]]
+        loss_dict = model({"ts": ts, "cap": text})
+        raw_losses.append(float(loss_dict["loss"].detach().cpu()) * int(ts.shape[0]))
+        ts_embeddings.append(model.get_global_ts_embedding(ts).detach().cpu())
+        text_embeddings.append(model.get_text_embedding(text).detach().cpu())
+        n_items += int(ts.shape[0])
+
+    if n_items == 0:
+        raise ValueError("Cannot evaluate an empty split")
+    ts_emb = torch.cat(ts_embeddings, dim=0)
+    text_emb = torch.cat(text_embeddings, dim=0)
+    sim = torch.mm(ts_emb, text_emb.t())
+    labels = torch.arange(sim.shape[0])
+    return {
+        "n": float(sim.shape[0]),
+        "batch_loss": float(sum(raw_losses) / n_items),
+        "global_ce": float((torch.nn.functional.cross_entropy(sim, labels) + torch.nn.functional.cross_entropy(sim.t(), labels)) / 2.0),
+        "diag_sim": float(sim.diag().mean()),
+        **rank_metrics(sim, labels, prefix="ts2text"),
+        **rank_metrics(sim.t(), labels, prefix="text2ts"),
+    }
+
+
+def rank_metrics(sim, labels, *, prefix: str) -> dict[str, float]:
+    order = torch.argsort(sim, dim=1, descending=True)
+    matches = order.eq(labels[:, None])
+    ranks = matches.float().argmax(dim=1) + 1
+    return {
+        f"{prefix}_top1": float((ranks <= 1).float().mean()),
+        f"{prefix}_top5": float((ranks <= 5).float().mean()),
+        f"{prefix}_top10": float((ranks <= 10).float().mean()),
+        f"{prefix}_mean_rank": float(ranks.float().mean()),
+        f"{prefix}_mrr": float((1.0 / ranks.float()).mean()),
+    }
+
+
+def print_metrics(dataset: str, checkpoint: Path, metrics: dict[str, Any]) -> None:
+    print(f"[cttp-eval] {dataset}: {checkpoint}", flush=True)
+    for split in ("valid", "test"):
+        values = metrics[split]
+        print(
+            "[cttp-eval] {split} n={n:.0f} batch_loss={batch_loss:.4f} global_ce={global_ce:.4f} "
+            "diag_sim={diag_sim:.4f} "
+            "ts2text@1/@5/@10={ts2text_top1:.4f}/{ts2text_top5:.4f}/{ts2text_top10:.4f} "
+            "text2ts@1/@5/@10={text2ts_top1:.4f}/{text2ts_top5:.4f}/{text2ts_top10:.4f} "
+            "mean_rank=({ts2text_mean_rank:.1f},{text2ts_mean_rank:.1f}) "
+            "mrr=({ts2text_mrr:.4f},{text2ts_mrr:.4f})".format(
+                split=split,
+                **values,
+            ),
+            flush=True,
+        )
+
+
+def write_metrics(output_dir: Path, metrics: dict[str, Any]) -> None:
+    write_text(
+        output_dir / "cttp_retrieval_metrics.json",
+        json.dumps(metrics, indent=2, sort_keys=True),
+        overwrite=True,
+    )
+
+
+def write_text(path: Path, text: str, *, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+def write_yaml(path: Path, data: dict[str, Any], *, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        return
+    write_text(path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True), overwrite=True)
 
 
 if __name__ == "__main__":

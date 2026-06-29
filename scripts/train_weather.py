@@ -23,7 +23,11 @@ from effectcma_flow.data import (
 )
 from effectcma_flow.evaluation.metrics import average_metric_dicts, compute_field_metrics, compute_metrics, compute_text2ts_metrics
 from effectcma_flow.evaluation import contsg_metrics
-from effectcma_flow.evaluation.checkpoint_proxy import JointProxyCheckpointSelector, joint_f1
+from effectcma_flow.evaluation.checkpoint_proxy import (
+    CTTPSummaryProxyCheckpointSelector,
+    JointProxyCheckpointSelector,
+    joint_f1,
+)
 from effectcma_flow.evaluation.sampler import euler_sample, sample_text2ts
 from effectcma_flow.evaluation.verbalts_metrics import VerbalTSMetricComputer
 from effectcma_flow.models import build_model
@@ -53,6 +57,8 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--proxy-verbalts-root", default=None, help="VerbalTS repository used by joint proxy checkpoint selection")
     parser.add_argument("--proxy-clip-folder", default=None, help="CTTP folder containing model_configs.yaml and clip_model_best.pth")
+    parser.add_argument("--proxy-contsg-root", default=None, help="ConTSG-Bench repository used by contsg proxy checkpoint selection")
+    parser.add_argument("--proxy-cttp-text-encoder-model", default=None, help="LongCLIP directory used by ConTSG CTTP proxy")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -91,6 +97,10 @@ def main() -> None:
         cfg.setdefault("checkpoint_selection", {})["verbalts_root"] = args.proxy_verbalts_root
     if args.proxy_clip_folder is not None:
         cfg.setdefault("checkpoint_selection", {})["clip_folder"] = args.proxy_clip_folder
+    if args.proxy_contsg_root is not None:
+        cfg.setdefault("checkpoint_selection", {})["contsg_root"] = args.proxy_contsg_root
+    if args.proxy_cttp_text_encoder_model is not None:
+        cfg.setdefault("checkpoint_selection", {})["cttp_text_encoder_model"] = args.proxy_cttp_text_encoder_model
     resolve_data_root(cfg, args.data_root)
     run_train(cfg)
 
@@ -164,8 +174,8 @@ def run_train(cfg: dict) -> None:
     save_every = int(cfg["train"].get("save_every", eval_every))
     selection_cfg = cfg.get("checkpoint_selection", {})
     selection_mode = str(selection_cfg.get("mode", "none")).lower()
-    if selection_mode not in {"none", "joint_proxy", "legacy"}:
-        raise ValueError("checkpoint_selection.mode must be 'none', 'joint_proxy', or 'legacy'")
+    if selection_mode not in {"none", "joint_proxy", "contsg_proxy", "legacy"}:
+        raise ValueError("checkpoint_selection.mode must be 'none', 'joint_proxy', 'contsg_proxy', or 'legacy'")
     best_metric = str(cfg["train"].get("best_metric", "mse"))
     best_metric_mode = str(cfg["train"].get("best_metric_mode", "auto"))
     allow_best_metric_fallback = bool(cfg["train"].get("allow_best_metric_fallback", False))
@@ -183,6 +193,19 @@ def run_train(cfg: dict) -> None:
         proxy_selector = JointProxyCheckpointSelector(
             mdd_threshold=float(selection_cfg.get("mdd_threshold", 0.012)),
             joint_f1_tolerance=float(selection_cfg.get("joint_f1_tolerance", 0.002)),
+        )
+    elif selection_mode == "contsg_proxy":
+        if task_mode != "text2ts":
+            raise ValueError("checkpoint_selection.mode='contsg_proxy' currently requires task.mode='text2ts'")
+        proxy_every = int(selection_cfg.get("every", 1000))
+        if proxy_every <= 0:
+            raise ValueError("checkpoint_selection.every must be positive")
+        proxy_evaluator = _TrainingCTTPProxyEvaluator(cfg, stats=stats, device=device, backend="contsg")
+        proxy_selector = CTTPSummaryProxyCheckpointSelector(
+            metric=str(selection_cfg.get("metric", "fid_jftsd_cttp_joint")),
+            cttp_weight=float(selection_cfg.get("metric_cttp_weight", 0.5)),
+            joint_f1_weight=float(selection_cfg.get("metric_joint_f1_weight", 10.0)),
+            tolerance=float(selection_cfg.get("metric_tolerance", 0.0)),
         )
     step = 0
     progress = tqdm(total=max_steps, desc="train", dynamic_ncols=True)
@@ -386,36 +409,69 @@ def run_train(cfg: dict) -> None:
                 step % proxy_every == 0 or step == max_steps
             ):
                 proxy_metrics = proxy_evaluator.compute(model)
-                proxy_metrics["JointF1"] = joint_f1(
-                    proxy_metrics["JointPrecision"], proxy_metrics["JointRecall"]
-                )
-                progress.write(json.dumps({"step": step, "joint_proxy": proxy_metrics}, ensure_ascii=False))
-                decision = proxy_selector.consider(proxy_metrics, step=step)
-                if decision.selected:
-                    selection = {"type": "joint_proxy", **decision.as_dict()}
-                    save_checkpoint(
-                        checkpoint_dir / "best_joint_proxy.pt",
-                        model,
-                        optimizer,
-                        cfg,
-                        stats,
-                        step,
-                        selection=selection,
+                if selection_mode == "joint_proxy":
+                    proxy_metrics["JointF1"] = joint_f1(
+                        proxy_metrics["JointPrecision"], proxy_metrics["JointRecall"]
                     )
-                    _write_json_atomic(
-                        checkpoint_dir / "best_joint_proxy.json",
-                        {"selection": selection, "metrics": proxy_metrics},
-                    )
-                    progress.write(
-                        f"[checkpoint] saved best_joint_proxy.pt at step {step} "
-                        f"(JointF1={decision.joint_f1:.6f}, MDD={decision.mdd:.6f}, reason={decision.reason})"
-                    )
+                    progress.write(json.dumps({"step": step, "joint_proxy": proxy_metrics}, ensure_ascii=False))
+                    decision = proxy_selector.consider(proxy_metrics, step=step)
+                    if decision.selected:
+                        selection = {"type": "joint_proxy", **decision.as_dict()}
+                        save_checkpoint(
+                            checkpoint_dir / "best_joint_proxy.pt",
+                            model,
+                            optimizer,
+                            cfg,
+                            stats,
+                            step,
+                            selection=selection,
+                        )
+                        _write_json_atomic(
+                            checkpoint_dir / "best_joint_proxy.json",
+                            {"selection": selection, "metrics": proxy_metrics},
+                        )
+                        progress.write(
+                            f"[checkpoint] saved best_joint_proxy.pt at step {step} "
+                            f"(JointF1={decision.joint_f1:.6f}, MDD={decision.mdd:.6f}, reason={decision.reason})"
+                        )
+                    else:
+                        progress.write(
+                            f"[checkpoint] joint proxy kept step {proxy_selector.best_step}; "
+                            f"candidate step {step} rejected ({decision.reason}, "
+                            f"JointF1={decision.joint_f1:.6f}, MDD={decision.mdd:.6f})"
+                        )
                 else:
-                    progress.write(
-                        f"[checkpoint] joint proxy kept step {proxy_selector.best_step}; "
-                        f"candidate step {step} rejected ({decision.reason}, "
-                        f"JointF1={decision.joint_f1:.6f}, MDD={decision.mdd:.6f})"
-                    )
+                    decision = proxy_selector.consider(proxy_metrics, step=step)
+                    proxy_metrics["ProxyScore"] = decision.score
+                    proxy_metrics["JointF1"] = decision.joint_f1
+                    progress.write(json.dumps({"step": step, "contsg_proxy": proxy_metrics}, ensure_ascii=False))
+                    if decision.selected:
+                        selection = {"type": "contsg_proxy", **decision.as_dict()}
+                        save_checkpoint(
+                            checkpoint_dir / "best_contsg_proxy.pt",
+                            model,
+                            optimizer,
+                            cfg,
+                            stats,
+                            step,
+                            selection=selection,
+                        )
+                        _write_json_atomic(
+                            checkpoint_dir / "best_contsg_proxy.json",
+                            {"selection": selection, "metrics": proxy_metrics},
+                        )
+                        progress.write(
+                            f"[checkpoint] saved best_contsg_proxy.pt at step {step} "
+                            f"(score={decision.score:.6f}, FID={decision.fid:.6f}, "
+                            f"J-FTSD={decision.jftsd:.6f}, CTTP={decision.cttp:.6f}, "
+                            f"JointF1={decision.joint_f1:.6f}, reason={decision.reason})"
+                        )
+                    else:
+                        progress.write(
+                            f"[checkpoint] contsg proxy kept step {proxy_selector.best_step}; "
+                            f"candidate step {step} rejected ({decision.reason}, "
+                            f"score={decision.score:.6f}, best={proxy_selector.best_score:.6f})"
+                        )
             if step >= max_steps:
                 break
     progress.close()
@@ -562,6 +618,129 @@ class _TrainingJointProxyEvaluator:
                 guidance_t_lo=float(self.selection.get("guidance_t_lo", self.cfg.get("sample", {}).get("guidance_t_lo", 0.0))),
                 guidance_t_hi=float(self.selection.get("guidance_t_hi", self.cfg.get("sample", {}).get("guidance_t_hi", 1.0))),
                 n_samples=int(self.selection.get("n_samples", 1)),
+                caption_slot_strategy=str(self.cfg.get("train", {}).get("caption_slot_strategy", "single")),
+                max_caption_slots=int(self.cfg.get("train", {}).get("max_caption_slots", 1)),
+                include_all_caption_candidates=bool(
+                    self.cfg.get("train", {}).get("include_all_caption_candidates", False)
+                ),
+                reference_series_key="ts",
+                reference_text_key="caption",
+                generated_text_key="caption",
+                reference_denormalize=False,
+                reference_max_batches=self.reference_max_batches,
+                generated_max_batches=self.generated_max_batches,
+                cache_dir=self.cache_dir,
+                cache_metadata=self.cache_metadata,
+            )
+        return {key: float(value) for key, value in metrics.items()}
+
+
+class _TrainingCTTPProxyEvaluator:
+    """Bounded CTTP-backed validation proxy for checkpoint ranking."""
+
+    def __init__(self, cfg: dict, *, stats: dict, device: torch.device, backend: str) -> None:
+        selection = cfg.get("checkpoint_selection", {})
+        backend = str(backend).lower()
+        if backend != "contsg":
+            raise ValueError("_TrainingCTTPProxyEvaluator currently supports only backend='contsg'")
+
+        contsg_root = _required_proxy_path(selection, "contsg_root")
+        clip_folder = _required_proxy_path(selection, "clip_folder")
+        text_encoder_model = _required_proxy_path(selection, "cttp_text_encoder_model")
+        clip_config = clip_folder / "model_configs.yaml"
+        clip_model = clip_folder / "clip_model_best.pth"
+        for path in (contsg_root, text_encoder_model, clip_config, clip_model):
+            if not path.exists():
+                raise FileNotFoundError(f"{backend} proxy dependency not found: {path}")
+
+        batch_size = int(selection.get("batch_size", 256))
+        if batch_size <= 0:
+            raise ValueError("checkpoint_selection.batch_size must be positive")
+        root = cfg["data"]["root"]
+        common = {
+            "window_length": cfg["data"].get("window_length"),
+            "include_precomputed_embeddings": False,
+        }
+        reference_ds = WeatherRawCaptionDataset(
+            root,
+            "train",
+            normalize=False,
+            seed=int(cfg["data"].get("seed", 0)) + 40_000,
+            caption_policy="random",
+            **common,
+        )
+        generated_ds = WeatherRawCaptionDataset(
+            root,
+            "valid",
+            normalize=bool(cfg["data"].get("normalize", True)),
+            stats=stats,
+            seed=int(cfg["data"].get("seed", 0)) + 20_000,
+            caption_policy="cyclic",
+            **common,
+        )
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "num_workers": 0,
+            "pin_memory": device.type == "cuda",
+            "collate_fn": collate_raw_caption_batch,
+        }
+        self.reference_loader = DataLoader(reference_ds, **loader_kwargs)
+        self.generated_loader = DataLoader(generated_ds, **loader_kwargs)
+        self.computer = VerbalTSMetricComputer(
+            verbalts_root=None,
+            clip_config_path=clip_config,
+            clip_model_path=clip_model,
+            device=device,
+            stats=stats,
+            cttp_backend=backend,
+            contsg_root=contsg_root,
+            cttp_text_encoder_model=text_encoder_model,
+        )
+        self.cfg = cfg
+        self.selection = selection
+        self.device = device
+        self.reference_max_batches = _none_if_nonpositive(selection.get("reference_max_batches", 0))
+        self.generated_max_batches = _none_if_nonpositive(selection.get("generated_max_batches", 3))
+        if self.generated_max_batches is None:
+            raise ValueError("checkpoint_selection.generated_max_batches must be positive for bounded proxy evaluation")
+        self.seed = int(cfg["data"].get("seed", 0)) + int(selection.get("seed_offset", 70_000))
+        self.cache_dir = Path(selection.get("cache_dir", f"cache/{backend}_checkpoint_proxy"))
+        self.cache_metadata = {
+            "metric_protocol": f"{backend}_raw_caption_proxy",
+            "cttp_backend": backend,
+            "cttp_text_encoder_model": str(text_encoder_model),
+            "data_root": str(Path(root).resolve()),
+            "window_length": cfg["data"].get("window_length"),
+            "reference_split": "train",
+            "generated_split": "valid",
+            "reference_seed": int(cfg["data"].get("seed", 0)) + 40_000,
+            "clip_config": _file_fingerprint(clip_config),
+            "clip_model": _file_fingerprint(clip_model),
+        }
+
+    @torch.no_grad()
+    def compute(self, model) -> dict[str, float]:
+        cuda_devices: list[int] = []
+        if self.device.type == "cuda":
+            cuda_devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+            torch.manual_seed(self.seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed_all(self.seed)
+            metrics = self.computer.compute(
+                model=model,
+                reference_loader=self.reference_loader,
+                generated_loader=self.generated_loader,
+                text_encoder_mode=str(self.cfg["text_encoder"].get("mode", "hash")),
+                steps=int(self.selection.get("steps", 32)),
+                solver=str(self.selection.get("solver", "rk4")),
+                task_mode="text2ts",
+                noise_scale=float(self.selection.get("noise_scale", self.cfg.get("sample", {}).get("noise_scale", 1.0))),
+                cfg_scale=float(self.selection.get("cfg_scale", self.cfg.get("sample", {}).get("cfg_scale", 1.0))),
+                guidance_t_lo=float(self.selection.get("guidance_t_lo", self.cfg.get("sample", {}).get("guidance_t_lo", 0.0))),
+                guidance_t_hi=float(self.selection.get("guidance_t_hi", self.cfg.get("sample", {}).get("guidance_t_hi", 1.0))),
+                n_samples=int(self.selection.get("n_samples", 2)),
                 caption_slot_strategy=str(self.cfg.get("train", {}).get("caption_slot_strategy", "single")),
                 max_caption_slots=int(self.cfg.get("train", {}).get("max_caption_slots", 1)),
                 include_all_caption_candidates=bool(

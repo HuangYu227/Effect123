@@ -64,28 +64,28 @@ model:
   bridge_token_budget: 128
   bridge_alignment_mode: siglip
   bridge_alignment_dense: true
-  bridge_alignment_regions: 8
+  bridge_alignment_regions: 12
   bridge_alignment_target: clean
   bridge_alignment_clean_prob: 1.0
   bridge_diagnostics: false
-  bridge_text_agg_tokens: 8
+  bridge_text_agg_tokens: 12
 
-  temporal_pyramid_patch_lens: [4, 8, 16, 32]
+  temporal_pyramid_patch_lens: [4, 12, 36]
   temporal_pyramid_token_budget: 128
   temporal_pyramid_anchor_tokens: 8
   temporal_pyramid_cross_scale_layers: 2
-  temporal_pyramid_dropout: 0.05
+  temporal_pyramid_dropout: 0.03
   temporal_pyramid_use_topdown: true
   temporal_pyramid_use_bottomup: true
   temporal_pyramid_use_text_routing: true
   temporal_pyramid_temporal_bias_tau: 0.25
-  temporal_pyramid_gate_temperature: 0.7
+  temporal_pyramid_gate_temperature: 0.55
 
   use_spectral_prompt: true
   spectral_prompt_bands: 3
   spectral_prompt_heads: 4
-  spectral_prompt_dropout: 0.05
-  spectral_prompt_gate_temperature: 0.7
+  spectral_prompt_dropout: 0.03
+  spectral_prompt_gate_temperature: 0.55
   spectral_prompt_residual_gate: true
 
   use_latent_regime_adapter: false
@@ -129,12 +129,12 @@ train:
   include_all_caption_candidates: false
   routing_loss_weight: 0.0
   regime_ortho_weight: 0.0
-  bridge_alignment_weight: 0.08
-  caption_ranking_weight: 0.02
-  caption_ranking_margin: 0.10
-  operator_balance_weight: 0.02
-  condition_dropout_prob: 0.10
-  spectral_loss_weight: 0.15
+  bridge_alignment_weight: 0.06
+  caption_ranking_weight: 0.004
+  caption_ranking_margin: 0.08
+  operator_balance_weight: 0.008
+  condition_dropout_prob: 0.08
+  spectral_loss_weight: 0.09
   spectral_loss_type: normalized_mrfft
   spectral_fft_sizes: [16, 32, 64, 128]
   spectral_distance: l1
@@ -160,8 +160,8 @@ train:
 
 sample:
   solver: rk4
-  steps: 32
+  steps: 48
   noise_scale: 1.0
-  cfg_scale: 2.0
+  cfg_scale: 2.5
   guidance_t_lo: 0.0
   guidance_t_hi: 1.0

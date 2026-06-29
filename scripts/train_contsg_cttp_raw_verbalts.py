@@ -364,7 +364,7 @@ def main() -> None:
     parser.add_argument("--padding", type=int, default=None)
     parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--normalize-embeddings", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--loss-type", choices=("ce", "contrastive", "supcon"), default="ce")
+    parser.add_argument("--loss-type", choices=("ce", "contrastive", "supcon", "attr_multipos_ce"), default="ce")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--skip-final-eval", action="store_true")
     parser.add_argument("--eval-only", action="store_true")
@@ -426,6 +426,7 @@ def main() -> None:
         train_caption_policy=args.train_caption_policy,
         eval_caption_policy=args.eval_caption_policy,
         eval_batch_size=args.eval_batch_size,
+        requested_loss_type=str(args.loss_type).lower(),
     )
     print(f"[done] {canonical_name}: {checkpoint}", flush=True)
     if not args.skip_final_eval:
@@ -447,6 +448,7 @@ def train_one_raw(
     train_caption_policy: str,
     eval_caption_policy: str,
     eval_batch_size: int | None,
+    requested_loss_type: str,
 ) -> Path:
     setup_contsg(contsg_root)
     import pytorch_lightning as pl
@@ -467,6 +469,8 @@ def train_one_raw(
                 ("train_text2ts", "train/text2ts"),
                 ("val_loss", "val/loss"),
                 ("val_acc", "val/acc"),
+                ("val_attr_acc", "val/attr_acc"),
+                ("val_exact_acc", "val/exact_acc"),
                 ("grad_norm", "train/grad_norm"),
                 ("grad_norm_max", "train/grad_norm_max"),
                 ("param_norm", "train/param_norm"),
@@ -496,9 +500,13 @@ def train_one_raw(
         "seed": cfg.seed,
         "train_caption_policy": train_caption_policy,
         "eval_caption_policy": eval_caption_policy,
+        "requested_loss_type": requested_loss_type,
     }
     datamodule = VerbalTSRawCTTPDataModule(cfg.data, train_config=train_config)
-    model_cls = make_configured_optimizer_model(Registry.get_model(cfg.model.name))
+    model_cls = make_configured_optimizer_model(
+        Registry.get_model(cfg.model.name),
+        requested_loss_type=requested_loss_type,
+    )
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(cfg.output_dir / "model_configs.yaml", cfg.model_dump(mode="json", exclude_none=True), overwrite=True)
     write_yaml(
@@ -508,6 +516,7 @@ def train_one_raw(
             "eval_caption_policy": eval_caption_policy,
             "eval_batch_size": eval_batch_size,
             "data_folder": str(cfg.data.data_folder),
+            "requested_loss_type": requested_loss_type,
         },
         overwrite=True,
     )
@@ -639,7 +648,7 @@ def build_raw_config(
             "textemb_hidden_dim": 1024,
             "pretrain_model_path": str(longclip_root),
             "pretrain_model_dim": 768,
-            "loss_type": str(args.loss_type).lower(),
+            "loss_type": schema_loss_type(str(args.loss_type).lower()),
             "temperature": float(args.temperature),
             "normalize_embeddings": normalize_embeddings,
             "ts_encoder_type": "patchtst_mae",
@@ -696,6 +705,12 @@ def official_profile(canonical_name: str) -> dict[str, Any]:
     return OFFICIAL_VERBALTS_CTTP_PROFILES[canonical_name].copy()
 
 
+def schema_loss_type(loss_type: str) -> str:
+    if loss_type == "attr_multipos_ce":
+        return "ce"
+    return loss_type
+
+
 def split_offset(split: str) -> int:
     return {"train": 0, "valid": 10_000, "test": 20_000}[split]
 
@@ -713,8 +728,79 @@ def setup_contsg(contsg_root: Path) -> None:
         ) from exc
 
 
-def make_configured_optimizer_model(model_cls):
+def positive_mask_from_attrs(attrs: torch.Tensor, *, device: torch.device | None = None) -> torch.Tensor:
+    if device is not None:
+        attrs = attrs.to(device)
+    if attrs.ndim == 1:
+        attrs = attrs[:, None]
+    return attrs[:, None, :].eq(attrs[None, :, :]).all(dim=-1)
+
+
+def multi_positive_ce(sim: torch.Tensor, pos_mask: torch.Tensor) -> torch.Tensor:
+    if sim.shape != pos_mask.shape:
+        raise ValueError(f"sim and pos_mask shape mismatch: {tuple(sim.shape)} vs {tuple(pos_mask.shape)}")
+    pos_mask = pos_mask.to(device=sim.device, dtype=torch.bool)
+    pos_logits = sim.masked_fill(~pos_mask, float("-inf"))
+    log_num = torch.logsumexp(pos_logits, dim=1)
+    log_den = torch.logsumexp(sim, dim=1)
+    return -(log_num - log_den).mean()
+
+
+def make_configured_optimizer_model(model_cls, *, requested_loss_type: str = "ce"):
     class ConfiguredOptimizerModel(model_cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.raw_verbalts_loss_type = str(requested_loss_type).lower()
+
+        def _forward_instance(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+            if self.raw_verbalts_loss_type != "attr_multipos_ce":
+                return super()._forward_instance(batch)
+            if "attrs" not in batch:
+                raise ValueError("attr_multipos_ce requires attrs_idx.npy so batches contain an 'attrs' tensor")
+
+            ts = batch["ts"]
+            ts_co_emb = self.ts_enc(ts)
+            ts_co_emb = self._maybe_normalize(ts_co_emb)
+
+            text = batch["cap"]
+            text_co_emb = self.text_enc(text)
+            text_co_emb = self._maybe_normalize(text_co_emb)
+
+            sim = torch.mm(ts_co_emb, text_co_emb.t())
+            pos_mask = positive_mask_from_attrs(batch["attrs"], device=sim.device)
+
+            ts2text = multi_positive_ce(sim, pos_mask)
+            text2ts = multi_positive_ce(sim.t(), pos_mask.t())
+            return {
+                "ts2text": ts2text,
+                "text2ts": text2ts,
+                "positive_count": pos_mask.float().sum(dim=1).mean(),
+                "loss": (ts2text + text2ts) / 2,
+            }
+
+        def validation_step(self, batch: dict[str, Any], batch_idx: int):
+            if self.raw_verbalts_loss_type != "attr_multipos_ce" or "attrs" not in batch:
+                return super().validation_step(batch, batch_idx)
+
+            loss_dict = self(batch)
+            self.log("val/loss", loss_dict["loss"], prog_bar=True)
+
+            ts = batch["ts"]
+            text = batch["cap"]
+            ts_emb = self.get_ts_embedding(ts)
+            text_emb = self.get_text_embedding(text)
+            sim = torch.mm(ts_emb, text_emb.t())
+            pred = torch.argmax(sim, dim=-1)
+            gt = torch.arange(ts.shape[0], device=sim.device)
+            exact_acc = (pred == gt).float().mean()
+            pos_mask = positive_mask_from_attrs(batch["attrs"], device=sim.device)
+            attr_acc = pos_mask[gt, pred].float().mean()
+
+            self.log("val/acc", attr_acc, prog_bar=True)
+            self.log("val/attr_acc", attr_acc)
+            self.log("val/exact_acc", exact_acc)
+            return {"loss": loss_dict["loss"], "acc": attr_acc, "exact_acc": exact_acc}
+
         def configure_optimizers(self):
             train_cfg = self.config.train
             weight_decay = float(getattr(train_cfg, "weight_decay", 1e-6))
@@ -798,6 +884,7 @@ def metric_to_float(value: Any) -> float | None:
 def retrieval_metrics(model, loader, *, device) -> dict[str, float]:
     ts_embeddings = []
     text_embeddings = []
+    attrs_values = []
     raw_losses = []
     n_items = 0
     for batch in loader:
@@ -807,6 +894,8 @@ def retrieval_metrics(model, loader, *, device) -> dict[str, float]:
         raw_losses.append(float(loss_dict["loss"].detach().cpu()) * int(ts.shape[0]))
         ts_embeddings.append(model.get_global_ts_embedding(ts).detach().cpu())
         text_embeddings.append(model.get_text_embedding(text).detach().cpu())
+        if "attrs" in batch:
+            attrs_values.append(batch["attrs"].detach().cpu())
         n_items += int(ts.shape[0])
 
     if n_items == 0:
@@ -815,7 +904,7 @@ def retrieval_metrics(model, loader, *, device) -> dict[str, float]:
     text_emb = torch.cat(text_embeddings, dim=0)
     sim = torch.mm(ts_emb, text_emb.t())
     labels = torch.arange(sim.shape[0])
-    return {
+    metrics = {
         "n": float(sim.shape[0]),
         "batch_loss": float(sum(raw_losses) / n_items),
         "global_ce": float((torch.nn.functional.cross_entropy(sim, labels) + torch.nn.functional.cross_entropy(sim.t(), labels)) / 2.0),
@@ -823,6 +912,13 @@ def retrieval_metrics(model, loader, *, device) -> dict[str, float]:
         **rank_metrics(sim, labels, prefix="ts2text"),
         **rank_metrics(sim.t(), labels, prefix="text2ts"),
     }
+    if attrs_values:
+        attrs = torch.cat(attrs_values, dim=0)
+        pos_mask = positive_mask_from_attrs(attrs)
+        metrics["attr_positive_count"] = float(pos_mask.float().sum(dim=1).mean())
+        metrics.update(rank_attr_metrics(sim, pos_mask, prefix="ts2text_attr"))
+        metrics.update(rank_attr_metrics(sim.t(), pos_mask.t(), prefix="text2ts_attr"))
+    return metrics
 
 
 def rank_metrics(sim, labels, *, prefix: str) -> dict[str, float]:
@@ -835,6 +931,19 @@ def rank_metrics(sim, labels, *, prefix: str) -> dict[str, float]:
         f"{prefix}_top10": float((ranks <= 10).float().mean()),
         f"{prefix}_mean_rank": float(ranks.float().mean()),
         f"{prefix}_mrr": float((1.0 / ranks.float()).mean()),
+    }
+
+
+def rank_attr_metrics(sim: torch.Tensor, pos_mask: torch.Tensor, *, prefix: str) -> dict[str, float]:
+    order = torch.argsort(sim, dim=1, descending=True)
+    ordered_positive = pos_mask.gather(1, order)
+    first_positive = ordered_positive.float().argmax(dim=1) + 1
+    return {
+        f"{prefix}_top1": float(ordered_positive[:, :1].any(dim=1).float().mean()),
+        f"{prefix}_top5": float(ordered_positive[:, :5].any(dim=1).float().mean()),
+        f"{prefix}_top10": float(ordered_positive[:, :10].any(dim=1).float().mean()),
+        f"{prefix}_mean_rank": float(first_positive.float().mean()),
+        f"{prefix}_mrr": float((1.0 / first_positive.float()).mean()),
     }
 
 
@@ -854,6 +963,18 @@ def print_metrics(dataset: str, checkpoint: Path, metrics: dict[str, Any]) -> No
             ),
             flush=True,
         )
+        if "ts2text_attr_top1" in values:
+            print(
+                "[cttp-eval] {split} attr_positive_count={attr_positive_count:.1f} "
+                "ts2text_attr@1/@5/@10={ts2text_attr_top1:.4f}/{ts2text_attr_top5:.4f}/{ts2text_attr_top10:.4f} "
+                "text2ts_attr@1/@5/@10={text2ts_attr_top1:.4f}/{text2ts_attr_top5:.4f}/{text2ts_attr_top10:.4f} "
+                "attr_mean_rank=({ts2text_attr_mean_rank:.1f},{text2ts_attr_mean_rank:.1f}) "
+                "attr_mrr=({ts2text_attr_mrr:.4f},{text2ts_attr_mrr:.4f})".format(
+                    split=split,
+                    **values,
+                ),
+                flush=True,
+            )
 
 
 def write_metrics(output_dir: Path, metrics: dict[str, Any]) -> None:

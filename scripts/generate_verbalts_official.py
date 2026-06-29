@@ -90,7 +90,7 @@ def main() -> None:
     )
 
     dataset = GenerationDataset({"name": "custom", "folder": str(data_root)})
-    test_dataset = dataset.dataset.get_split("test", include_self=False)
+    test_dataset = _get_verbalts_split(dataset.dataset, "test")
     indices = _resolve_indices(args, len(test_dataset))
     loader = DataLoader(
         Subset(test_dataset, indices),
@@ -181,6 +181,15 @@ def _validate_indices(indices: list[int], dataset_len: int) -> None:
     bad = [idx for idx in indices if idx < 0 or idx >= dataset_len]
     if bad:
         raise ValueError(f"indices out of range [0,{dataset_len - 1}]: {bad}")
+
+
+def _get_verbalts_split(dataset, split: str):
+    try:
+        return dataset.get_split(split, include_self=False)
+    except TypeError as exc:
+        if "include_self" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        return dataset.get_split(split)
 
 
 if __name__ == "__main__":

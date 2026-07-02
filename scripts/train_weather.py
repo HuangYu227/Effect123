@@ -57,6 +57,8 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--proxy-verbalts-root", default=None, help="VerbalTS repository used by joint proxy checkpoint selection")
     parser.add_argument("--proxy-clip-folder", default=None, help="CTTP folder containing model_configs.yaml and clip_model_best.pth")
+    parser.add_argument("--proxy-clip-config", default=None, help="Explicit CTTP config path for proxy checkpoint selection")
+    parser.add_argument("--proxy-clip-model", default=None, help="Explicit CTTP checkpoint path for proxy checkpoint selection")
     parser.add_argument("--proxy-contsg-root", default=None, help="ConTSG-Bench repository used by contsg proxy checkpoint selection")
     parser.add_argument("--proxy-cttp-text-encoder-model", default=None, help="LongCLIP directory used by ConTSG CTTP proxy")
     args = parser.parse_args()
@@ -97,6 +99,10 @@ def main() -> None:
         cfg.setdefault("checkpoint_selection", {})["verbalts_root"] = args.proxy_verbalts_root
     if args.proxy_clip_folder is not None:
         cfg.setdefault("checkpoint_selection", {})["clip_folder"] = args.proxy_clip_folder
+    if args.proxy_clip_config is not None:
+        cfg.setdefault("checkpoint_selection", {})["clip_config"] = args.proxy_clip_config
+    if args.proxy_clip_model is not None:
+        cfg.setdefault("checkpoint_selection", {})["clip_model"] = args.proxy_clip_model
     if args.proxy_contsg_root is not None:
         cfg.setdefault("checkpoint_selection", {})["contsg_root"] = args.proxy_contsg_root
     if args.proxy_cttp_text_encoder_model is not None:
@@ -645,10 +651,20 @@ class _TrainingCTTPProxyEvaluator:
             raise ValueError("_TrainingCTTPProxyEvaluator currently supports only backend='contsg'")
 
         contsg_root = _required_proxy_path(selection, "contsg_root")
-        clip_folder = _required_proxy_path(selection, "clip_folder")
         text_encoder_model = _required_proxy_path(selection, "cttp_text_encoder_model")
-        clip_config = clip_folder / "model_configs.yaml"
-        clip_model = clip_folder / "clip_model_best.pth"
+        clip_config_value = selection.get("clip_config")
+        clip_model_value = selection.get("clip_model")
+        if clip_config_value is not None or clip_model_value is not None:
+            if clip_config_value is None or clip_model_value is None:
+                raise ValueError(
+                    "checkpoint_selection.clip_config and checkpoint_selection.clip_model must be set together"
+                )
+            clip_config = Path(str(clip_config_value)).expanduser()
+            clip_model = Path(str(clip_model_value)).expanduser()
+        else:
+            clip_folder = _required_proxy_path(selection, "clip_folder")
+            clip_config = clip_folder / "model_configs.yaml"
+            clip_model = clip_folder / "clip_model_best.pth"
         for path in (contsg_root, text_encoder_model, clip_config, clip_model):
             if not path.exists():
                 raise FileNotFoundError(f"{backend} proxy dependency not found: {path}")

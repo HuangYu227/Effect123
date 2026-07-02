@@ -1,0 +1,187 @@
+task:
+  mode: text2ts
+
+data:
+  root: null
+  window_length: null
+  normalize: true
+  caption_policy: random
+  include_precomputed_embeddings: false
+  seed: 20260609
+
+model:
+  d_model: 256
+  patch_len: 4
+  num_operators: 3
+  transformer_layers: 2
+  transformer_heads: 4
+  channel_patch_len: 4
+  channel_stride: 2
+  channel_temporal_layers: 1
+  channel_layers: 1
+  channel_heads: 4
+  channel_dropout: 0.0
+
+  mapper_field_rank: 4
+  mapper_slot_layers: 1
+  mapper_slot_heads: 4
+  mapper_dropout: 0.0
+  mapper_normalizer: softmax
+  mapper_bounded_field_gate: true
+  mapper_gate_rescale: auto
+  mapper_operator_router: text
+  mapper_time_segment_scales: [1]
+  mapper_router_epsilon: 0.0001
+  mapper_flow_time_condition: true
+
+  operator_architecture: structural
+  operator_hidden: 192
+  operator_t_dim: 32
+  operator_max_velocity: 5.0
+  operator_depth: 3
+  operator_kernel_size: 3
+  operator_dropout: 0.05
+  operator_context_mode: global
+  operator_context_film: true
+  operator_multiview_context: true
+  operator_norm: group
+  operator_channel_heads: 4
+  operator_frequency_band_mode: gaussian
+  operator_temporal_long_range_mode: multiscale
+  operator_temporal_long_range_scales: [2, 4, 8]
+
+  use_cross_modal_bridge: true
+  bridge_focal_mode: legacy
+  bridge_num_heads: 4
+  bridge_dropout: 0.05
+  bridge_patch_size: 4
+  bridge_num_spectral_tokens: 3
+  bridge_num_stage_tokens: 3
+  bridge_alignment_temperature: 0.07
+  bridge_state_connector: temporal_pyramid_v2
+  bridge_temporal_merge: 4
+  bridge_channel_merge: 1
+  bridge_token_budget: 128
+  bridge_alignment_mode: siglip
+  bridge_alignment_dense: true
+  bridge_alignment_regions: 12
+  bridge_alignment_target: clean
+  bridge_alignment_clean_prob: 1.0
+  bridge_diagnostics: false
+  bridge_text_agg_tokens: 12
+
+  temporal_pyramid_patch_lens: [2, 4, 9, 18, 36]
+  temporal_pyramid_token_budget: 128
+  temporal_pyramid_anchor_tokens: 8
+  temporal_pyramid_cross_scale_layers: 2
+  temporal_pyramid_dropout: 0.05
+  temporal_pyramid_use_topdown: true
+  temporal_pyramid_use_bottomup: true
+  temporal_pyramid_use_text_routing: true
+  temporal_pyramid_temporal_bias_tau: 0.25
+  temporal_pyramid_gate_temperature: 0.65
+
+  use_spectral_prompt: true
+  spectral_prompt_bands: 3
+  spectral_prompt_heads: 4
+  spectral_prompt_dropout: 0.05
+  spectral_prompt_gate_temperature: 0.65
+  spectral_prompt_residual_gate: true
+
+  use_latent_regime_adapter: false
+  num_regimes: 4
+  regime_dim: 256
+  regime_hidden_dim: 256
+  regime_temperature: 0.7
+  regime_posterior_mode: learned
+  regime_append_token: false
+  regime_state_weight_mode: linear_t
+
+  router_mode: global_operator
+  operator_gate_router: attention
+  operator_gate_heads: 4
+  operator_gate_dropout: 0.05
+
+text_encoder:
+  mode: longclip
+  output_type: tokens
+  max_output_tokens: 128
+  hash_dim: 256
+  precomputed_dim: 128
+  hf_model_name: "BAAI/bge-small-en-v1.5"
+  longclip_model_name: "save/Longclip"
+  longclip_local_files_only: true
+  local_files_only: false
+  fallback_mode: error
+  fallback_hash_dim: 256
+
+train:
+  batch_size: 256
+  eval_batch_size: 192
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_steps: 16000
+  cfm_loss_mode: global
+  noise_scale: 1.0
+
+  caption_slot_strategy: candidates
+  max_caption_slots: 3
+  include_all_caption_candidates: true
+  routing_loss_weight: 0.0
+  regime_ortho_weight: 0.0
+  bridge_alignment_weight: 1.00
+  caption_ranking_weight: 0.18
+  caption_ranking_margin: 0.12
+  operator_balance_weight: 0.05
+  condition_dropout_prob: 0.12
+  spectral_loss_weight: 1.00
+  spectral_loss_type: normalized_mrfft
+  spectral_fft_sizes: [4, 10, 25, 36]
+  spectral_distance: l1
+  spectral_log_magnitude: true
+  spectral_time_weight_power: 0.0
+  warmup_steps: 1000
+  min_lr: 1.0e-6
+
+  grad_clip: 1.0
+  num_workers: 0
+  device: auto
+  checkpoint_dir: checkpoints/v68_weather_candidates_refined_proxy_b256_s16000
+  log_every: 20
+  eval_every: 500
+  eval_batches: 20
+  eval_seed_offset: 50000
+  eval_statistical_metrics: true
+  save_every: 500
+
+checkpoint_selection:
+  mode: contsg_proxy
+  every: 1000
+  metric: fid_jftsd_cttp_joint
+  metric_cttp_weight: 0.15
+  metric_joint_f1_weight: 4.0
+  metric_tolerance: 0.01
+  batch_size: 192
+  generated_max_batches: 2
+  reference_max_batches: 0
+  n_samples: 2
+  solver: rk4
+  steps: 32
+  noise_scale: 1.0
+  cfg_scale: 2.2
+  guidance_t_lo: 0.0
+  guidance_t_hi: 1.0
+  seed_offset: 70000
+  contsg_root: null
+  clip_config: null
+  clip_model: null
+  cttp_text_encoder_model: null
+  cache_dir: cache/weather_v68_candidates_refined_contsg_proxy
+
+sample:
+  solver: rk4
+  steps: 48
+  noise_scale: 1.0
+  cfg_scale: 2.2
+  guidance_t_lo: 0.0
+  guidance_t_hi: 1.0

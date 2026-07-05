@@ -25,10 +25,31 @@ def compute_train_stats(root: str | Path) -> dict[str, torch.Tensor]:
 
 
 def load_weather_caption_embeddings(root: str | Path, *, expected_dim: int = 128) -> dict[str, np.ndarray]:
-    """Load and split flat caption embeddings as `[samples, captions_per_sample, dim]`."""
+    """Load caption embeddings as `[samples, captions_per_sample, dim]`.
+
+    VerbalTS Weather stores all caption embeddings in one flat array with a
+    separate count vector. Some converted datasets instead store one embedding
+    array per split, either as `[N, J, D]` or `[N, D]`. Support both layouts so
+    precomputed text conditioning can be used without changing the dataset
+    files.
+    """
     root = Path(root)
-    counts = np.load(root / "text_embedding_caption_counts.npy", allow_pickle=False)
-    flat = np.load(root / "text_embeddings_128_all_caps.npy", allow_pickle=False)
+    split_embeddings = _load_split_caption_embeddings(root, expected_dim=expected_dim)
+    if split_embeddings is not None:
+        return split_embeddings
+
+    counts_path = root / "text_embedding_caption_counts.npy"
+    flat_path = root / "text_embeddings_128_all_caps.npy"
+    if not counts_path.exists() or not flat_path.exists():
+        raise FileNotFoundError(
+            "Precomputed caption embeddings require either split files like "
+            "'train_text_caps_embeddings_128.npy'/'train_cap_emb.npy' or the "
+            "legacy Weather files 'text_embedding_caption_counts.npy' and "
+            "'text_embeddings_128_all_caps.npy'."
+        )
+
+    counts = np.load(counts_path, allow_pickle=False)
+    flat = np.load(flat_path, allow_pickle=False)
     if counts.ndim != 1:
         raise ValueError(f"caption counts must be 1-D, got {counts.shape}")
     split_sizes = {split: int(_load_ts(root, split).shape[0]) for split in SPLITS}
@@ -52,6 +73,31 @@ def load_weather_caption_embeddings(root: str | Path, *, expected_dim: int = 128
         split: sample_embeddings[start:end]
         for split, (start, end) in offsets.items()
     }
+
+
+def _load_split_caption_embeddings(root: Path, *, expected_dim: int) -> dict[str, np.ndarray] | None:
+    out: dict[str, np.ndarray] = {}
+    for split in SPLITS:
+        candidates = (
+            root / f"{split}_text_caps_embeddings_{expected_dim}.npy",
+            root / f"{split}_text_caps_embeddings.npy",
+            root / f"{split}_cap_emb.npy",
+        )
+        path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if path is None:
+            return None
+        arr = np.load(path, allow_pickle=False).astype(np.float32)
+        if arr.ndim == 2:
+            arr = arr[:, None, :]
+        if arr.ndim != 3:
+            raise ValueError(f"{path.name} must have shape [N,D] or [N,J,D], got {arr.shape}")
+        if arr.shape[-1] != expected_dim:
+            raise ValueError(f"{path.name} expected embedding dim {expected_dim}, got {arr.shape[-1]}")
+        rows = int(_load_ts(root, split).shape[0])
+        if arr.shape[0] != rows:
+            raise ValueError(f"{path.name} rows {arr.shape[0]} do not match {split}_ts rows {rows}")
+        out[split] = arr
+    return out
 
 
 class WeatherSemiSyntheticDataset(Dataset):

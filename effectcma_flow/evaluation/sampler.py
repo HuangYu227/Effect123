@@ -141,10 +141,15 @@ def sample_text2ts(
     guidance_t_lo = float(guidance_t_lo)
     guidance_t_hi = float(guidance_t_hi)
     use_cfg = cfg_scale > 1.0
+    raw_text_condition = text_condition
     if hasattr(model, "prepare_condition"):
         text_condition = model.prepare_condition(text_condition, device=device, dtype=dtype)
         if use_cfg:
-            null_condition = uncond_condition if uncond_condition is not None else _blank_condition(batch_size)
+            null_condition = uncond_condition
+            if null_condition is None:
+                null_condition = _zero_precomputed_condition(raw_text_condition)
+            if null_condition is None:
+                null_condition = _blank_condition(batch_size)
             uncond_condition = model.prepare_condition(null_condition, device=device, dtype=dtype)
     elif use_cfg and uncond_condition is None:
         uncond_condition = _blank_condition(batch_size)
@@ -193,6 +198,19 @@ def sample_text2ts(
 def _blank_condition(batch_size: int) -> list[list[str]]:
     """Standard CFG null condition: one empty caption slot per sample."""
     return [[""] for _ in range(batch_size)]
+
+
+def _zero_precomputed_condition(condition):
+    if not isinstance(condition, dict):
+        return None
+    embeddings = condition.get("embeddings")
+    if not torch.is_tensor(embeddings):
+        return None
+    out = {"embeddings": torch.zeros_like(embeddings)}
+    mask = condition.get("mask")
+    if torch.is_tensor(mask):
+        out["mask"] = mask
+    return out
 
 
 def _initial_noise(

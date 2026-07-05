@@ -252,6 +252,11 @@ def _maybe_blank_caption_batch(batch: dict[str, Any], *, p: float) -> dict[str, 
     # Also blank caption_candidates if present, to prevent text leakage.
     if "caption_candidates" in batch and batch["caption_candidates"] is not None:
         new_batch["caption_candidates"] = [[] if m else c for m, c in zip(mask, batch["caption_candidates"])]
+    value = batch.get("caption_embeddings")
+    if torch.is_tensor(value) and value.shape[0] == len(captions):
+        keep = (~mask).to(device=value.device, dtype=value.dtype)
+        keep = keep.view((keep.shape[0],) + (1,) * (value.ndim - 1))
+        new_batch["caption_embeddings"] = value * keep
     return new_batch
 
 

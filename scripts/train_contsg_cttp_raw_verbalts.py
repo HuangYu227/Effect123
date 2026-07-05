@@ -35,6 +35,7 @@ SOURCE_TO_CANONICAL = {
     "synth-u": "synth-u",
     "synthetic_u": "synthetic_u",
     "Weather": "weather",
+    "Health_US_96": "health_us_96",
 }
 
 CANONICAL_TO_SOURCE = {
@@ -45,6 +46,7 @@ CANONICAL_TO_SOURCE = {
     "synth-u": "synth-u",
     "synthetic_u": "synthetic_u",
     "weather": "Weather",
+    "health_us_96": "Health_US_96",
 }
 
 OFFICIAL_VERBALTS_CTTP_PROFILES = {
@@ -98,6 +100,14 @@ OFFICIAL_VERBALTS_CTTP_PROFILES = {
     },
     "weather": {
         "batch_size": 128,
+        "normalize": False,
+        "patch_len": 4,
+        "stride": 4,
+        "padding": 0,
+        "normalize_embeddings": False,
+    },
+    "health_us_96": {
+        "batch_size": 64,
         "normalize": False,
         "patch_len": 4,
         "stride": 4,

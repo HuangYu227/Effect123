@@ -20,6 +20,7 @@ SOURCE_TO_CANONICAL = {
     "synth-u": "synth-u",
     "synthetic_u": "synthetic_u",
     "Weather": "weather",
+    "Health_US_96": "health_us_96",
 }
 
 
@@ -703,6 +704,14 @@ def contsg_cttp_profile(canonical_name: str, seq_length: int) -> dict[str, Any]:
         },
         "synthetic_u": {
             "batch_size": 256,
+            "normalize": False,
+            "patch_len": 4,
+            "stride": 4,
+            "padding": 0,
+            "normalize_embeddings": False,
+        },
+        "health_us_96": {
+            "batch_size": 64,
             "normalize": False,
             "patch_len": 4,
             "stride": 4,

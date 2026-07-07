@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     ours.add_argument("--checkpoint", required=True, type=Path)
     ours.add_argument("--data-root", required=True, type=Path)
     ours.add_argument("--output", required=True, type=Path)
-    ours.add_argument("--split", default="test", choices=("valid", "test"))
+    ours.add_argument("--split", default="test", choices=("train", "valid", "test"))
     ours.add_argument("--batch-size", type=int, default=256)
     ours.add_argument("--n-samples", type=int, default=10)
     ours.add_argument("--max-batches", type=int, default=0, help="0 means all batches.")
@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     verbalts.add_argument("--diff-config", type=Path, default=None)
     verbalts.add_argument("--cond-config", type=Path, default=None)
     verbalts.add_argument("--output", required=True, type=Path)
+    verbalts.add_argument("--split", default="test", choices=("train", "valid", "test"))
     verbalts.add_argument("--batch-size", type=int, default=256)
     verbalts.add_argument("--num-workers", type=int, default=4)
     verbalts.add_argument("--n-samples", type=int, default=10)
@@ -316,7 +317,7 @@ def export_verbalts(args: argparse.Namespace) -> None:
 
     dataset = GenerationDataset({"name": "custom", "folder": str(data_root)})
     loader = dataset.get_loader(
-        "test",
+        args.split,
         batch_size=int(args.batch_size),
         shuffle=False,
         num_workers=int(args.num_workers),
@@ -364,6 +365,7 @@ def export_verbalts(args: argparse.Namespace) -> None:
             "diff_config": str(diff_config),
             "cond_config": str(cond_config),
             "data_root": str(data_root),
+            "split": args.split,
             "n_samples": int(args.n_samples),
             "sampler": args.sampler,
             "cond_modal": args.cond_modal,

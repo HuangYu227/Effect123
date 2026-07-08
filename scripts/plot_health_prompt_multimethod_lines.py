@@ -233,8 +233,7 @@ def generate_ours(args: argparse.Namespace, device: torch.device, seq_len: int, 
             text_encoder_model=args.cttp_text_encoder_model.expanduser().resolve(),
             device=device,
         )
-        with torch.no_grad():
-            prompt_emb = clip.get_text_embedding({"cap": [args.prompt]}).detach()
+        prompt_emb = cttp_text_embedding(clip, [args.prompt]).detach()
         expected_dim = int(cfg.get("text_encoder", {}).get("precomputed_dim", prompt_emb.shape[-1]))
         if int(prompt_emb.shape[-1]) != expected_dim:
             raise ValueError(
@@ -364,8 +363,7 @@ def generate_contsg(
         text_encoder_model=args.cttp_text_encoder_model.expanduser().resolve(),
         device=device,
     )
-    with torch.no_grad():
-        cap_emb = embedder.get_text_embedding({"cap": [args.prompt]})
+    cap_emb = cttp_text_embedding(embedder, [args.prompt])
     batch = {
         "ts": torch.zeros((1, seq_len, num_channels), device=device, dtype=torch.float32),
         "tp": torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(0),
@@ -390,6 +388,22 @@ def parse_label_paths(items: list[str]) -> list[tuple[str, Path]]:
             raise ValueError("Empty method label")
         parsed.append((label, Path(path.strip())))
     return parsed
+
+
+def cttp_text_embedding(clip: Any, texts: list[str]) -> torch.Tensor:
+    """Return text embeddings from either ConTSG CLIPEmbedder or EffectCMA's CTTP adapter."""
+    with torch.no_grad():
+        if hasattr(clip, "get_text_embedding"):
+            return clip.get_text_embedding({"cap": texts})
+        if hasattr(clip, "get_text_coemb"):
+            return clip.get_text_coemb(texts, None)
+        embedder = getattr(clip, "embedder", None)
+        if embedder is not None and hasattr(embedder, "get_text_embedding"):
+            return embedder.get_text_embedding({"cap": texts})
+    raise AttributeError(
+        "CTTP object does not expose get_text_embedding, get_text_coemb, "
+        "or embedder.get_text_embedding"
+    )
 
 
 def save_method(output_dir: Path, label: str, values: np.ndarray) -> None:

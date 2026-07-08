@@ -286,7 +286,7 @@ def generate_verbalts(args: argparse.Namespace, device: torch.device, seq_len: i
     sys.path.insert(0, str(verbalts_root))
 
     from models.conditional_generator import ConditionalGenerator
-    from scripts.eval_verbalts_official_contsg_metrics import configure_verbalts_model, read_yaml
+    from scripts.eval_verbalts_official_contsg_metrics import read_yaml
 
     diff_config = (
         args.verbalts_diff_config
@@ -304,15 +304,11 @@ def generate_verbalts(args: argparse.Namespace, device: torch.device, seq_len: i
 
     diff_cfg = read_yaml(diff_config)
     cond_cfg = read_yaml(cond_config)
-    configure_verbalts_model(
+    configure_verbalts_from_saved_config(
         diff_cfg,
         cond_cfg,
         device=device,
         longclip_root=longclip_root,
-        cond_modal="text",
-        text_output_type="all",
-        text_pos_emb="none",
-        diff_stage_num=3,
         base_patch=args.verbalts_base_patch,
         multipatch_num=args.verbalts_multipatch_num,
         l_patch_len=args.verbalts_l_patch_len,
@@ -386,6 +382,37 @@ def parse_label_paths(items: list[str]) -> list[tuple[str, Path]]:
             raise ValueError("Empty method label")
         parsed.append((label, Path(path.strip())))
     return parsed
+
+
+def configure_verbalts_from_saved_config(
+    diff_cfg: dict[str, Any],
+    cond_cfg: dict[str, Any],
+    *,
+    device: torch.device,
+    longclip_root: Path,
+    base_patch: int | None,
+    multipatch_num: int | None,
+    l_patch_len: int | None,
+) -> None:
+    """Set runtime paths/devices while preserving the run's saved VerbalTS architecture."""
+    diff_cfg["device"] = str(device)
+    diff_cfg["generator_pretrain_path"] = ""
+    diffusion = diff_cfg.setdefault("diffusion", {})
+    if base_patch is not None:
+        diffusion["base_patch"] = int(base_patch)
+    if multipatch_num is not None:
+        diffusion["multipatch_num"] = int(multipatch_num)
+    if l_patch_len is not None:
+        diffusion["L_patch_len"] = int(l_patch_len)
+
+    cond_cfg["device"] = str(device)
+    text_cfg = cond_cfg.setdefault("text", {})
+    text_cfg["device"] = str(device)
+    # Only CLIP/LongCLIP text mode needs these runtime paths. For simple_text,
+    # preserving the saved vocabulary encoder is required to load attr_en.*.
+    if str(cond_cfg.get("cond_modal", "")).lower() == "text":
+        text_cfg["pretrain_model_path"] = str(longclip_root)
+        text_cfg["tokenizer_path"] = str(longclip_root)
 
 
 def cttp_text_embedding(clip: Any, texts: list[str]) -> torch.Tensor:

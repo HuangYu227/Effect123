@@ -22,6 +22,8 @@ DEFAULT_COLORS = {
     "TimeVQVAE": "#B56576",
 }
 
+_PROMPT_EMBEDDING_CACHE: dict[tuple[str, str, int, str], torch.Tensor] = {}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -233,13 +235,8 @@ def generate_ours(args: argparse.Namespace, device: torch.device, seq_len: int, 
             text_encoder_model=args.cttp_text_encoder_model.expanduser().resolve(),
             device=device,
         )
-        prompt_emb = cttp_text_embedding(clip, [args.prompt]).detach()
-        expected_dim = int(cfg.get("text_encoder", {}).get("precomputed_dim", prompt_emb.shape[-1]))
-        if int(prompt_emb.shape[-1]) != expected_dim:
-            raise ValueError(
-                f"Ours expects precomputed embedding dim {expected_dim}, "
-                f"but CTTP text encoder produced {prompt_emb.shape[-1]}"
-            )
+        expected_dim = int(cfg.get("text_encoder", {}).get("precomputed_dim", infer_training_cap_embedding_dim(args.data_root)))
+        prompt_emb = prompt_embedding_in_training_space(args, clip, device, expected_dim)
         dtype = next(model.parameters()).dtype
         generator = torch.Generator(device=device)
         generator.manual_seed(int(args.seed))
@@ -363,7 +360,8 @@ def generate_contsg(
         text_encoder_model=args.cttp_text_encoder_model.expanduser().resolve(),
         device=device,
     )
-    cap_emb = cttp_text_embedding(embedder, [args.prompt])
+    target_dim = infer_training_cap_embedding_dim(args.data_root)
+    cap_emb = prompt_embedding_in_training_space(args, embedder, device, target_dim)
     batch = {
         "ts": torch.zeros((1, seq_len, num_channels), device=device, dtype=torch.float32),
         "tp": torch.arange(seq_len, device=device, dtype=torch.float32).unsqueeze(0),
@@ -404,6 +402,105 @@ def cttp_text_embedding(clip: Any, texts: list[str]) -> torch.Tensor:
         "CTTP object does not expose get_text_embedding, get_text_coemb, "
         "or embedder.get_text_embedding"
     )
+
+
+def prompt_embedding_in_training_space(
+    args: argparse.Namespace,
+    clip: Any,
+    device: torch.device,
+    target_dim: int,
+) -> torch.Tensor:
+    """Map a free-text CTTP embedding into the dataset's precomputed cap_emb space."""
+    cache_key = (str(args.data_root.expanduser().resolve()), args.prompt, int(target_dim), str(device))
+    cached = _PROMPT_EMBEDDING_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.to(device)
+
+    prompt_raw = cttp_text_embedding(clip, [args.prompt]).detach().float()
+    if int(prompt_raw.shape[-1]) == int(target_dim):
+        out = prompt_raw.to(device)
+        _PROMPT_EMBEDDING_CACHE[cache_key] = out.detach().cpu()
+        return out
+
+    train_caps = load_train_captions(args.data_root)
+    target = load_train_cap_embeddings(args.data_root, int(target_dim))
+    raw_batches = []
+    encode_batch = max(1, min(int(args.batch_size), 128))
+    for start in range(0, len(train_caps), encode_batch):
+        raw = cttp_text_embedding(clip, train_caps[start : start + encode_batch]).detach().float().cpu()
+        raw_batches.append(raw)
+    source = torch.cat(raw_batches, dim=0)
+    if source.shape[0] != target.shape[0]:
+        raise ValueError(f"CTTP source rows {source.shape[0]} != target cap_emb rows {target.shape[0]}")
+
+    mapped = fit_ridge_and_project(source, torch.from_numpy(target).float(), prompt_raw.cpu())
+    out = mapped.to(device)
+    _PROMPT_EMBEDDING_CACHE[cache_key] = out.detach().cpu()
+    print(
+        f"[embedding-map] CTTP dim {prompt_raw.shape[-1]} -> training cap_emb dim {target_dim} "
+        f"using {source.shape[0]} Health train captions",
+        flush=True,
+    )
+    return out
+
+
+def load_train_captions(data_root: Path) -> list[str]:
+    caps = np.load(data_root / "train_text_caps.npy", allow_pickle=True)
+    if caps.ndim == 1:
+        return [str(item).strip() for item in caps]
+    if caps.ndim == 2:
+        out = []
+        for row in caps:
+            parts = [str(item).strip() for item in row if str(item).strip()]
+            out.append(" ".join(parts))
+        return out
+    raise ValueError(f"train_text_caps.npy must be [N] or [N,J], got {caps.shape}")
+
+
+def load_train_cap_embeddings(data_root: Path, target_dim: int) -> np.ndarray:
+    candidates = [
+        data_root / "train_cap_emb.npy",
+        data_root / f"train_text_caps_embeddings_{target_dim}.npy",
+        data_root / "train_text_caps_embeddings_128.npy",
+    ]
+    path = next((item for item in candidates if item.exists()), None)
+    if path is None:
+        raise FileNotFoundError(f"Could not find train cap embeddings under {data_root}")
+    values = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
+    if values.ndim == 3 and values.shape[1] == 1:
+        values = values[:, 0, :]
+    if values.ndim != 2 or int(values.shape[-1]) != int(target_dim):
+        raise ValueError(f"{path} must have shape [N,{target_dim}] or [N,1,{target_dim}], got {values.shape}")
+    return values
+
+
+def infer_training_cap_embedding_dim(data_root: Path) -> int:
+    values = load_train_cap_embeddings(data_root, 128)
+    return int(values.shape[-1])
+
+
+def fit_ridge_and_project(source: torch.Tensor, target: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    if source.ndim != 2 or target.ndim != 2 or query.ndim != 2:
+        raise ValueError("source, target, and query must be rank-2 tensors")
+    if source.shape[0] != target.shape[0]:
+        raise ValueError(f"source rows {source.shape[0]} != target rows {target.shape[0]}")
+
+    x_mean = source.mean(dim=0, keepdim=True)
+    x_std = source.std(dim=0, keepdim=True).clamp_min(1e-6)
+    x = (source - x_mean) / x_std
+    q = (query - x_mean) / x_std
+
+    ones = torch.ones((x.shape[0], 1), dtype=x.dtype)
+    x_aug = torch.cat([x, ones], dim=1)
+    q_aug = torch.cat([q, torch.ones((q.shape[0], 1), dtype=q.dtype)], dim=1)
+
+    ridge = 1e-3
+    xtx = x_aug.T @ x_aug
+    reg = torch.eye(xtx.shape[0], dtype=xtx.dtype) * ridge
+    reg[-1, -1] = 0.0
+    rhs = x_aug.T @ target
+    weights = torch.linalg.solve(xtx + reg, rhs)
+    return (q_aug @ weights).float()
 
 
 def save_method(output_dir: Path, label: str, values: np.ndarray) -> None:

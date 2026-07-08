@@ -191,6 +191,8 @@ def resolve_shape(data_root: Path, seq: int | None, channels: int | None) -> tup
 
 def generate_ours(args: argparse.Namespace, device: torch.device, seq_len: int, num_channels: int) -> np.ndarray:
     from effectcma_flow.config import load_config
+    from effectcma_flow.evaluation.sampler import sample_text2ts
+    from effectcma_flow.evaluation.verbalts_metrics import _load_contsg_cttp
     from effectcma_flow.models import build_model
     from effectcma_flow.training import checkpoint_eval_config, checkpoint_stats_or_none, load_training_checkpoint
     from scripts.generate_text2ts import _denormalize_if_needed, _generate
@@ -211,22 +213,75 @@ def generate_ours(args: argparse.Namespace, device: torch.device, seq_len: int, 
     model.eval()
 
     sample_cfg = cfg.get("sample", {})
-    normalized = _generate(
-        model=model,
-        captions=[[args.prompt]],
-        sequence_length=seq_len,
-        num_channels=num_channels,
-        num_samples=int(args.n_samples),
-        batch_size=int(args.batch_size),
-        device=device,
-        solver=str(sample_cfg.get("solver", "rk4")),
-        steps=int(sample_cfg.get("steps", 64)),
-        noise_scale=float(sample_cfg.get("noise_scale", 1.0)),
-        cfg_scale=float(sample_cfg.get("cfg_scale", 1.0)),
-        guidance_t_lo=float(sample_cfg.get("guidance_t_lo", 0.0)),
-        guidance_t_hi=float(sample_cfg.get("guidance_t_hi", 1.0)),
-        seed=int(args.seed),
-    )
+    if str(cfg.get("text_encoder", {}).get("mode", "")).lower() == "precomputed":
+        missing = [
+            name
+            for name, value in {
+                "contsg-root": args.contsg_root,
+                "cttp-config": args.cttp_config,
+                "cttp-checkpoint": args.cttp_checkpoint,
+                "cttp-text-encoder-model": args.cttp_text_encoder_model,
+            }.items()
+            if value is None
+        ]
+        if missing:
+            raise ValueError("Ours uses precomputed text embeddings; provide " + ", ".join(missing))
+        clip = _load_contsg_cttp(
+            contsg_root=args.contsg_root.expanduser().resolve(),
+            clip_config_path=args.cttp_config.expanduser().resolve(),
+            clip_model_path=args.cttp_checkpoint.expanduser().resolve(),
+            text_encoder_model=args.cttp_text_encoder_model.expanduser().resolve(),
+            device=device,
+        )
+        with torch.no_grad():
+            prompt_emb = clip.get_text_embedding({"cap": [args.prompt]}).detach()
+        expected_dim = int(cfg.get("text_encoder", {}).get("precomputed_dim", prompt_emb.shape[-1]))
+        if int(prompt_emb.shape[-1]) != expected_dim:
+            raise ValueError(
+                f"Ours expects precomputed embedding dim {expected_dim}, "
+                f"but CTTP text encoder produced {prompt_emb.shape[-1]}"
+            )
+        dtype = next(model.parameters()).dtype
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(args.seed))
+        normalized = np.empty((1, int(args.n_samples), seq_len, num_channels), dtype=np.float32)
+        for start in range(0, int(args.n_samples), int(args.batch_size)):
+            width = min(int(args.batch_size), int(args.n_samples) - start)
+            shape_like = torch.empty((width, seq_len, num_channels), device=device, dtype=dtype)
+            text_condition = {
+                "embeddings": prompt_emb.to(device=device, dtype=dtype).repeat(width, 1),
+                "mask": torch.ones((width, 1), device=device, dtype=dtype),
+            }
+            generated, _ = sample_text2ts(
+                model,
+                shape_like,
+                text_condition,
+                solver=str(sample_cfg.get("solver", "rk4")),
+                steps=int(sample_cfg.get("steps", 64)),
+                noise_scale=float(sample_cfg.get("noise_scale", 1.0)),
+                generator=generator,
+                cfg_scale=float(sample_cfg.get("cfg_scale", 1.0)),
+                guidance_t_lo=float(sample_cfg.get("guidance_t_lo", 0.0)),
+                guidance_t_hi=float(sample_cfg.get("guidance_t_hi", 1.0)),
+            )
+            normalized[0, start : start + width] = generated.detach().cpu().float().numpy()
+    else:
+        normalized = _generate(
+            model=model,
+            captions=[[args.prompt]],
+            sequence_length=seq_len,
+            num_channels=num_channels,
+            num_samples=int(args.n_samples),
+            batch_size=int(args.batch_size),
+            device=device,
+            solver=str(sample_cfg.get("solver", "rk4")),
+            steps=int(sample_cfg.get("steps", 64)),
+            noise_scale=float(sample_cfg.get("noise_scale", 1.0)),
+            cfg_scale=float(sample_cfg.get("cfg_scale", 1.0)),
+            guidance_t_lo=float(sample_cfg.get("guidance_t_lo", 0.0)),
+            guidance_t_hi=float(sample_cfg.get("guidance_t_hi", 1.0)),
+            seed=int(args.seed),
+        )
     return _denormalize_if_needed(normalized, cfg, stats).astype(np.float32)
 
 

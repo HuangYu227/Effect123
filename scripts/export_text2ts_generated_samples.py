@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     ours.add_argument("--text-encoder-model", default=None)
     ours.add_argument("--task-mode", default="text2ts", choices=("text2ts",))
     ours.add_argument("--seed", type=int, default=1)
+    ours.add_argument("--random-sample-size", type=int, default=0, help="Randomly select this many split samples before export.")
+    ours.add_argument("--sample-indices", type=Path, default=None, help="Optional .npy/.txt file of split indices to export.")
+    ours.add_argument("--save-sample-indices", type=Path, default=None, help="Save selected split indices for reuse by another method.")
     ours.add_argument("--save-all-samples", action="store_true", help="Also save [N,S,L,C] samples next to median output.")
 
     verbalts = sub.add_parser("verbalts", help="Export generated samples from a VerbalTS run.")
@@ -64,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     verbalts.add_argument("--multipatch-num", type=int, default=None)
     verbalts.add_argument("--l-patch-len", type=int, default=None)
     verbalts.add_argument("--longclip-root", type=Path, default=Path("/home/newuser001/huangyu/Research/VerbalTS/save/Longclip"))
+    verbalts.add_argument("--random-sample-size", type=int, default=0, help="Randomly select this many split samples before export.")
+    verbalts.add_argument("--sample-indices", type=Path, default=None, help="Optional .npy/.txt file of split indices to export.")
+    verbalts.add_argument("--save-sample-indices", type=Path, default=None, help="Save selected split indices for reuse by another method.")
     verbalts.add_argument("--save-all-samples", action="store_true", help="Also save [N,S,L,C] samples next to median output.")
 
     return parser.parse_args()
@@ -102,6 +108,76 @@ def save_payload(
     if all_samples is not None:
         print(f"[saved] samples:   {output.with_suffix('.samples.npy')} shape={all_samples.shape}")
     print(f"[saved] metadata:  {output.with_suffix('.metadata.json')}")
+
+
+def resolve_sample_indices(args: argparse.Namespace, total: int) -> np.ndarray | None:
+    if total <= 0:
+        raise ValueError("dataset split is empty")
+    indices: np.ndarray | None = None
+    if args.sample_indices is not None:
+        path = Path(args.sample_indices)
+        if path.suffix.lower() == ".npy":
+            indices = np.load(path)
+        else:
+            indices = np.loadtxt(path, dtype=np.int64)
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    elif int(args.random_sample_size) > 0:
+        size = min(int(args.random_sample_size), int(total))
+        rng = np.random.default_rng(int(args.seed))
+        indices = rng.choice(int(total), size=size, replace=False).astype(np.int64)
+    if indices is None:
+        return None
+    if indices.size == 0:
+        raise ValueError("sample index list is empty")
+    if indices.min() < 0 or indices.max() >= total:
+        raise ValueError(f"sample indices must be in [0, {total}), got min={indices.min()} max={indices.max()}")
+    indices = np.unique(indices)
+    indices.sort()
+    if args.save_sample_indices is not None:
+        out = Path(args.save_sample_indices)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out, indices)
+        print(f"[saved] sample indices: {out} n={indices.size}")
+    return indices
+
+
+def batch_size_of(batch: dict[str, Any]) -> int:
+    for value in batch.values():
+        if torch.is_tensor(value) and value.ndim > 0:
+            return int(value.shape[0])
+    for key in ("caption", "cap", "ts", "Y"):
+        value = batch.get(key)
+        if hasattr(value, "__len__"):
+            return int(len(value))
+    raise ValueError("could not infer batch size")
+
+
+def select_batch_rows(batch: dict[str, Any], rows: np.ndarray) -> dict[str, Any]:
+    if rows.size == 0:
+        raise ValueError("rows must not be empty")
+    batch_size = batch_size_of(batch)
+    index = torch.as_tensor(rows, dtype=torch.long)
+    out: dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == batch_size:
+            out[key] = value.index_select(0, index.to(value.device))
+        elif isinstance(value, list) and len(value) == batch_size:
+            out[key] = [value[int(i)] for i in rows.tolist()]
+        elif isinstance(value, tuple) and len(value) == batch_size:
+            out[key] = tuple(value[int(i)] for i in rows.tolist())
+        else:
+            out[key] = value
+    return out
+
+
+def selected_rows_for_batch(indices: np.ndarray | None, offset: int, batch_size: int) -> np.ndarray | None:
+    if indices is None:
+        return None
+    lo = np.searchsorted(indices, offset, side="left")
+    hi = np.searchsorted(indices, offset + batch_size, side="left")
+    if hi <= lo:
+        return np.empty((0,), dtype=np.int64)
+    return indices[lo:hi] - offset
 
 
 def export_ours(args: argparse.Namespace) -> None:
@@ -146,6 +222,9 @@ def export_ours(args: argparse.Namespace) -> None:
         include_precomputed_embeddings=include_embeddings,
         precomputed_dim=int(cfg["text_encoder"].get("precomputed_dim", 128)),
     )
+    selected_indices = resolve_sample_indices(args, len(ds))
+    if selected_indices is not None:
+        print(f"[select] split={args.split} total={len(ds)} selected={selected_indices.size}")
     loader = DataLoader(ds, batch_size=int(args.batch_size), shuffle=False, collate_fn=collate_raw_caption_batch)
 
     model = build_model(cfg, sequence_length=ds.sequence_length, num_channels=ds.num_channels).to(device)
@@ -169,10 +248,20 @@ def export_ours(args: argparse.Namespace) -> None:
     mean = stats["mean"].to(device)
     std = stats["std"].to(device)
 
+    offset = 0
+    exported = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc="ours-gen", dynamic_ncols=True)):
             if args.max_batches and batch_idx >= int(args.max_batches):
                 break
+            raw_batch_size = batch_size_of(batch)
+            rows = selected_rows_for_batch(selected_indices, offset, raw_batch_size)
+            offset += raw_batch_size
+            if rows is not None:
+                if rows.size == 0:
+                    continue
+                batch = select_batch_rows(batch, rows)
+                exported += int(rows.size)
             batch = batch_to_device(batch, device)
             text_condition = text_condition_from_batch(
                 batch,
@@ -203,6 +292,8 @@ def export_ours(args: argparse.Namespace) -> None:
             if args.save_all_samples:
                 sample_batches.append((stacked * std + mean).detach().cpu())
             captions.extend([str(x) for x in batch["caption"]])
+            if selected_indices is not None and exported >= int(selected_indices.size):
+                break
 
     generated = torch.cat(generated_batches, dim=0).numpy()
     real = torch.cat(real_batches, dim=0).numpy()
@@ -220,6 +311,10 @@ def export_ours(args: argparse.Namespace) -> None:
             "data_root": str(args.data_root),
             "split": args.split,
             "n_samples": int(args.n_samples),
+            "random_sample_size": int(args.random_sample_size),
+            "sample_indices": str(args.sample_indices) if args.sample_indices is not None else None,
+            "save_sample_indices": str(args.save_sample_indices) if args.save_sample_indices is not None else None,
+            "selected_count": int(selected_indices.size) if selected_indices is not None else None,
             "solver": solver,
             "steps": steps,
             "cfg_scale": cfg_scale,
@@ -323,6 +418,9 @@ def export_verbalts(args: argparse.Namespace) -> None:
         num_workers=int(args.num_workers),
         include_self=False,
     )
+    selected_indices = resolve_sample_indices(args, len(loader.dataset))
+    if selected_indices is not None:
+        print(f"[select] split={args.split} total={len(loader.dataset)} selected={selected_indices.size}")
     model = ConditionalGenerator(diff_cfg, cond_cfg).to(device)
     state = torch.load(checkpoint, map_location=device)
     model.load_state_dict(state)
@@ -333,10 +431,20 @@ def export_verbalts(args: argparse.Namespace) -> None:
     sample_batches: list[torch.Tensor] = []
     captions: list[str] = []
 
+    offset = 0
+    exported = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc="verbalts-gen", dynamic_ncols=True)):
             if args.max_batches and batch_idx >= int(args.max_batches):
                 break
+            raw_batch_size = batch_size_of(batch)
+            rows = selected_rows_for_batch(selected_indices, offset, raw_batch_size)
+            offset += raw_batch_size
+            if rows is not None:
+                if rows.size == 0:
+                    continue
+                batch = select_batch_rows(batch, rows)
+                exported += int(rows.size)
             multi_preds = model.generate(batch, int(args.n_samples), sampler=args.sampler)
             # VerbalTS returns [S,B,C,L]; convert to [B,S,L,C].
             multi_preds = multi_preds.permute(1, 0, 3, 2).float()
@@ -347,6 +455,8 @@ def export_verbalts(args: argparse.Namespace) -> None:
             if args.save_all_samples:
                 sample_batches.append(multi_preds.detach().cpu())
             captions.extend([str(x) for x in batch["cap"]])
+            if selected_indices is not None and exported >= int(selected_indices.size):
+                break
 
     generated = torch.cat(generated_batches, dim=0).numpy()
     real = torch.cat(real_batches, dim=0).numpy()
@@ -367,6 +477,10 @@ def export_verbalts(args: argparse.Namespace) -> None:
             "data_root": str(data_root),
             "split": args.split,
             "n_samples": int(args.n_samples),
+            "random_sample_size": int(args.random_sample_size),
+            "sample_indices": str(args.sample_indices) if args.sample_indices is not None else None,
+            "save_sample_indices": str(args.save_sample_indices) if args.save_sample_indices is not None else None,
+            "selected_count": int(selected_indices.size) if selected_indices is not None else None,
             "sampler": args.sampler,
             "cond_modal": args.cond_modal,
             "base_patch": args.base_patch,

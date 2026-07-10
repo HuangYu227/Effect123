@@ -83,7 +83,7 @@ def plot_single_column(
     ax_gate.set_ylim(0.0, min(1.0, max(0.55, float(gates[sample].max()) + 0.05)))
     for ax in (ax_energy, ax_gate):
         set_panel_style(ax)
-        ax.tick_params(labelsize=8.3)
+        ax.tick_params(labelsize=9)
         ax.set_xlim(float(flow_time.min()), float(flow_time.max()))
         ax.set_xticks(np.linspace(0.0, 1.0, 5))
     output.parent.mkdir(parents=True, exist_ok=True)

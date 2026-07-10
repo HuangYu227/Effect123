@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solver", choices=("euler", "midpoint", "rk4"), default=None)
     parser.add_argument("--cfg-scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=20260710)
+    parser.add_argument(
+        "--caption-shuffle",
+        action="store_true",
+        help="Cyclically replace each sample's caption with another sample's caption in the same batch.",
+    )
     parser.add_argument("--text-encoder-mode", choices=("hash", "precomputed", "hf", "longclip"), default=None)
     parser.add_argument("--text-encoder-model", default=None)
     return parser.parse_args()
@@ -253,7 +258,8 @@ def main() -> None:
 
     traces: list[torch.Tensor] = []
     finals: list[torch.Tensor] = []
-    captions: list[str] = []
+    source_captions: list[str] = []
+    condition_captions: list[str] = []
     exported = 0
     for batch in tqdm(loader, desc="gate-trace", dynamic_ncols=True):
         if exported >= max_samples:
@@ -263,8 +269,16 @@ def main() -> None:
         if batch_size > remaining:
             batch = take_rows(batch, remaining)
         batch = move_batch(batch, device)
+        original_captions = [str(item) for item in batch["caption"]]
+        conditioned_batch = batch
+        conditioned_caption_values = original_captions
+        if args.caption_shuffle:
+            if len(original_captions) < 2:
+                raise ValueError("caption shuffle requires at least two samples per batch")
+            conditioned_caption_values = original_captions[1:] + original_captions[:1]
+            conditioned_batch = {**batch, "caption": conditioned_caption_values}
         raw_condition = text_condition_from_batch(
-            batch,
+            conditioned_batch,
             text_mode,
             condition_key="caption",
             caption_slot_strategy=caption_slot_strategy,
@@ -281,7 +295,8 @@ def main() -> None:
         )
         traces.append(gate_trace)
         finals.append(final_state)
-        captions.extend(str(item) for item in batch["caption"])
+        source_captions.extend(original_captions)
+        condition_captions.extend(conditioned_caption_values)
         exported += int(gate_trace.shape[0])
 
     gates = torch.cat(traces, dim=0).numpy()
@@ -294,7 +309,10 @@ def main() -> None:
         flow_time=np.arange(steps, dtype=np.float32) / float(steps),
         final_state=final_series.astype(np.float32, copy=False),
     )
-    output.with_suffix(".captions.json").write_text(json.dumps(captions, ensure_ascii=False, indent=2), encoding="utf-8")
+    output.with_suffix(".captions.json").write_text(json.dumps(source_captions, ensure_ascii=False, indent=2), encoding="utf-8")
+    output.with_suffix(".condition_captions.json").write_text(
+        json.dumps(condition_captions, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     summary = summarize(gates)
     summary.update(
         {
@@ -307,11 +325,14 @@ def main() -> None:
             "solver": solver,
             "cfg_scale": cfg_scale,
             "seed": int(args.seed),
+            "caption_shuffle": bool(args.caption_shuffle),
         }
     )
     output.with_suffix(".summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[saved] trace: {output} gates={gates.shape} final_state={final_series.shape}")
     print(f"[saved] captions: {output.with_suffix('.captions.json')}")
+    if args.caption_shuffle:
+        print(f"[saved] condition captions: {output.with_suffix('.condition_captions.json')}")
     print(f"[saved] summary: {output.with_suffix('.summary.json')}")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

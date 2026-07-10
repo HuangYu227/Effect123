@@ -22,6 +22,10 @@ def parse_args() -> argparse.Namespace:
         help="Trace sample to draw. Use -1 to automatically select the strongest contribution-dynamics example.",
     )
     parser.add_argument("--channel-index", type=int, default=0)
+    parser.add_argument(
+        "--layout", choices=("wide", "single-column"), default="wide",
+        help="Use single-column for a 3.25-inch AAAI figure with vertically stacked panels.",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--dpi", type=int, default=300)
     return parser.parse_args()
@@ -40,6 +44,53 @@ def set_panel_style(ax: plt.Axes) -> None:
     ax.grid(axis="y", alpha=0.18, linewidth=0.6)
     ax.spines[["top", "right"]].set_visible(False)
     ax.tick_params(labelsize=8.5)
+
+
+def plot_single_column(
+    flow_time: np.ndarray,
+    energy: np.ndarray,
+    gates: np.ndarray,
+    sample: int,
+    output: Path,
+    dpi: int,
+) -> None:
+    """Render a compliant 3.25 x 2.70 inch AAAI single-column figure."""
+    plt.rcParams.update({"font.size": 9, "font.family": "serif"})
+    labels = tuple(COLORS)
+    styles = ("-", "--", ":")
+    fig, (ax_energy, ax_gate) = plt.subplots(
+        2, 1, figsize=(3.25, 2.70), sharex=True, facecolor="white",
+        gridspec_kw={"hspace": 0.24},
+    )
+    for operator, (label, style) in enumerate(zip(labels, styles)):
+        ax_energy.plot(
+            flow_time, energy[sample, :, operator], color=COLORS[label],
+            linestyle=style, linewidth=1.45, label=label,
+        )
+        ax_gate.plot(
+            flow_time, gates[sample, :, operator], color=COLORS[label],
+            linestyle=style, linewidth=1.45, label=label,
+        )
+    ax_energy.set_title("(a) Operator contribution magnitude", fontsize=9.4, pad=3)
+    ax_energy.set_ylabel("Contribution", fontsize=9)
+    ax_energy.legend(
+        loc="upper center", ncol=3, fontsize=9, frameon=False,
+        handlelength=1.55, columnspacing=0.75, handletextpad=0.35,
+    )
+    ax_gate.set_title("(b) Dynamic mixture weights", fontsize=9.4, pad=3)
+    ax_gate.set_xlabel("ODE flow time", fontsize=9)
+    ax_gate.set_ylabel("Gate weight", fontsize=9)
+    ax_gate.set_ylim(0.0, min(1.0, max(0.55, float(gates[sample].max()) + 0.05)))
+    for ax in (ax_energy, ax_gate):
+        set_panel_style(ax)
+        ax.tick_params(labelsize=8.3)
+        ax.set_xlim(float(flow_time.min()), float(flow_time.max()))
+        ax.set_xticks(np.linspace(0.0, 1.0, 5))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Do not use bbox_inches='tight': physical dimensions must remain stable.
+    fig.savefig(output, dpi=dpi, facecolor="white")
+    fig.savefig(output.with_suffix(".pdf"), facecolor="white")
+    plt.close(fig)
 
 
 def main() -> None:
@@ -66,6 +117,13 @@ def main() -> None:
         # Keep the caption available for provenance, but do not put a long
         # natural-language paragraph inside a publication figure.
         json.loads(captions_path.read_text(encoding="utf-8"))[sample]
+
+    if args.layout == "single-column":
+        plot_single_column(flow_time, energy, gates, sample, args.output, args.dpi)
+        print(f"[selected] sample={sample}")
+        print(f"[saved] {args.output}")
+        print(f"[saved] {args.output.with_suffix('.pdf')}")
+        return
 
     snapshots = np.asarray([0, state.shape[1] // 2, state.shape[1] - 1], dtype=int)
     labels = tuple(COLORS)

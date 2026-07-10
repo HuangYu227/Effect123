@@ -10,7 +10,7 @@ from effectcma_flow.models.text_to_ts_flow import TextToTSFlow
 _V61_KEYS = frozenset({
     "use_latent_regime_adapter", "num_regimes", "regime_dim", "regime_hidden_dim",
     "regime_temperature", "regime_posterior_mode", "regime_append_token", "regime_dropout", "regime_state_weight_mode",
-    "router_mode", "operator_gate_temperature", "operator_gate_dropout", "operator_gate_router", "operator_gate_heads",
+    "router_mode", "operator_gate_mode", "operator_gate_temperature", "operator_gate_dropout", "operator_gate_router", "operator_gate_heads",
 })
 _V62_KEYS = frozenset({
     "use_cross_modal_bridge", "bridge_num_heads", "bridge_dropout", "bridge_patch_size",
@@ -108,6 +108,7 @@ def build_model(config: dict[str, Any], *, sequence_length: int, num_channels: i
         regime_state_weight_mode=str(model_cfg.get("regime_state_weight_mode", "linear_t")),
         # V6.1 routing mode
         router_mode=str(model_cfg.get("router_mode", "legacy")),
+        operator_gate_mode=str(model_cfg.get("operator_gate_mode", "dynamic")),
         operator_gate_temperature=float(model_cfg.get("operator_gate_temperature", 1.0)),
         operator_gate_dropout=float(model_cfg.get("operator_gate_dropout", 0.0)),
         operator_gate_router=str(model_cfg.get("operator_gate_router", "mlp")),

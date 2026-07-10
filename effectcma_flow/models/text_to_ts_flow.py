@@ -87,6 +87,7 @@ class TextToTSFlow(nn.Module):
         regime_state_weight_mode: str = "linear_t",
         # V6.1 routing mode: "legacy" (EffectMapper) or "global_operator"
         router_mode: str = "legacy",
+        operator_gate_mode: str = "dynamic",
         operator_gate_temperature: float = 1.0,
         operator_gate_dropout: float = 0.0,
         operator_gate_router: str = "mlp",
@@ -139,6 +140,13 @@ class TextToTSFlow(nn.Module):
         if self.router_mode not in {"legacy", "global_operator"}:
             raise ValueError(f"router_mode must be 'legacy' or 'global_operator', got {router_mode!r}")
         self._use_global_gate = self.router_mode == "global_operator"
+        self.operator_gate_mode = str(operator_gate_mode).lower()
+        if self.operator_gate_mode not in {"dynamic", "uniform"}:
+            raise ValueError(
+                f"operator_gate_mode must be 'dynamic' or 'uniform', got {operator_gate_mode!r}"
+            )
+        if self.operator_gate_mode == "uniform" and not self._use_global_gate:
+            raise ValueError("operator_gate_mode='uniform' requires router_mode='global_operator'")
 
         self.text_encoder = text_encoder
         self.mapper_flow_time_condition = bool(mapper_flow_time_condition)
@@ -293,7 +301,7 @@ class TextToTSFlow(nn.Module):
             self.regime_adapter = None
 
         # V6.1: Global operator gate (replaces mapper when active)
-        if self._use_global_gate:
+        if self._use_global_gate and self.operator_gate_mode == "dynamic":
             self.global_operator_gate = GlobalOperatorGate(
                 d_model=d_model,
                 num_channels=num_channels,
@@ -389,14 +397,29 @@ class TextToTSFlow(nn.Module):
                 expert_context=expert_context,
                 channel_context=bank_channel_context,
             )
-            _gate, g, gate_aux = self.global_operator_gate(
-                x_t=x_t,
-                t=t,
-                text_context=text_context,
-                slot_tokens=slot_tokens,
-                slot_mask=slot_mask,
-                velocity_shape=velocities.shape,
-            )
+            if self.operator_gate_mode == "dynamic":
+                _gate, g, gate_aux = self.global_operator_gate(
+                    x_t=x_t,
+                    t=t,
+                    text_context=text_context,
+                    slot_tokens=slot_tokens,
+                    slot_mask=slot_mask,
+                    velocity_shape=velocities.shape,
+                )
+            else:
+                batch_size, length, channels, num_operators = velocities.shape
+                _gate = x_t.new_full((batch_size, num_operators), 1.0 / float(num_operators))
+                g = _gate[:, None, None, :].expand(batch_size, length, channels, num_operators)
+                uniform_entropy = -(_gate * _gate.log()).sum(dim=-1).mean()
+                gate_aux = {
+                    "A_o": _gate,
+                    "operator_gate_logits": _gate.log().detach(),
+                    "operator_gate_entropy": uniform_entropy.detach(),
+                    "operator_gate_entropy_norm": x_t.new_tensor(1.0),
+                    "operator_gate_max_prob": _gate.max(dim=-1).values.mean().detach(),
+                    "operator_balance_loss": x_t.new_zeros(()),
+                    "operator_usage": _gate.mean(dim=0).detach(),
+                }
             v_hat = (g * velocities).sum(dim=-1)
             bank_aux = getattr(self.operator_bank, "last_aux", {})
             aux = {

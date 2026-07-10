@@ -31,6 +31,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timevqvae", type=Path, default=None)
     parser.add_argument("--text2motion", type=Path, default=None)
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument(
+        "--real-sample-index", type=int, default=None,
+        help="Index in the real-data array; defaults to --sample-index.",
+    )
     parser.add_argument("--channel-index", type=int, default=0)
     parser.add_argument("--aggregate", choices=("first", "mean", "median"), default="median")
     parser.add_argument("--title", default=None, help="Optional short in-figure title. Omit for paper use.")
@@ -75,7 +79,8 @@ def select_series(array: np.ndarray, sample_index: int, channel_index: int, aggr
 
 def main() -> None:
     args = parse_args()
-    real = select_series(load_array(args.real), args.sample_index, args.channel_index, "first", generated=False)
+    real_index = args.sample_index if args.real_sample_index is None else args.real_sample_index
+    real = select_series(load_array(args.real), real_index, args.channel_index, "first", generated=False)
     method_paths = {
         "Ours": args.ours,
         "VerbalTS": args.verbalts,
@@ -123,7 +128,10 @@ def main() -> None:
     plt.close(fig)
     print(f"[saved] {args.output} size=3.25x2.65in dpi={args.dpi}")
     print(f"[saved] {args.output.with_suffix('.pdf')}")
-    print(f"[methods] {', '.join(methods)}; aggregate={args.aggregate}; sample={args.sample_index}; channel={args.channel_index}")
+    print(
+        f"[methods] {', '.join(methods)}; generated_sample={args.sample_index}; "
+        f"real_sample={real_index}; aggregate={args.aggregate}; channel={args.channel_index}"
+    )
 
 
 if __name__ == "__main__":

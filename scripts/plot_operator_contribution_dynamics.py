@@ -54,14 +54,13 @@ def plot_single_column(
     output: Path,
     dpi: int,
 ) -> None:
-    """Render a compliant 3.25 x 2.70 inch AAAI single-column figure."""
+    """Render a compliant 3.25 x 3.35 inch AAAI single-column figure."""
     plt.rcParams.update({"font.size": 9, "font.family": "serif"})
     labels = tuple(COLORS)
     styles = ("-", "--", ":")
-    fig, (ax_energy, ax_gate) = plt.subplots(
-        2, 1, figsize=(3.25, 2.70), sharex=True, facecolor="white",
-        gridspec_kw={"hspace": 0.24},
-    )
+    fig, (ax_energy, ax_gate) = plt.subplots(2, 1, figsize=(3.25, 3.35), sharex=True, facecolor="white")
+    # Fixed margins retain the 9pt labels in the exported physical dimensions.
+    fig.subplots_adjust(left=0.225, right=0.985, bottom=0.175, top=0.695, hspace=0.68)
     for operator, (label, style) in enumerate(zip(labels, styles)):
         ax_energy.plot(
             flow_time, energy[sample, :, operator], color=COLORS[label],
@@ -73,10 +72,6 @@ def plot_single_column(
         )
     ax_energy.set_title("(a) Operator contribution magnitude", fontsize=9.4, pad=3)
     ax_energy.set_ylabel("Contribution", fontsize=9)
-    ax_energy.legend(
-        loc="upper center", ncol=3, fontsize=9, frameon=False,
-        handlelength=1.55, columnspacing=0.75, handletextpad=0.35,
-    )
     ax_gate.set_title("(b) Dynamic mixture weights", fontsize=9.4, pad=3)
     ax_gate.set_xlabel("ODE flow time", fontsize=9)
     ax_gate.set_ylabel("Gate weight", fontsize=9)
@@ -86,6 +81,12 @@ def plot_single_column(
         ax.tick_params(labelsize=9)
         ax.set_xlim(float(flow_time.min()), float(flow_time.max()))
         ax.set_xticks(np.linspace(0.0, 1.0, 5))
+    handles, legend_labels = ax_energy.get_legend_handles_labels()
+    fig.legend(
+        handles, legend_labels, loc="upper center", bbox_to_anchor=(0.55, 0.995),
+        ncol=2, fontsize=9, frameon=False, handlelength=1.55,
+        columnspacing=0.72, handletextpad=0.32,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     # Do not use bbox_inches='tight': physical dimensions must remain stable.
     fig.savefig(output, dpi=dpi, facecolor="white")

@@ -54,13 +54,13 @@ def plot_single_column(
     output: Path,
     dpi: int,
 ) -> None:
-    """Render a compliant 3.25 x 3.35 inch AAAI single-column figure."""
+    """Render a compact 3.25 x 2.95 inch AAAI single-column figure."""
     plt.rcParams.update({"font.size": 9, "font.family": "serif"})
     labels = tuple(COLORS)
     styles = ("-", "--", ":")
-    fig, (ax_energy, ax_gate) = plt.subplots(2, 1, figsize=(3.25, 3.35), sharex=True, facecolor="white")
+    fig, (ax_energy, ax_gate) = plt.subplots(2, 1, figsize=(3.25, 2.95), sharex=True, facecolor="white")
     # Fixed margins retain the 9pt labels in the exported physical dimensions.
-    fig.subplots_adjust(left=0.225, right=0.985, bottom=0.175, top=0.695, hspace=0.68)
+    fig.subplots_adjust(left=0.225, right=0.985, bottom=0.19, top=0.80, hspace=0.52)
     for operator, (label, style) in enumerate(zip(labels, styles)):
         ax_energy.plot(
             flow_time, energy[sample, :, operator], color=COLORS[label],
@@ -79,13 +79,15 @@ def plot_single_column(
     for ax in (ax_energy, ax_gate):
         set_panel_style(ax)
         ax.tick_params(labelsize=9)
-        ax.set_xlim(float(flow_time.min()), float(flow_time.max()))
+        # Leave room for the 1.00 tick label; traces recorded with ``all``
+        # end at (steps-1)/steps, just before one.
+        ax.set_xlim(0.0, 1.04)
         ax.set_xticks(np.linspace(0.0, 1.0, 5))
     handles, legend_labels = ax_energy.get_legend_handles_labels()
     fig.legend(
-        handles, legend_labels, loc="upper center", bbox_to_anchor=(0.55, 0.995),
-        ncol=2, fontsize=9, frameon=False, handlelength=1.55,
-        columnspacing=0.72, handletextpad=0.32,
+        handles, legend_labels, loc="upper center", bbox_to_anchor=(0.50, 0.985),
+        ncol=3, fontsize=9, frameon=False, handlelength=1.25,
+        columnspacing=0.45, handletextpad=0.28,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     # Do not use bbox_inches='tight': physical dimensions must remain stable.

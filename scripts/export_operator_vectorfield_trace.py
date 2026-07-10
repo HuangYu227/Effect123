@@ -80,6 +80,8 @@ def take_rows(batch: dict[str, Any], count: int) -> dict[str, Any]:
 
 
 def parse_record_indices(record_times: str, steps: int) -> list[int]:
+    if record_times.strip().lower() == "all":
+        return list(range(steps))
     values = [float(part.strip()) for part in record_times.split(",") if part.strip()]
     if not values:
         raise ValueError("--record-times must contain at least one value")

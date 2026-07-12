@@ -1,0 +1,11 @@
+_base_: weather_v68_traffic_semantic_calibrated.yaml
+
+model:
+  # Replace only the Temporal Semantic Pyramid with the standard patch-merger state encoder.
+  bridge_state_connector: patch_merger
+
+train:
+  checkpoint_dir: checkpoints/v68_ablate_no_tsp_traffic_b640_s20000
+
+checkpoint_selection:
+  cache_dir: cache/traffic_v68_ablate_no_tsp_contsg_proxy

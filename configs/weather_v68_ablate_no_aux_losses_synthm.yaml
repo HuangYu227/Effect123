@@ -1,0 +1,12 @@
+_base_: weather_v68_alignment_semantic_calibrated.yaml
+
+train:
+  # Retain every architectural module; remove only the four auxiliary objectives.
+  bridge_alignment_weight: 0.0
+  caption_ranking_weight: 0.0
+  spectral_loss_weight: 0.0
+  operator_balance_weight: 0.0
+  checkpoint_dir: checkpoints/v68_ablate_no_aux_losses_synthm_b640_s20000
+
+checkpoint_selection:
+  cache_dir: cache/synthm_v68_ablate_no_aux_losses_contsg_proxy

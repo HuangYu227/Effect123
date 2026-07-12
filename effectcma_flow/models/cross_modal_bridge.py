@@ -507,8 +507,13 @@ class TSPatchMergerConnector(nn.Module):
                 tsp_alignment_clean_encoded = True
                 tsp_alignment_clean_detached = True
             elif use_clean:
-                clean_grid = self._encode_grid(target, torch.ones_like(t))
-                align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
+                # The clean series is a contrastive target, not a second trainable
+                # reconstruction branch. Keep this invariant for both state encoders.
+                with torch.no_grad():
+                    clean_grid = self._encode_grid(target, torch.ones_like(t))
+                    align_state_tokens = self.budget_pool(self._patch_merge(clean_grid))
+                align_state_tokens = align_state_tokens.detach()
+                tsp_alignment_clean_detached = True
             else:
                 align_state_tokens = fused_state
             if self.alignment_dense:
